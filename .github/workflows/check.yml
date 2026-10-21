@@ -1,0 +1,31 @@
+# Runs every flake check, including the NixOS VM tests.
+#
+# GitHub's ubuntu-latest runners expose /dev/kvm, but only to the runner user
+# after a udev rule grants access; without KVM the VM tests fall back to
+# emulation and are too slow to be useful.
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  flake-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            system-features = nixos-test benchmark big-parallel kvm
+      - name: Check KVM
+        run: test -w /dev/kvm || { echo "::error::/dev/kvm is not available to this job"; exit 1; }
+      - run: nix flake check -L
