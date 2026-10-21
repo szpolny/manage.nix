@@ -1,0 +1,20 @@
+[package]
+name = "mnix-store"
+description = "Storage for the manage.nix control plane (SQLite and Postgres)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true
