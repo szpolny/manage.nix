@@ -16,6 +16,15 @@ A dashboard and control plane for fleets of Nix-managed machines.
 | `nix/tests` | NixOS VM tests, one per milestone |
 | `web/` | SvelteKit UI (from M4) |
 
+## Agent
+
+`mnix-agent activate <store-path> [--mode switch|boot|test]` verifies that a
+NixOS system is signed by a key in `services.manage-nix.agent.trustedPublicKeys`,
+activates it, runs the health checks the new system declares in
+`services.manage-nix.agent.healthChecks`, and rolls back on its own if they
+do not pass. It prints a JSON report. `mnix-agent facts` prints what the
+machine runs as JSON.
+
 ## Development
 
 ```sh

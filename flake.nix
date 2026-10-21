@@ -132,6 +132,7 @@
         }
         // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           vm-hello = import ./nix/tests/hello.nix { inherit self pkgs; };
+          vm-activate = import ./nix/tests/activate.nix { inherit self pkgs; };
         }
       );
 

@@ -1,0 +1,533 @@
+//! Activating a system safely: verify, switch, check health, roll back.
+//!
+//! The steps talk to the machine only through [`Host`], so the decisions
+//! (what to refuse, when to roll back, and how) are unit tested against a
+//! fake machine. [`crate::host::NixosHost`] is the real implementation.
+
+use std::path::Path;
+
+use anyhow::Context;
+use mnix_protocol::{ActivationMode, ActivationReport, ActivationStatus};
+
+use crate::config::{AgentConfig, HealthChecks};
+use crate::signature::{PathInfo, TrustedKeys};
+use crate::store_path::StorePath;
+
+/// A generation of the system profile: its number and system.
+pub type ProfileGeneration = (u64, StorePath);
+
+/// Everything activation needs to do to the machine.
+pub trait Host {
+    /// Makes sure `path` is in the local store, substituting it if needed.
+    fn realise(&self, path: &StorePath) -> anyhow::Result<()>;
+    fn path_info(&self, path: &StorePath) -> anyhow::Result<PathInfo>;
+    /// Whether `path` is a NixOS system that can be activated.
+    fn is_nixos_system(&self, path: &StorePath) -> bool;
+    /// The agent configuration installed under `root` (`/` or a system).
+    fn agent_config(&self, root: &Path) -> anyhow::Result<Option<AgentConfig>>;
+    fn current_system(&self) -> anyhow::Result<StorePath>;
+    /// The generation the system profile points at, if it exists.
+    fn profile_generation(&self) -> anyhow::Result<Option<ProfileGeneration>>;
+    fn set_profile(&self, path: &StorePath) -> anyhow::Result<()>;
+    fn switch_profile_generation(&self, number: u64) -> anyhow::Result<()>;
+    /// Runs `<system>/bin/switch-to-configuration <action>`.
+    fn switch_to_configuration(&self, system: &StorePath, action: &str) -> anyhow::Result<()>;
+    fn wait_until_healthy(&self, checks: &HealthChecks) -> Result<(), Vec<String>>;
+}
+
+/// The verified request and the state to restore on failure.
+#[derive(Debug)]
+struct Plan {
+    target: StorePath,
+    health_checks: HealthChecks,
+    previous_system: StorePath,
+    previous_generation: Option<ProfileGeneration>,
+}
+
+#[derive(Debug)]
+struct Failure {
+    message: String,
+    failed_checks: Vec<String>,
+}
+
+impl From<anyhow::Error> for Failure {
+    fn from(e: anyhow::Error) -> Self {
+        Self {
+            message: format!("{e:#}"),
+            failed_checks: Vec::new(),
+        }
+    }
+}
+
+pub fn activate(host: &dyn Host, store_path: &str, mode: ActivationMode) -> ActivationReport {
+    let mut report = ActivationReport {
+        store_path: store_path.to_owned(),
+        mode,
+        status: ActivationStatus::Failed,
+        system_changed: false,
+        previous_system: None,
+        message: None,
+        failed_checks: Vec::new(),
+    };
+
+    let plan = match plan(host, store_path) {
+        Ok(plan) => plan,
+        Err(e) => {
+            tracing::error!("refusing to activate {store_path}: {e:#}");
+            report.message = Some(format!("refused: {e:#}"));
+            return report;
+        }
+    };
+    report.previous_system = Some(plan.previous_system.to_string());
+
+    let Err(failure) = apply(host, &plan, mode) else {
+        tracing::info!("activated {} ({mode})", plan.target);
+        report.status = ActivationStatus::Succeeded;
+        report.system_changed = true;
+        return report;
+    };
+    tracing::error!("activation failed, rolling back: {}", failure.message);
+    report.failed_checks = failure.failed_checks;
+
+    match roll_back(host, &plan, mode) {
+        Ok(()) => {
+            tracing::info!("rolled back to {}", plan.previous_system);
+            report.status = ActivationStatus::RolledBack;
+            report.message = Some(failure.message);
+        }
+        Err(e) => {
+            tracing::error!("rollback failed: {e:#}");
+            report.system_changed = true;
+            report.message = Some(format!("{}; rollback failed: {e:#}", failure.message));
+        }
+    }
+    report
+}
+
+/// Checks everything that can be checked without changing the machine.
+fn plan(host: &dyn Host, store_path: &str) -> anyhow::Result<Plan> {
+    let target = StorePath::parse(store_path)?;
+
+    let config = host
+        .agent_config(Path::new("/"))?
+        .context("the agent is not configured (no /etc/manage-nix/agent.json)")?;
+    let keys = TrustedKeys::parse(&config.trusted_public_keys)?;
+    anyhow::ensure!(
+        !keys.is_empty(),
+        "no trusted public keys are configured \
+         (services.manage-nix.agent.trustedPublicKeys)"
+    );
+
+    host.realise(&target)
+        .with_context(|| format!("fetching {target}"))?;
+    let key = keys.verify(&host.path_info(&target)?)?;
+    tracing::info!("{target} is signed by trusted key {key}");
+
+    anyhow::ensure!(
+        host.is_nixos_system(&target),
+        "{target} is not a NixOS system (no bin/switch-to-configuration)"
+    );
+    let target_config = host.agent_config(target.as_path())?.context(
+        "the new system does not enable services.manage-nix.agent; \
+         activating it would leave the machine unmanaged",
+    )?;
+
+    Ok(Plan {
+        health_checks: target_config.health_checks,
+        previous_system: host.current_system()?,
+        previous_generation: host.profile_generation()?,
+        target,
+    })
+}
+
+fn apply(host: &dyn Host, plan: &Plan, mode: ActivationMode) -> Result<(), Failure> {
+    if mode.sets_profile() {
+        host.set_profile(&plan.target)?;
+    }
+    host.switch_to_configuration(&plan.target, mode.as_str())?;
+    if !mode.activates_now() {
+        tracing::info!(
+            "{} will be used on next boot; skipping health checks",
+            plan.target
+        );
+        return Ok(());
+    }
+    if plan.health_checks.is_empty() {
+        tracing::warn!("no health checks are configured");
+        return Ok(());
+    }
+    host.wait_until_healthy(&plan.health_checks)
+        .map_err(|failed_checks| Failure {
+            message: format!(
+                "health checks did not pass within {}s",
+                plan.health_checks.timeout_secs
+            ),
+            failed_checks,
+        })
+}
+
+/// Restores what `apply` may have changed: the boot default for `switch` and
+/// `boot`, and the running system for `switch` and `test`. Attempts every
+/// step even if one fails.
+fn roll_back(host: &dyn Host, plan: &Plan, mode: ActivationMode) -> anyhow::Result<()> {
+    let mut errors = Vec::new();
+    if mode.sets_profile() {
+        let restored = match &plan.previous_generation {
+            Some((number, system)) => host
+                .switch_profile_generation(*number)
+                .and_then(|()| host.switch_to_configuration(system, "boot"))
+                .with_context(|| format!("restoring system profile generation {number}")),
+            None => Err(anyhow::anyhow!(
+                "there was no system profile generation to restore"
+            )),
+        };
+        errors.extend(restored.err());
+    }
+    if mode.activates_now() {
+        errors.extend(
+            host.switch_to_configuration(&plan.previous_system, "test")
+                .with_context(|| format!("reactivating {}", plan.previous_system))
+                .err(),
+        );
+    }
+    match errors.len() {
+        0 => Ok(()),
+        _ => Err(anyhow::anyhow!(errors
+            .iter()
+            .map(|e| format!("{e:#}"))
+            .collect::<Vec<_>>()
+            .join("; "))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const OLD: &str = "/nix/store/00000000000000000000000000000000-nixos-system-old";
+    const NEW: &str = "/nix/store/11111111111111111111111111111111-nixos-system-new";
+
+    /// A fixed signing key standing in for the deploy key.
+    fn signing_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[7; 32])
+    }
+
+    fn public_key() -> String {
+        use base64::Engine;
+        let key = base64::engine::general_purpose::STANDARD.encode(signing_key().verifying_key());
+        format!("test-1:{key}")
+    }
+
+    /// Signs `path` as `Fake::path_info` describes it, under `name`.
+    fn signature(name: &str, path: &str) -> String {
+        use base64::Engine;
+        use ed25519_dalek::Signer;
+        let info = PathInfo {
+            signatures: vec![],
+            ..fake_path_info(path)
+        };
+        let sig = signing_key().sign(info.fingerprint().as_bytes());
+        format!(
+            "{name}:{}",
+            base64::engine::general_purpose::STANDARD.encode(sig.to_bytes())
+        )
+    }
+
+    fn fake_path_info(path: &str) -> PathInfo {
+        PathInfo {
+            path: path.to_owned(),
+            nar_hash: "sha256:0000000000000000000000000000000000000000000000000000".into(),
+            nar_size: 1234,
+            references: vec![OLD.into()],
+            signatures: vec![],
+        }
+    }
+
+    /// A fake machine that records what was done to it.
+    struct Fake {
+        configs: BTreeMap<String, AgentConfig>,
+        signatures: Vec<String>,
+        not_systems: BTreeSet<String>,
+        failing_actions: BTreeSet<(String, String)>,
+        healthy: bool,
+        current: RefCell<StorePath>,
+        profile: RefCell<Vec<StorePath>>,
+        generation: RefCell<usize>,
+        log: RefCell<Vec<String>>,
+    }
+
+    fn sp(s: &str) -> StorePath {
+        StorePath::parse(s).unwrap()
+    }
+
+    fn config(checks: bool) -> AgentConfig {
+        AgentConfig {
+            version: 1,
+            trusted_public_keys: vec![public_key()],
+            health_checks: HealthChecks {
+                systemd_units: if checks {
+                    vec!["app.service".into()]
+                } else {
+                    vec![]
+                },
+                ..HealthChecks::default()
+            },
+        }
+    }
+
+    impl Fake {
+        fn new() -> Self {
+            Self {
+                configs: BTreeMap::from([("/".into(), config(true)), (NEW.into(), config(true))]),
+                signatures: vec![signature("test-1", NEW)],
+                not_systems: BTreeSet::new(),
+                failing_actions: BTreeSet::new(),
+                healthy: true,
+                current: RefCell::new(sp(OLD)),
+                profile: RefCell::new(vec![sp(OLD)]),
+                generation: RefCell::new(0),
+                log: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn log(&self) -> Vec<String> {
+            self.log.borrow().clone()
+        }
+
+        fn profile_system(&self) -> StorePath {
+            self.profile.borrow()[*self.generation.borrow()].clone()
+        }
+    }
+
+    impl Host for Fake {
+        fn realise(&self, _: &StorePath) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn path_info(&self, path: &StorePath) -> anyhow::Result<PathInfo> {
+            Ok(PathInfo {
+                signatures: self.signatures.clone(),
+                ..fake_path_info(path.as_str())
+            })
+        }
+        fn is_nixos_system(&self, path: &StorePath) -> bool {
+            !self.not_systems.contains(path.as_str())
+        }
+        fn agent_config(&self, root: &Path) -> anyhow::Result<Option<AgentConfig>> {
+            Ok(self.configs.get(root.to_str().unwrap()).cloned())
+        }
+        fn current_system(&self) -> anyhow::Result<StorePath> {
+            Ok(self.current.borrow().clone())
+        }
+        fn profile_generation(&self) -> anyhow::Result<Option<ProfileGeneration>> {
+            let n = *self.generation.borrow();
+            Ok(Some((n as u64 + 1, self.profile.borrow()[n].clone())))
+        }
+        fn set_profile(&self, path: &StorePath) -> anyhow::Result<()> {
+            self.log.borrow_mut().push(format!("set-profile {path}"));
+            self.profile.borrow_mut().push(path.clone());
+            *self.generation.borrow_mut() = self.profile.borrow().len() - 1;
+            Ok(())
+        }
+        fn switch_profile_generation(&self, number: u64) -> anyhow::Result<()> {
+            self.log
+                .borrow_mut()
+                .push(format!("switch-generation {number}"));
+            *self.generation.borrow_mut() = number as usize - 1;
+            Ok(())
+        }
+        fn switch_to_configuration(&self, system: &StorePath, action: &str) -> anyhow::Result<()> {
+            self.log.borrow_mut().push(format!("{action} {system}"));
+            if action != "boot" {
+                *self.current.borrow_mut() = system.clone();
+            }
+            let key = (system.to_string(), action.to_owned());
+            anyhow::ensure!(!self.failing_actions.contains(&key), "exit status 4");
+            Ok(())
+        }
+        fn wait_until_healthy(&self, _: &HealthChecks) -> Result<(), Vec<String>> {
+            self.log.borrow_mut().push("health".into());
+            match *self.current.borrow() == sp(NEW) && !self.healthy {
+                true => Err(vec!["systemd unit app.service: is failed".into()]),
+                false => Ok(()),
+            }
+        }
+    }
+
+    #[test]
+    fn healthy_switch_succeeds() {
+        let host = Fake::new();
+        let report = activate(&host, NEW, ActivationMode::Switch);
+        assert_eq!(report.status, ActivationStatus::Succeeded, "{report:?}");
+        assert!(report.system_changed);
+        assert_eq!(report.previous_system.as_deref(), Some(OLD));
+        assert_eq!(
+            host.log(),
+            [
+                format!("set-profile {NEW}").as_str(),
+                format!("switch {NEW}").as_str(),
+                "health"
+            ]
+        );
+        assert_eq!(*host.current.borrow(), sp(NEW));
+        assert_eq!(host.profile_system(), sp(NEW));
+    }
+
+    #[test]
+    fn unhealthy_switch_rolls_back_profile_and_running_system() {
+        let host = Fake {
+            healthy: false,
+            ..Fake::new()
+        };
+        let report = activate(&host, NEW, ActivationMode::Switch);
+        assert_eq!(report.status, ActivationStatus::RolledBack, "{report:?}");
+        assert!(!report.system_changed);
+        assert_eq!(
+            report.failed_checks,
+            ["systemd unit app.service: is failed"]
+        );
+        assert_eq!(
+            host.log(),
+            [
+                format!("set-profile {NEW}").as_str(),
+                format!("switch {NEW}").as_str(),
+                "health",
+                "switch-generation 1",
+                format!("boot {OLD}").as_str(),
+                format!("test {OLD}").as_str(),
+            ]
+        );
+        assert_eq!(*host.current.borrow(), sp(OLD));
+        assert_eq!(host.profile_system(), sp(OLD));
+    }
+
+    #[test]
+    fn failed_switch_to_configuration_rolls_back() {
+        let host = Fake {
+            failing_actions: BTreeSet::from([(NEW.into(), "test".into())]),
+            ..Fake::new()
+        };
+        let report = activate(&host, NEW, ActivationMode::Test);
+        assert_eq!(report.status, ActivationStatus::RolledBack, "{report:?}");
+        assert_eq!(
+            host.log(),
+            [
+                format!("test {NEW}").as_str(),
+                format!("test {OLD}").as_str()
+            ]
+        );
+        assert_eq!(*host.current.borrow(), sp(OLD));
+        assert_eq!(host.profile_system(), sp(OLD));
+    }
+
+    #[test]
+    fn failed_rollback_is_reported() {
+        let host = Fake {
+            healthy: false,
+            failing_actions: BTreeSet::from([(OLD.into(), "test".into())]),
+            ..Fake::new()
+        };
+        let report = activate(&host, NEW, ActivationMode::Switch);
+        assert_eq!(report.status, ActivationStatus::Failed);
+        assert!(report.system_changed);
+        assert!(report.message.unwrap().contains("rollback failed"));
+    }
+
+    #[test]
+    fn boot_mode_skips_health_checks() {
+        let host = Fake {
+            healthy: false,
+            ..Fake::new()
+        };
+        let report = activate(&host, NEW, ActivationMode::Boot);
+        assert_eq!(report.status, ActivationStatus::Succeeded);
+        assert_eq!(
+            host.log(),
+            [
+                format!("set-profile {NEW}").as_str(),
+                format!("boot {NEW}").as_str()
+            ]
+        );
+        assert_eq!(*host.current.borrow(), sp(OLD));
+    }
+
+    #[test]
+    fn no_health_checks_means_activation_succeeds() {
+        let mut host = Fake {
+            healthy: false,
+            ..Fake::new()
+        };
+        host.configs.insert(NEW.into(), config(false));
+        let report = activate(&host, NEW, ActivationMode::Switch);
+        assert_eq!(report.status, ActivationStatus::Succeeded);
+    }
+
+    fn assert_refused(host: Fake, path: &str, reason: &str) {
+        let report = activate(&host, path, ActivationMode::Switch);
+        assert_eq!(report.status, ActivationStatus::Failed, "{report:?}");
+        assert!(!report.system_changed);
+        let message = report.message.unwrap();
+        assert!(
+            message.contains(reason),
+            "{message:?} should mention {reason:?}"
+        );
+        assert!(host.log().is_empty(), "{:?}", host.log());
+    }
+
+    #[test]
+    fn refuses_unsafe_requests_without_touching_the_machine() {
+        assert_refused(Fake::new(), "/etc/passwd", "not a top-level Nix store path");
+        assert_refused(
+            Fake {
+                signatures: vec![],
+                ..Fake::new()
+            },
+            NEW,
+            "no valid signature",
+        );
+        assert_refused(
+            Fake {
+                signatures: vec![signature("other-1", NEW)],
+                ..Fake::new()
+            },
+            NEW,
+            "no valid signature",
+        );
+        assert_refused(
+            Fake {
+                not_systems: BTreeSet::from([NEW.into()]),
+                ..Fake::new()
+            },
+            NEW,
+            "not a NixOS system",
+        );
+
+        let mut host = Fake::new();
+        host.configs.remove(NEW);
+        assert_refused(host, NEW, "would leave the machine unmanaged");
+
+        let mut host = Fake::new();
+        host.configs.remove("/");
+        assert_refused(host, NEW, "not configured");
+
+        let mut host = Fake::new();
+        host.configs
+            .get_mut("/")
+            .unwrap()
+            .trusted_public_keys
+            .clear();
+        assert_refused(host, NEW, "no trusted public keys");
+    }
+
+    #[test]
+    fn trusted_keys_come_from_the_running_system() {
+        // The new system trusting some other key does not matter.
+        let mut host = Fake {
+            signatures: vec![],
+            ..Fake::new()
+        };
+        host.configs.get_mut(NEW).unwrap().trusted_public_keys = vec![];
+        assert_refused(host, NEW, "no valid signature");
+    }
+}
