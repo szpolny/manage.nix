@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE machines SET credential_hash = $1, enrolled_at = $2 WHERE id = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Timestamptz",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "39bbaf57c30d704c58bbac5eca5e5d75184d9603d3cb3558fa66a069c3823ac0"
+}

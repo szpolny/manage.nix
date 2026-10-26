@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO agent_sessions (id, machine_id, agent_version, connected_at, last_heartbeat_at)\n             VALUES ($1, $2, $3, $4, $4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1641a1b50474ecc0067b5eee8777ff73351b5d0c0482e5ae00eaa246f9e322f8"
+}

@@ -1,7 +1,14 @@
-//! Message types shared by `mnix-agent` and `mnix-server`.
+//! Message types shared by `mnix-agent`, `mnix-server`, and `mnix`.
 //!
-//! Protocol v1 messages are added in M2. M1 defines the payloads the agent
-//! already produces locally: [`Facts`] and [`ActivationReport`].
+//! Protocol v1:
+//!
+//! - [`AgentMessage`] and [`ServerMessage`] are the JSON text frames of the
+//!   agent's WebSocket ([`AGENT_WS_PATH`]).
+//! - [`api`] holds the HTTP API's request and response bodies.
+//! - [`Facts`] and [`ActivationReport`] are what the agent reports about
+//!   itself; `mnix-agent facts` and `mnix-agent activate` print them too.
+
+pub mod api;
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +24,54 @@ impl std::fmt::Display for ProtocolVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "v{}", self.0)
     }
+}
+
+/// Where agents enroll: `POST` an [`api::EnrollRequest`].
+pub const ENROLL_PATH: &str = "/api/agent/enroll";
+
+/// The agent's WebSocket endpoint. The upgrade request carries the machine's
+/// credential as `Authorization: Bearer <credential>`.
+pub const AGENT_WS_PATH: &str = "/api/agent/ws";
+
+/// A message from the agent to the server.
+///
+/// Receivers ignore (and log) messages whose `type` they do not know, so
+/// new message types can be added within a protocol version. Changing an
+/// existing message needs a new version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentMessage {
+    /// The first message of every session.
+    Hello(Hello),
+    /// Sent every `heartbeat_interval_secs` from [`ServerMessage::Welcome`].
+    Heartbeat,
+    /// The machine's facts changed since the last `hello` or `facts`.
+    Facts { facts: Facts },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hello {
+    pub protocol_version: ProtocolVersion,
+    pub agent_version: String,
+    pub facts: Facts,
+}
+
+/// A message from the server to the agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerMessage {
+    /// The answer to a valid `hello`; the session is open.
+    Welcome {
+        protocol_version: ProtocolVersion,
+        machine_id: String,
+        /// How often the agent sends `heartbeat`.
+        heartbeat_interval_secs: u64,
+        /// How long the server waits for a heartbeat before it considers the
+        /// machine offline. The agent uses the same timeout for the server.
+        heartbeat_timeout_secs: u64,
+    },
+    /// The server is about to close the connection.
+    Error { message: String },
 }
 
 /// What a machine reports about itself.
@@ -126,6 +181,40 @@ mod tests {
     fn version_serializes_as_a_bare_number() {
         assert_eq!(serde_json::to_string(&PROTOCOL_VERSION).unwrap(), "1");
         assert_eq!(PROTOCOL_VERSION.to_string(), "v1");
+    }
+
+    #[test]
+    fn messages_are_tagged_by_type() {
+        assert_eq!(
+            serde_json::to_value(AgentMessage::Heartbeat).unwrap(),
+            serde_json::json!({"type": "heartbeat"})
+        );
+        let hello: AgentMessage = serde_json::from_value(serde_json::json!({
+            "type": "hello",
+            "protocol_version": 1,
+            "agent_version": "0.1.0",
+            "facts": {
+                "hostname": "web-1",
+                "current_system": "/nix/store/x-nixos-system",
+                "booted_system": null,
+                "nixos_version": null,
+                "kernel": "6.12.0",
+                "reboot_required": false,
+                "generations": []
+            }
+        }))
+        .unwrap();
+        assert!(matches!(hello, AgentMessage::Hello(h) if h.facts.hostname == "web-1"));
+        let welcome = ServerMessage::Welcome {
+            protocol_version: PROTOCOL_VERSION,
+            machine_id: "m".to_owned(),
+            heartbeat_interval_secs: 15,
+            heartbeat_timeout_secs: 45,
+        };
+        assert_eq!(
+            serde_json::to_value(&welcome).unwrap()["type"],
+            serde_json::json!("welcome")
+        );
     }
 
     #[test]

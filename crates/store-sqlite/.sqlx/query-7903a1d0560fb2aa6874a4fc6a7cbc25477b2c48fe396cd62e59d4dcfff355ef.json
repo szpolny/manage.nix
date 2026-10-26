@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE machines\n             SET agent_version = ?, facts = ?, facts_updated_at = ?, last_seen_at = ?\n             WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "7903a1d0560fb2aa6874a4fc6a7cbc25477b2c48fe396cd62e59d4dcfff355ef"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE machines SET credential_hash = ?, enrolled_at = ? WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "c7f221a085787d9fd03e0543820f0a86c16c382737c19ca6ebcc10ef7de183f1"
+}

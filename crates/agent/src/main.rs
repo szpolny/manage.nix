@@ -5,6 +5,8 @@
 
 mod activate;
 mod config;
+mod credential;
+mod daemon;
 mod facts;
 mod health;
 mod host;
@@ -12,6 +14,7 @@ mod signature;
 mod store_path;
 
 use std::fs::File;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::Context;
@@ -43,6 +46,22 @@ enum Command {
     },
     /// Print facts about this machine as JSON.
     Facts,
+    /// Connect to the control plane and stay connected.
+    ///
+    /// On first start, exchanges the enrollment token for a credential and
+    /// stores it in the state directory.
+    Run {
+        /// The control plane's URL, for example `https://mnix.example.com`.
+        #[arg(long, env = "MNIX_SERVER_URL")]
+        server_url: String,
+        /// File containing a one-time enrollment token from
+        /// `mnix machine add`. Only read while the machine is not enrolled.
+        #[arg(long, env = "MNIX_ENROLLMENT_TOKEN_FILE")]
+        enrollment_token_file: Option<PathBuf>,
+        /// Where the agent keeps its credential.
+        #[arg(long, default_value = "/var/lib/manage-nix")]
+        state_dir: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -85,6 +104,18 @@ fn main() -> anyhow::Result<ExitCode> {
         }
         Some(Command::Facts) => {
             println!("{}", serde_json::to_string_pretty(&facts::collect()?)?);
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Command::Run {
+            server_url,
+            enrollment_token_file,
+            state_dir,
+        }) => {
+            tokio::runtime::Runtime::new()?.block_on(daemon::run(daemon::Options {
+                server_url,
+                enrollment_token_file,
+                state_dir,
+            }))?;
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Activate { store_path, mode }) => {

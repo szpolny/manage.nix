@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE agent_sessions SET disconnected_at = ?, disconnect_reason = ?\n             WHERE machine_id = ? AND disconnected_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "d97ce6cd0740788fce0d313e5ffad0f4315ce769f1b1d1e75cdd45a979b549ea"
+}

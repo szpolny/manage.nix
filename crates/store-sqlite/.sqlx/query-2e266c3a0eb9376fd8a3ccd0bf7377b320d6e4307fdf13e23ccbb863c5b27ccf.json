@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT machine_id, used_at FROM enrollment_tokens WHERE token_hash = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "machine_id",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "used_at",
+        "ordinal": 1,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "2e266c3a0eb9376fd8a3ccd0bf7377b320d6e4307fdf13e23ccbb863c5b27ccf"
+}

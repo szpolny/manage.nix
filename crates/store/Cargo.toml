@@ -7,12 +7,16 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-async-trait.workspace = true
-sqlx.workspace = true
-thiserror.workspace = true
+mnix-store-core.workspace = true
+mnix-store-postgres.workspace = true
+mnix-store-sqlite.workspace = true
 
 [dev-dependencies]
-tempfile = "3"
+mnix-protocol.workspace = true
+serde_json.workspace = true
+sqlx = { workspace = true, features = ["sqlite", "postgres"] }
+tempfile.workspace = true
+time.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 

@@ -1,5 +1,8 @@
-# NixOS module for mnix-agent. The agent daemon and enrollment are added
-# from M2 on.
+# NixOS module for mnix-agent.
+#
+# With `server.url` set, the `mnix-agent` service enrolls the machine with the
+# control plane (once, using `enrollmentTokenFile`) and keeps a WebSocket to
+# it open. The credential it receives is kept in /var/lib/manage-nix.
 #
 # The agent reads `/etc/manage-nix/agent.json` from two places: trusted keys
 # from the running system, and health checks from the system being activated
@@ -43,6 +46,29 @@ in
       default = self.packages.${pkgs.stdenv.hostPlatform.system}.mnix-agent;
       defaultText = lib.literalExpression "manage-nix.packages.\${system}.mnix-agent";
       description = "The mnix-agent package to use.";
+    };
+
+    server.url = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "https://mnix.example.com";
+      description = ''
+        URL of the control plane. When set, the `mnix-agent` service
+        connects to it and keeps the connection open.
+      '';
+    };
+
+    enrollmentTokenFile = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "/run/secrets/mnix-enrollment-token";
+      description = ''
+        File containing the one-time token printed by
+        `mnix machine add <name>`. It is read only while the machine has not
+        enrolled; afterwards the agent uses the credential it stored in
+        {file}`/var/lib/manage-nix/credential.json`. Keep it out of the Nix
+        store.
+      '';
     };
 
     trustedPublicKeys = mkOption {
@@ -116,5 +142,32 @@ in
     environment.etc."manage-nix/agent.json".source =
       (pkgs.formats.json { }).generate "mnix-agent.json"
         agentConfig;
+
+    systemd.services.mnix-agent = lib.mkIf (cfg.server.url != null) {
+      description = "manage.nix agent";
+      wantedBy = [ "multi-user.target" ];
+      wants = [ "network-online.target" ];
+      after = [ "network-online.target" ];
+      environment.RUST_LOG = lib.mkDefault "info";
+      serviceConfig = {
+        ExecStart = lib.escapeShellArgs (
+          [
+            (lib.getExe cfg.package)
+            "run"
+            "--server-url"
+            cfg.server.url
+          ]
+          ++ lib.optionals (cfg.enrollmentTokenFile != null) [
+            "--enrollment-token-file"
+            cfg.enrollmentTokenFile
+          ]
+        );
+        # Root: activating systems (M3) needs it.
+        StateDirectory = "manage-nix";
+        StateDirectoryMode = "0700";
+        Restart = "always";
+        RestartSec = 5;
+      };
+    };
   };
 }

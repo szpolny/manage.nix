@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE agent_sessions SET last_heartbeat_at = $1\n             WHERE id = $2 AND disconnected_at IS NULL\n             RETURNING machine_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "machine_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "45b6c07b277bff58457fd424104e2b1419680093fa0bed6e4786c5cf8f057a52"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE machines SET facts = ?, facts_updated_at = ? WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "839ee6f52e0cf9beb0b2b0457d39edbd2a8f5590487255e4c2003b22e0a9b5b8"
+}

@@ -3,6 +3,9 @@ resolver = "2"
 members = [
   "crates/protocol",
   "crates/store",
+  "crates/store-core",
+  "crates/store-sqlite",
+  "crates/store-postgres",
   "crates/agent",
   "crates/server",
   "crates/cli",
@@ -17,22 +20,33 @@ publish = false
 [workspace.dependencies]
 mnix-protocol = { path = "crates/protocol" }
 mnix-store = { path = "crates/store" }
+mnix-store-core = { path = "crates/store-core" }
+mnix-store-postgres = { path = "crates/store-postgres" }
+mnix-store-sqlite = { path = "crates/store-sqlite" }
 
 anyhow = "1"
 async-trait = "0.1"
+axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = "2"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+getrandom = "0.3"
 humantime = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "postgres", "migrate", "macros"] }
+sha2 = "0.10"
+# Each backend crate adds its own driver feature.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "migrate", "macros", "json", "time", "uuid"] }
+tempfile = "3"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "signal", "sync", "fs"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-ureq = "3"
-uuid = { version = "1", features = ["v4"] }
+ureq = { version = "3", features = ["json", "platform-verifier"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

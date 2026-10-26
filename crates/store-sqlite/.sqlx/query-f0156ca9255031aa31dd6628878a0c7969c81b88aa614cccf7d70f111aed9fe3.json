@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE agent_sessions SET last_heartbeat_at = ?\n             WHERE id = ? AND disconnected_at IS NULL\n             RETURNING machine_id",
+  "describe": {
+    "columns": [
+      {
+        "name": "machine_id",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "f0156ca9255031aa31dd6628878a0c7969c81b88aa614cccf7d70f111aed9fe3"
+}

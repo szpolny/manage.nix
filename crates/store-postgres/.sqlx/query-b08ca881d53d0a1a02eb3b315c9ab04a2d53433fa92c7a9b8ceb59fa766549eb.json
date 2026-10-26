@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE enrollment_tokens SET used_at = $1\n             WHERE token_hash = $2 AND used_at IS NULL AND expires_at > $1\n             RETURNING machine_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "machine_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "b08ca881d53d0a1a02eb3b315c9ab04a2d53433fa92c7a9b8ceb59fa766549eb"
+}

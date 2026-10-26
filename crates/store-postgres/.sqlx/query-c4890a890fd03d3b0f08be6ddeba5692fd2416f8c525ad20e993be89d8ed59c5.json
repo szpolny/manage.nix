@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE machines\n             SET agent_version = $1, facts = $2, facts_updated_at = $3, last_seen_at = $3\n             WHERE id = $4",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Jsonb",
+        "Timestamptz",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c4890a890fd03d3b0f08be6ddeba5692fd2416f8c525ad20e993be89d8ed59c5"
+}

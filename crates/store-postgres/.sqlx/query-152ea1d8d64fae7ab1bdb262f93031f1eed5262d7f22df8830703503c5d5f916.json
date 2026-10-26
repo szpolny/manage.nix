@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE agent_sessions SET disconnected_at = $1, disconnect_reason = $2\n             WHERE machine_id = $3 AND disconnected_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "152ea1d8d64fae7ab1bdb262f93031f1eed5262d7f22df8830703503c5d5f916"
+}

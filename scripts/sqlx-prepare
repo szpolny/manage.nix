@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Regenerates the sqlx offline query data (`crates/store-*/.sqlx/`) that Nix
+# builds compile against. Run it from the dev shell after changing a query or
+# a migration, and commit the result.
+#
+# Each backend crate is prepared against its own throwaway database: a
+# temporary SQLite file and a temporary Postgres server.
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+work="$(mktemp -d)"
+# Unix socket paths are limited to ~104 bytes; keep the socket dir short.
+pghost="$(mktemp -d /tmp/pg.XXXXXX)"
+cleanup() {
+  pg_ctl --pgdata="$work/pg" --mode=immediate stop >/dev/null 2>&1 || true
+  rm -rf "$work" "$pghost"
+}
+trap cleanup EXIT
+
+export SQLX_OFFLINE=false
+
+echo "preparing mnix-store-sqlite"
+sqlite_url="sqlite://$work/db.sqlite"
+sqlx database create --database-url "$sqlite_url"
+sqlx migrate run --database-url "$sqlite_url" --source "$root/migrations/sqlite"
+(cd "$root/crates/store-sqlite" && DATABASE_URL="$sqlite_url" cargo sqlx prepare -- --all-targets)
+
+echo "preparing mnix-store-postgres"
+initdb --pgdata="$work/pg" --username=postgres --auth=trust --no-sync >/dev/null
+pg_ctl --pgdata="$work/pg" --wait --log="$work/pg.log" \
+  --options="-c listen_addresses= -c unix_socket_directories=$pghost -c fsync=off" start >/dev/null
+pg_url="postgres://postgres@localhost/mnix?host=$pghost"
+sqlx database create --database-url "$pg_url"
+sqlx migrate run --database-url "$pg_url" --source "$root/migrations/postgres"
+(cd "$root/crates/store-postgres" && DATABASE_URL="$pg_url" cargo sqlx prepare -- --all-targets)

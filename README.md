@@ -7,14 +7,34 @@ A dashboard and control plane for fleets of Nix-managed machines.
 | Path | Contents |
 |---|---|
 | `crates/protocol` | Message types shared by agent and server |
-| `crates/store` | `Store` trait with SQLite and Postgres implementations |
-| `crates/agent` | `mnix-agent`: activation, rollback, facts |
+| `crates/store` | Storage facade: `connect(url)` and the shared test suite |
+| `crates/store-core` | The `Store` trait and records |
+| `crates/store-sqlite`, `crates/store-postgres` | The two backends, each with its sqlx offline data in `.sqlx/` |
+| `crates/agent` | `mnix-agent`: enrollment, the server connection, activation, rollback, facts |
 | `crates/server` | `mnix-server`: API, scheduler, builds |
 | `crates/cli` | `mnix`: command-line client |
+| `scripts/sqlx-prepare` | Regenerates the sqlx offline data for both backends |
 | `migrations/{sqlite,postgres}` | sqlx migrations, same numbering in both |
 | `nix/modules` | NixOS modules (`nixosModules.agent`, `nixosModules.server`) |
 | `nix/tests` | NixOS VM tests, one per milestone |
 | `web/` | SvelteKit UI (from M4) |
+
+## Control plane
+
+`mnix-server serve` runs the HTTP API and the agent WebSocket endpoint on
+plain HTTP (`127.0.0.1:8080` by default); put a TLS reverse proxy in front of
+it. `nixosModules.server` runs it with SQLite by default, or with a local
+Postgres (`services.manage-nix.server.database.createLocally = true;`).
+
+```sh
+mnix --token-file /var/lib/manage-nix/admin-token machine add web-1  # prints a one-time token
+mnix --token-file /var/lib/manage-nix/admin-token machines           # status and current system
+```
+
+On the machine, set `services.manage-nix.agent.server.url` and
+`enrollmentTokenFile` (a file holding that token). The `mnix-agent` service
+enrolls once, stores its credential in `/var/lib/manage-nix`, and stays
+connected. The protocol's message types live in `crates/protocol`.
 
 ## Agent
 
@@ -38,18 +58,23 @@ at a server where the user may create databases (each test creates its own
 database). The `store-postgres` flake check starts a throwaway server and
 sets this for you.
 
-NixOS VM tests (`checks.<linux-system>.vm-*`) need a Linux builder that
-advertises the `kvm` and `nixos-test` system features. `nix flake check` on
-macOS only runs the darwin checks; run the Linux ones explicitly, for example
-`nix build .#checks.aarch64-linux.vm-hello -L`. With nix-darwin:
+NixOS VM tests (`checks.*.vm-*`) run on Linux with KVM, and natively on
+Apple Silicon macOS: there the test driver runs QEMU with Apple's
+hypervisor and the guests are `aarch64-linux`, so `nix flake check` on an
+`aarch64-darwin` machine runs them too. That needs the `apple-virt` system
+feature and a Linux builder for the guest systems. With nix-darwin:
 
 ```nix
-nix.linux-builder = {
-  enable = true;
-  supportedFeatures = [ "kvm" "benchmark" "big-parallel" "nixos-test" ];
-};
+nix.settings.system-features = [ "apple-virt" "benchmark" "big-parallel" "nixos-test" ];
+nix.linux-builder.enable = true;
 ```
 
-SQL queries use sqlx's checked macros against committed `.sqlx/` offline
-data (`SQLX_OFFLINE=true` in Nix builds and the dev shell). M0 has no
-checked queries yet, so `.sqlx/` arrives with the first one in M2.
+Don't run the VM tests *inside* the Linux builder
+(`checks.aarch64-linux.vm-*`) on a Mac without nested virtualization (before
+M3): QEMU falls back to emulation and the multi-machine tests time out.
+
+SQL queries use sqlx's checked macros against committed offline data in
+`crates/store-sqlite/.sqlx` and `crates/store-postgres/.sqlx`
+(`SQLX_OFFLINE=true` in Nix builds and the dev shell). After changing a query
+or a migration, run `scripts/sqlx-prepare` in the dev shell and commit the
+result; it prepares each backend against a throwaway database.
