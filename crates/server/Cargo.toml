@@ -17,6 +17,7 @@ base64.workspace = true
 clap.workspace = true
 getrandom.workspace = true
 humantime.workspace = true
+mnix-nix.workspace = true
 mnix-protocol.workspace = true
 mnix-store.workspace = true
 serde.workspace = true

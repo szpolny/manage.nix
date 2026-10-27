@@ -1,16 +1,21 @@
 //! `mnix`: command-line client for the manage.nix HTTP API.
 
 mod client;
+mod deploys;
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::Context;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use mnix_protocol::api::{
-    CreateEnrollmentToken, CreateMachine, CreatedMachine, EnrollmentToken, Machine,
+    CreateDeployment, CreateEnrollmentToken, CreateMachine, CreateRepository, CreateRollback,
+    CreatedMachine, Deployment, DeploymentStatus, EnrollmentToken, Machine, Repository,
+    SetConfiguration, SetTags, SigningKey,
 };
+use mnix_protocol::ActivationMode;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -55,6 +60,118 @@ enum Command {
     /// Manage one machine.
     #[command(subcommand)]
     Machine(MachineCommand),
+    /// List the Git repositories machines are built from.
+    Repos {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage repositories.
+    #[command(subcommand)]
+    Repo(RepoCommand),
+    /// Build a revision for machines and activate it, rolling back
+    /// machines where it is unhealthy or cannot reach the server.
+    ///
+    /// Follows the deployment's log until it finishes; exits 0 only if
+    /// every machine succeeded.
+    Deploy {
+        /// Machine names or IDs, or `tag:<tag>`.
+        #[arg(required = true)]
+        targets: Vec<String>,
+        /// A branch, tag, or commit (default: the repository's default
+        /// branch).
+        #[arg(long)]
+        rev: Option<String>,
+        #[command(flatten)]
+        options: DeployOptions,
+    },
+    /// Return a machine to its previous system profile generation, with the
+    /// same health checks and confirmation as a deploy.
+    Rollback {
+        /// The machine's name or ID.
+        machine: String,
+        #[command(flatten)]
+        options: DeployOptions,
+    },
+    /// List recent deployments, or show one.
+    Deploys {
+        #[command(subcommand)]
+        command: Option<DeploysCommand>,
+        /// How many to list.
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the public key the server signs systems with. Add it to
+    /// `services.manage-nix.agent.trustedPublicKeys` on every machine.
+    SigningKey,
+}
+
+#[derive(Debug, Args)]
+struct DeployOptions {
+    #[arg(long, value_enum, default_value_t = Mode::Switch)]
+    mode: Mode,
+    /// Who is deploying, for the history (default: $USER).
+    #[arg(long = "as", value_name = "NAME")]
+    requested_by: Option<String>,
+    /// Print the deployment and return instead of following it.
+    #[arg(long)]
+    no_wait: bool,
+    /// Print the deployment as JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Mode {
+    /// Make it the boot default and activate it now.
+    Switch,
+    /// Make it the boot default only.
+    Boot,
+    /// Activate it now without changing the boot default.
+    Test,
+}
+
+impl From<Mode> for ActivationMode {
+    fn from(mode: Mode) -> Self {
+        match mode {
+            Mode::Switch => Self::Switch,
+            Mode::Boot => Self::Boot,
+            Mode::Test => Self::Test,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum RepoCommand {
+    /// Register a Git repository containing a flake with
+    /// `nixosConfigurations`.
+    Add {
+        name: String,
+        /// Anything `git clone` accepts.
+        url: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DeploysCommand {
+    /// Show a deployment's machines and results.
+    Show {
+        /// The deployment's ID, or the start of it.
+        id: String,
+        /// Print its log too.
+        #[arg(long)]
+        logs: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a deployment's log.
+    Logs {
+        id: String,
+        /// Keep printing until the deployment finishes.
+        #[arg(long, short)]
+        follow: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -82,6 +199,30 @@ enum MachineCommand {
         /// The machine's name or ID.
         machine: String,
     },
+    /// Build the machine from `nixosConfigurations.<configuration>` in a
+    /// repository.
+    Configure {
+        /// The machine's name or ID.
+        machine: String,
+        /// The repository's name.
+        #[arg(long)]
+        repo: String,
+        /// The configuration's name (default: the machine's name).
+        #[arg(long)]
+        configuration: Option<String>,
+    },
+    /// Add tags to a machine, to deploy to `tag:<tag>`.
+    Tag {
+        machine: String,
+        #[arg(required = true)]
+        tags: Vec<String>,
+    },
+    /// Remove tags from a machine.
+    Untag {
+        machine: String,
+        #[arg(required = true)]
+        tags: Vec<String>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -94,7 +235,7 @@ struct TokenArgs {
     json: bool,
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     let client = Client::new(&cli.connection.server, admin_token(&cli.connection)?);
     match cli.command {
@@ -153,8 +294,202 @@ fn main() -> anyhow::Result<()> {
                 client.get(&format!("/api/machines/{}", client::escape(&machine)))?;
             print_json(&machine)?;
         }
+        Command::Machine(MachineCommand::Configure {
+            machine,
+            repo,
+            configuration,
+        }) => {
+            let machine: Machine = client.put(
+                &format!("/api/machines/{}/configuration", client::escape(&machine)),
+                &SetConfiguration {
+                    repository: repo,
+                    configuration,
+                },
+            )?;
+            eprintln!(
+                "{} is built from {}#nixosConfigurations.{}",
+                machine.name,
+                machine.repository.as_deref().unwrap_or("?"),
+                machine.configuration.as_deref().unwrap_or("?")
+            );
+        }
+        Command::Machine(MachineCommand::Tag { machine, tags }) => {
+            update_tags(&client, &machine, |current| current.extend(tags))?;
+        }
+        Command::Machine(MachineCommand::Untag { machine, tags }) => {
+            update_tags(&client, &machine, |current| {
+                current.retain(|t| !tags.contains(t))
+            })?;
+        }
+        Command::Repos { json } => {
+            let repositories: Vec<Repository> = client.get("/api/repositories")?;
+            if json {
+                print_json(&repositories)?;
+            } else if repositories.is_empty() {
+                println!("No repositories. Add one with `mnix repo add <name> <url>`.");
+            } else {
+                let rows: Vec<Vec<String>> = repositories
+                    .iter()
+                    .map(|r| vec![r.name.clone(), r.url.clone()])
+                    .collect();
+                print!("{}", table(&["NAME", "URL"], &rows));
+            }
+        }
+        Command::Repo(RepoCommand::Add { name, url }) => {
+            let repository: Repository =
+                client.post("/api/repositories", &CreateRepository { name, url })?;
+            eprintln!("Added repository {} ({})", repository.name, repository.url);
+        }
+        Command::Deploy {
+            targets,
+            rev,
+            options,
+        } => {
+            let deployment: Deployment = client.post(
+                "/api/deployments",
+                &CreateDeployment {
+                    targets,
+                    rev,
+                    mode: options.mode.into(),
+                    requested_by: requested_by(&options),
+                },
+            )?;
+            return finish(&client, deployment, &options);
+        }
+        Command::Rollback { machine, options } => {
+            let deployment: Deployment = client.post(
+                &format!("/api/machines/{}/rollback", client::escape(&machine)),
+                &CreateRollback {
+                    mode: options.mode.into(),
+                    requested_by: requested_by(&options),
+                },
+            )?;
+            return finish(&client, deployment, &options);
+        }
+        Command::Deploys {
+            command: None,
+            limit,
+            json,
+        } => {
+            let deployments: Vec<Deployment> =
+                client.get(&format!("/api/deployments?limit={limit}"))?;
+            if json {
+                print_json(&deployments)?;
+            } else {
+                print!("{}", deploys::list(&deployments, OffsetDateTime::now_utc()));
+            }
+        }
+        Command::Deploys {
+            command: Some(DeploysCommand::Show { id, logs, json }),
+            ..
+        } => {
+            let deployment = deploys::find(&client, &id)?;
+            if json {
+                print_json(&deployment)?;
+            } else {
+                if logs {
+                    deploys::print_logs(&client, &deployment.id, 0)?;
+                }
+                print!("{}", deploys::show(&deployment));
+            }
+        }
+        Command::Deploys {
+            command: Some(DeploysCommand::Logs { id, follow }),
+            ..
+        } => {
+            let deployment = deploys::find(&client, &id)?;
+            if follow {
+                deploys::follow(&client, &deployment.id)?;
+            } else {
+                deploys::print_logs(&client, &deployment.id, 0)?;
+            }
+        }
+        Command::SigningKey => {
+            let key: SigningKey = client.get("/api/signing-key")?;
+            println!("{}", key.public_key);
+        }
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn requested_by(options: &DeployOptions) -> Option<String> {
+    options
+        .requested_by
+        .clone()
+        .or_else(|| std::env::var("USER").ok())
+        .filter(|name| !name.is_empty())
+}
+
+/// Follows a new deployment unless told not to; the exit code says whether
+/// it succeeded.
+fn finish(
+    client: &Client,
+    deployment: Deployment,
+    options: &DeployOptions,
+) -> anyhow::Result<ExitCode> {
+    if options.no_wait {
+        if options.json {
+            print_json(&deployment)?;
+        } else {
+            println!("{}", deployment.id);
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    eprintln!("Deployment {}", deployment.id);
+    let deployment = deploys::follow(client, &deployment.id)?;
+    if options.json {
+        print_json(&deployment)?;
+    }
+    Ok(match deployment.status {
+        DeploymentStatus::Succeeded => ExitCode::SUCCESS,
+        _ => ExitCode::FAILURE,
+    })
+}
+
+fn update_tags(
+    client: &Client,
+    machine: &str,
+    change: impl FnOnce(&mut Vec<String>),
+) -> anyhow::Result<()> {
+    let current: Machine = client.get(&format!("/api/machines/{}", client::escape(machine)))?;
+    let mut tags = current.tags;
+    change(&mut tags);
+    tags.sort();
+    tags.dedup();
+    let updated: Machine = client.put(
+        &format!("/api/machines/{}/tags", client::escape(machine)),
+        &SetTags { tags },
+    )?;
+    eprintln!("{}: {}", updated.name, updated.tags.join(", "));
     Ok(())
+}
+
+/// Formats rows under a header, padding every column but the last.
+pub fn table<S: AsRef<str>>(header: &[&str], rows: &[Vec<S>]) -> String {
+    let widths: Vec<usize> = (0..header.len())
+        .map(|i| {
+            rows.iter()
+                .map(|r| r[i].as_ref().len())
+                .chain([header[i].len()])
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let mut out = String::new();
+    let header: Vec<&str> = header.to_vec();
+    for cells in
+        std::iter::once(header).chain(rows.iter().map(|r| r.iter().map(AsRef::as_ref).collect()))
+    {
+        for (i, cell) in cells.iter().enumerate() {
+            if i + 1 == cells.len() {
+                out.push_str(cell);
+            } else {
+                out.push_str(&format!("{cell:<w$}  ", w = widths[i]));
+            }
+        }
+        out.push('\n');
+    }
+    out
 }
 
 fn admin_token(connection: &Connection) -> anyhow::Result<String> {
@@ -239,7 +574,7 @@ fn machine_table(machines: &[Machine], now: OffsetDateTime, color: bool) -> Stri
 }
 
 /// `2026-10-22T08:00:00Z` → `5m ago`, relative to `now`.
-fn ago(timestamp: &str, now: OffsetDateTime) -> String {
+pub fn ago(timestamp: &str, now: OffsetDateTime) -> String {
     let Ok(then) = OffsetDateTime::parse(timestamp, &Rfc3339) else {
         return timestamp.to_owned();
     };
@@ -285,6 +620,9 @@ mod tests {
             agent_version: None,
             current_system: system.map(str::to_owned),
             facts: None,
+            repository: None,
+            configuration: None,
+            tags: Vec::new(),
         };
         let table = machine_table(
             &[

@@ -8,12 +8,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::Context;
+use mnix_nix::{PathInfo, StorePath};
 
 use crate::activate::{Host, ProfileGeneration};
 use crate::config::{AgentConfig, HealthChecks};
 use crate::health;
-use crate::signature::PathInfo;
-use crate::store_path::StorePath;
 
 pub const SYSTEM_PROFILE: &str = "/nix/var/nix/profiles/system";
 pub const CURRENT_SYSTEM: &str = "/run/current-system";
@@ -30,29 +29,7 @@ impl Host for NixosHost {
     }
 
     fn path_info(&self, path: &StorePath) -> anyhow::Result<PathInfo> {
-        let query =
-            |flag: &str| run(Command::new("nix-store").args(["--query", flag, path.as_str()]));
-        let nar_size = query("--size")?;
-        // `nix path-info --json` has changed format between Nix releases;
-        // the plain-text output and `nix-store --query` have not.
-        let sigs = run(Command::new("nix")
-            .args([
-                "--extra-experimental-features",
-                "nix-command",
-                "path-info",
-                "--sigs",
-            ])
-            .arg(path.as_str()))?;
-        Ok(PathInfo {
-            path: path.to_string(),
-            nar_hash: query("--hash")?.trim().to_owned(),
-            nar_size: nar_size
-                .trim()
-                .parse()
-                .with_context(|| format!("unexpected NAR size {nar_size:?}"))?,
-            references: query("--references")?.lines().map(str::to_owned).collect(),
-            signatures: sigs.split_whitespace().skip(1).map(str::to_owned).collect(),
-        })
+        mnix_nix::query_path_info(path)
     }
 
     fn is_nixos_system(&self, path: &StorePath) -> bool {
@@ -79,6 +56,13 @@ impl Host for NixosHost {
             .and_then(|link| generation_number("system", link))
             .with_context(|| format!("unexpected profile link {}", link.display()))?;
         Ok(Some((number, StorePath::resolve(profile)?)))
+    }
+
+    fn profile_generations(&self) -> anyhow::Result<Vec<ProfileGeneration>> {
+        crate::facts::generations(Path::new(SYSTEM_PROFILE))?
+            .into_iter()
+            .map(|g| Ok((g.number, StorePath::parse(&g.store_path)?)))
+            .collect()
     }
 
     fn set_profile(&self, path: &StorePath) -> anyhow::Result<()> {

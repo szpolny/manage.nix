@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM machine_tags WHERE machine_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "69eca786fb3a9ec9efdf700cb364da6916709aa44bd94eba2130b9ef6b45b7df"
+}

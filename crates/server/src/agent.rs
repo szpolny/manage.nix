@@ -1,5 +1,11 @@
 //! The agent-facing endpoints: enrollment and the WebSocket session.
+//!
+//! Besides heartbeats and facts, a session hands the machine's released
+//! activations to its agent (again on every new session, until the agent
+//! reports a phase), stores what the agent reports, and answers an agent
+//! that is waiting for confirmation.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
@@ -7,14 +13,18 @@ use axum::extract::State;
 use axum::http::{header, HeaderMap};
 use axum::response::Response;
 use axum::Json;
-use mnix_protocol::api::{EnrollRequest, EnrollResponse};
-use mnix_protocol::{AgentMessage, Hello, ServerMessage, PROTOCOL_VERSION};
+use mnix_protocol::api::{DeploymentKind, EnrollRequest, EnrollResponse};
+use mnix_protocol::{
+    Activate, ActivationPhase, ActivationReport, ActivationTarget, AgentMessage, Hello,
+    ServerMessage, PROTOCOL_VERSION,
+};
 use mnix_store::{disconnect_reason, Machine, NewSession, Redemption};
 use time::OffsetDateTime;
+use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::app::{ApiError, AppState, State as AppStateRef};
-use crate::secret;
+use crate::{deploy, secret};
 
 /// The largest WebSocket message the server accepts from an agent.
 const MAX_MESSAGE_SIZE: usize = 1 << 20;
@@ -92,6 +102,8 @@ struct Session<'a> {
     state: &'a AppState,
     machine: Machine,
     socket: WebSocket,
+    /// Activations sent on this session and not acknowledged yet.
+    sent: HashSet<Uuid>,
 }
 
 /// What ended a session.
@@ -108,6 +120,7 @@ impl Session<'_> {
             state,
             machine,
             socket,
+            sent: HashSet::new(),
         };
         let name = session.machine.name.clone();
         let hello = match session.receive_hello().await {
@@ -210,12 +223,24 @@ impl Session<'_> {
 
     async fn serve(&mut self, session_id: Uuid) -> End {
         let mut shutdown = self.state.shutdown.clone();
+        let mut activations = self.state.activations.subscribe();
+        if let Err(end) = self.send_activations().await {
+            return end;
+        }
+        let mut deadline = Instant::now() + self.timeout();
         loop {
             let message = tokio::select! {
-                message = tokio::time::timeout(self.timeout(), self.next_message()) => message,
+                message = tokio::time::timeout_at(deadline, self.next_message()) => Some(message),
+                _ = activations.changed() => None,
                 _ = shutdown.wait_for(|stopping| *stopping) => {
                     return End::Reason(disconnect_reason::SERVER_SHUTDOWN);
                 }
+            };
+            let Some(message) = message else {
+                if let Err(end) = self.send_activations().await {
+                    return end;
+                }
+                continue;
             };
             let message = match message {
                 Err(_) => return End::Reason(disconnect_reason::HEARTBEAT_TIMEOUT),
@@ -224,6 +249,10 @@ impl Session<'_> {
             };
             let now = OffsetDateTime::now_utc();
             let store = &self.state.store;
+            let heartbeat = matches!(
+                message,
+                AgentMessage::Heartbeat | AgentMessage::Facts { .. }
+            );
             let result = match message {
                 AgentMessage::Heartbeat => store.heartbeat(session_id, now).await,
                 AgentMessage::Facts { facts } => {
@@ -235,9 +264,22 @@ impl Session<'_> {
                 AgentMessage::Hello(_) => {
                     return End::ProtocolError("unexpected hello".to_owned());
                 }
+                AgentMessage::ActivationStatus {
+                    deployment_id,
+                    phase,
+                } => self.activation_status(&deployment_id, phase).await,
+                AgentMessage::ActivationLog {
+                    deployment_id,
+                    offset,
+                    text,
+                } => self.activation_log(&deployment_id, offset, &text).await,
+                AgentMessage::ActivationResult {
+                    deployment_id,
+                    report,
+                } => self.activation_result(&deployment_id, report).await,
             };
             match result {
-                Ok(true) => {}
+                Ok(true) => deadline = Instant::now() + self.timeout(),
                 // Another session replaced this one, or the reaper closed it.
                 Ok(false) => return End::Reason(disconnect_reason::REPLACED),
                 Err(e) => {
@@ -245,7 +287,140 @@ impl Session<'_> {
                     return End::Reason(disconnect_reason::CLOSED);
                 }
             }
+            // Covers activations released by another server, which cannot
+            // notify this one.
+            if heartbeat {
+                if let Err(end) = self.send_activations().await {
+                    return end;
+                }
+            }
         }
+    }
+
+    /// Sends the machine's released activations that this session has not
+    /// sent yet.
+    async fn send_activations(&mut self) -> Result<(), End> {
+        let pending = match self.state.store.pending_activations(self.machine.id).await {
+            Ok(pending) => pending,
+            Err(e) => {
+                tracing::error!("{}: {e}", self.machine.name);
+                return Err(End::Reason(disconnect_reason::CLOSED));
+            }
+        };
+        for activation in pending {
+            if !self.sent.insert(activation.deployment_id) {
+                continue;
+            }
+            let target = match (activation.kind, activation.store_path) {
+                (DeploymentKind::Rollback, _) => ActivationTarget::PreviousGeneration,
+                (DeploymentKind::Deploy, Some(store_path)) => {
+                    ActivationTarget::System { store_path }
+                }
+                (DeploymentKind::Deploy, None) => continue,
+            };
+            tracing::info!(
+                "{}: sending deployment {}",
+                self.machine.name,
+                activation.deployment_id
+            );
+            let message = ServerMessage::Activate(Activate {
+                deployment_id: activation.deployment_id.to_string(),
+                target,
+                mode: activation.mode,
+                signatures: activation.signatures,
+                confirm_timeout_secs: self.state.settings.confirm_timeout.as_secs(),
+            });
+            if let Err(e) = self.send(&message).await {
+                tracing::info!("{}: sending: {e}", self.machine.name);
+                return Err(End::Reason(disconnect_reason::CLOSED));
+            }
+        }
+        Ok(())
+    }
+
+    /// The agent's report of a new phase: it has the request. An agent
+    /// waiting for confirmation gets it if the deployment still expects
+    /// this machine.
+    async fn activation_status(
+        &mut self,
+        deployment_id: &str,
+        phase: ActivationPhase,
+    ) -> mnix_store::Result<bool> {
+        let Some(id) = self.deployment_id(deployment_id) else {
+            return Ok(true);
+        };
+        let active = self
+            .state
+            .store
+            .record_activation_phase(id, self.machine.id, phase, OffsetDateTime::now_utc())
+            .await?;
+        tracing::info!(
+            "{}: deployment {id}: {}{}",
+            self.machine.name,
+            phase.as_str(),
+            if active { "" } else { " (no longer expected)" }
+        );
+        if active && phase == ActivationPhase::AwaitingConfirmation {
+            let confirm = ServerMessage::Confirm {
+                deployment_id: deployment_id.to_owned(),
+            };
+            if let Err(e) = self.send(&confirm).await {
+                tracing::info!("{}: sending confirm: {e}", self.machine.name);
+            }
+        }
+        Ok(true)
+    }
+
+    async fn activation_log(
+        &mut self,
+        deployment_id: &str,
+        offset: u64,
+        text: &str,
+    ) -> mnix_store::Result<bool> {
+        if let Some(id) = self.deployment_id(deployment_id) {
+            self.state
+                .store
+                .append_agent_log(id, self.machine.id, offset, text, OffsetDateTime::now_utc())
+                .await?;
+        }
+        Ok(true)
+    }
+
+    async fn activation_result(
+        &mut self,
+        deployment_id: &str,
+        report: ActivationReport,
+    ) -> mnix_store::Result<bool> {
+        if let Some(id) = self.deployment_id(deployment_id) {
+            tracing::info!(
+                "{}: deployment {id}: {:?}{}",
+                self.machine.name,
+                report.status,
+                report
+                    .message
+                    .as_deref()
+                    .map(|m| format!(": {m}"))
+                    .unwrap_or_default()
+            );
+            deploy::finish(self.state, id, self.machine.id, deploy::outcome(report)).await;
+        }
+        // Acknowledge even results the server does not expect, so the
+        // agent stops sending them.
+        let received = ServerMessage::ResultReceived {
+            deployment_id: deployment_id.to_owned(),
+        };
+        if let Err(e) = self.send(&received).await {
+            tracing::info!("{}: sending: {e}", self.machine.name);
+        }
+        Ok(true)
+    }
+
+    fn deployment_id(&self, id: &str) -> Option<Uuid> {
+        let parsed = Uuid::parse_str(id).ok();
+        if parsed.is_none() {
+            tracing::warn!("{}: invalid deployment ID {id:?}", self.machine.name);
+        }
+        parsed
     }
 
     /// The next protocol message, skipping control frames and messages of
@@ -312,7 +487,17 @@ fn parse(text: &str) -> Result<Option<AgentMessage>, String> {
         .to_owned();
     match serde_json::from_value(value) {
         Ok(message) => Ok(Some(message)),
-        Err(_) if !matches!(kind.as_str(), "hello" | "heartbeat" | "facts") => {
+        Err(_)
+            if !matches!(
+                kind.as_str(),
+                "hello"
+                    | "heartbeat"
+                    | "facts"
+                    | "activation_status"
+                    | "activation_log"
+                    | "activation_result"
+            ) =>
+        {
             tracing::debug!("ignoring unknown agent message {kind:?}");
             Ok(None)
         }

@@ -1,0 +1,92 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id, organization_id, kind, status, message, repository_id, rev, commit_id,\n                    mode, requested_by, created_at, started_at, finished_at\n             FROM deployments WHERE organization_id = ?\n             ORDER BY created_at DESC, rowid DESC LIMIT ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "organization_id",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "kind",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "status",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "message",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "repository_id",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "rev",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "commit_id",
+        "ordinal": 7,
+        "type_info": "Text"
+      },
+      {
+        "name": "mode",
+        "ordinal": 8,
+        "type_info": "Text"
+      },
+      {
+        "name": "requested_by",
+        "ordinal": 9,
+        "type_info": "Text"
+      },
+      {
+        "name": "created_at",
+        "ordinal": 10,
+        "type_info": "Text"
+      },
+      {
+        "name": "started_at",
+        "ordinal": 11,
+        "type_info": "Text"
+      },
+      {
+        "name": "finished_at",
+        "ordinal": 12,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "57ba80a16b7f7922e4b268edb826bcbf2b57812f9d2813f788bd5631844a59db"
+}

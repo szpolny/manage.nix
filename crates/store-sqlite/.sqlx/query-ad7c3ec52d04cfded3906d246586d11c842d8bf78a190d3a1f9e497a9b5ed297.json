@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT id, organization_id, name, created_at, enrolled_at, agent_version,\n                      facts, facts_updated_at, last_seen_at,\n                      EXISTS (\n                          SELECT 1 FROM agent_sessions AS s\n                          WHERE s.machine_id = machines.id AND s.disconnected_at IS NULL\n                      ) AS \"connected!: bool\"\n               FROM machines WHERE credential_hash = ?",
+  "query": "SELECT id, organization_id, kind, status, message, repository_id, rev, commit_id,\n                    mode, requested_by, created_at, started_at, finished_at\n             FROM deployments WHERE id = ?",
   "describe": {
     "columns": [
       {
@@ -14,44 +14,59 @@
         "type_info": "Text"
       },
       {
-        "name": "name",
+        "name": "kind",
         "ordinal": 2,
         "type_info": "Text"
       },
       {
-        "name": "created_at",
+        "name": "status",
         "ordinal": 3,
         "type_info": "Text"
       },
       {
-        "name": "enrolled_at",
+        "name": "message",
         "ordinal": 4,
         "type_info": "Text"
       },
       {
-        "name": "agent_version",
+        "name": "repository_id",
         "ordinal": 5,
         "type_info": "Text"
       },
       {
-        "name": "facts",
+        "name": "rev",
         "ordinal": 6,
         "type_info": "Text"
       },
       {
-        "name": "facts_updated_at",
+        "name": "commit_id",
         "ordinal": 7,
         "type_info": "Text"
       },
       {
-        "name": "last_seen_at",
+        "name": "mode",
         "ordinal": 8,
         "type_info": "Text"
       },
       {
-        "name": "connected!: bool",
+        "name": "requested_by",
         "ordinal": 9,
-        "type_info": "Null"
+        "type_info": "Text"
+      },
+      {
+        "name": "created_at",
+        "ordinal": 10,
+        "type_info": "Text"
+      },
+      {
+        "name": "started_at",
+        "ordinal": 11,
+        "type_info": "Text"
+      },
+      {
+        "name": "finished_at",
+        "ordinal": 12,
+        "type_info": "Text"
       }
     ],
     "parameters": {
@@ -66,9 +81,12 @@
       true,
       true,
       true,
+      false,
+      false,
+      false,
       true,
-      null
+      true
     ]
   },
-  "hash": "513a8a283f719aeec03b618112fec9e09ca50d971957589f50f3ddcf159e0a5f"
+  "hash": "ad7c3ec52d04cfded3906d246586d11c842d8bf78a190d3a1f9e497a9b5ed297"
 }

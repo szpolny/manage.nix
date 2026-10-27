@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT deployment_id, machine_id FROM deployment_machines\n             WHERE status = 'activating' AND released_at < ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "deployment_id",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "machine_id",
+        "ordinal": 1,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "7bafbcc9b34b518cf0aa87b5c8deb8bf4708c116dd30ee6d01b4d84a2e5de62f"
+}

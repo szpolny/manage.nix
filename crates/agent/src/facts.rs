@@ -6,7 +6,7 @@ use anyhow::Context;
 use mnix_protocol::{Facts, Generation};
 
 use crate::host::{generation_number, BOOTED_SYSTEM, CURRENT_SYSTEM, SYSTEM_PROFILE};
-use crate::store_path::StorePath;
+use mnix_nix::StorePath;
 
 pub fn collect() -> anyhow::Result<Facts> {
     let current = StorePath::resolve(Path::new(CURRENT_SYSTEM))?;

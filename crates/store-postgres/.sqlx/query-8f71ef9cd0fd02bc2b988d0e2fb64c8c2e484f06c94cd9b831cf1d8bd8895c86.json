@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE deployment_machines SET phase = $1, accepted_at = COALESCE(accepted_at, $2)\n             WHERE deployment_id = $3 AND machine_id = $4 AND status = 'activating'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Timestamptz",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8f71ef9cd0fd02bc2b988d0e2fb64c8c2e484f06c94cd9b831cf1d8bd8895c86"
+}

@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE deployments SET status = 'building', started_at = $1\n             WHERE id = (\n                 SELECT id FROM deployments WHERE status = 'queued'\n                 ORDER BY created_at LIMIT 1\n                 FOR UPDATE SKIP LOCKED\n             )\n             RETURNING id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "584317c21e98eadafd8ca144961174ff070abfeb4ffa4b8d121c427b65db8018"
+}

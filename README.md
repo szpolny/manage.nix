@@ -7,11 +7,12 @@ A dashboard and control plane for fleets of Nix-managed machines.
 | Path | Contents |
 |---|---|
 | `crates/protocol` | Message types shared by agent and server |
+| `crates/nix` | Store paths and signatures (signing on the server, verifying on the agent) |
 | `crates/store` | Storage facade: `connect(url)` and the shared test suite |
 | `crates/store-core` | The `Store` trait and records |
 | `crates/store-sqlite`, `crates/store-postgres` | The two backends, each with its sqlx offline data in `.sqlx/` |
 | `crates/agent` | `mnix-agent`: enrollment, the server connection, activation, rollback, facts |
-| `crates/server` | `mnix-server`: API, scheduler, builds |
+| `crates/server` | `mnix-server`: API, enrollment, builds, deployments |
 | `crates/cli` | `mnix`: command-line client |
 | `scripts/sqlx-prepare` | Regenerates the sqlx offline data for both backends |
 | `migrations/{sqlite,postgres}` | sqlx migrations, same numbering in both |
@@ -35,6 +36,28 @@ On the machine, set `services.manage-nix.agent.server.url` and
 `enrollmentTokenFile` (a file holding that token). The `mnix-agent` service
 enrolls once, stores its credential in `/var/lib/manage-nix`, and stays
 connected. The protocol's message types live in `crates/protocol`.
+
+## Deploying
+
+The server builds each machine from a Git flake
+(`nixosConfigurations.<name>`), signs the result, and pushes it to Attic
+(`services.manage-nix.server.attic`). Machines need the server's key in
+`services.manage-nix.agent.trustedPublicKeys` (`mnix signing-key` prints it)
+and the cache in `nix.settings.substituters`.
+
+```sh
+mnix repo add infra https://git.example.com/infra.git
+mnix machine configure web-1 --repo infra      # builds nixosConfigurations.web-1
+mnix machine tag web-1 web
+mnix deploy tag:web --rev main                 # follows the log; exit 0 if all succeeded
+mnix deploys                                   # history
+mnix deploys show <id> --logs
+mnix rollback web-1                            # previous system profile generation
+```
+
+Each machine activates its system in its own systemd unit, checks its
+health, and then must reach the server over a **new** connection within
+`confirmTimeout` (60 s); otherwise it rolls back on its own.
 
 ## Agent
 
@@ -70,8 +93,8 @@ nix.linux-builder.enable = true;
 ```
 
 Don't run the VM tests *inside* the Linux builder
-(`checks.aarch64-linux.vm-*`) on a Mac without nested virtualization (before
-M3): QEMU falls back to emulation and the multi-machine tests time out.
+(`checks.aarch64-linux.vm-*`) on a Mac without nested virtualization: QEMU
+falls back to emulation and the multi-machine tests time out.
 
 SQL queries use sqlx's checked macros against committed offline data in
 `crates/store-sqlite/.sqlx` and `crates/store-postgres/.sqlx`

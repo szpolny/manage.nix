@@ -1,0 +1,318 @@
+//! Building a machine's system: fetch the repository into a mirror, build
+//! the machine's NixOS configuration, sign the result, and push it to the
+//! binary cache.
+//!
+//! Everything runs through the `git`, `nix`, and `attic` command-line tools
+//! with fixed arguments; nothing goes through a shell. Their output goes to
+//! the deployment's log.
+
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::{Duration, Instant};
+
+use anyhow::Context;
+use mnix_nix::{SecretKey, StorePath};
+use mnix_store::{log_source, NewLogEntry, Store};
+use time::OffsetDateTime;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::process::Command;
+use uuid::Uuid;
+
+/// How often buffered output is written to the log.
+const LOG_FLUSH: Duration = Duration::from_secs(1);
+/// The most output buffered before it is written.
+const LOG_BUFFER: usize = 16 * 1024;
+
+/// Pushes built systems to an Attic cache with the `attic` client.
+#[derive(Debug, Clone)]
+pub struct Attic {
+    /// The cache's name on the server.
+    pub cache: String,
+    /// `XDG_CONFIG_HOME` holding `attic/config.toml` for the server.
+    config_home: PathBuf,
+}
+
+/// The name of the Attic server in the generated client configuration.
+const ATTIC_SERVER: &str = "mnix";
+
+impl Attic {
+    /// Writes a client configuration for `endpoint` with `token` under
+    /// `state_dir`, readable only by the server.
+    pub fn configure(
+        state_dir: &Path,
+        endpoint: &str,
+        cache: &str,
+        token: &str,
+    ) -> anyhow::Result<Self> {
+        let plain = |s: &str| {
+            !s.is_empty() && !s.contains(|c: char| c == '"' || c == '\\' || c.is_control())
+        };
+        anyhow::ensure!(plain(endpoint), "invalid Attic endpoint {endpoint:?}");
+        anyhow::ensure!(plain(token), "invalid Attic token");
+        anyhow::ensure!(
+            crate::api::is_valid_name(cache),
+            "invalid Attic cache name {cache:?}"
+        );
+        let config_home = state_dir.join("attic");
+        let dir = config_home.join("attic");
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let config = format!(
+            "default-server = \"{ATTIC_SERVER}\"\n\n[servers.{ATTIC_SERVER}]\nendpoint = \"{endpoint}\"\ntoken = \"{token}\"\n"
+        );
+        crate::write_private(&dir.join("config.toml"), &config)?;
+        Ok(Self {
+            cache: cache.to_owned(),
+            config_home,
+        })
+    }
+}
+
+pub struct Builder {
+    /// Mirrors in `repositories/`, garbage collector roots in `gcroots/`.
+    pub state_dir: PathBuf,
+    pub signing_key: SecretKey,
+    pub attic: Option<Attic>,
+}
+
+/// A system built for one machine.
+#[derive(Debug, Clone)]
+pub struct Built {
+    pub store_path: StorePath,
+    pub signature: String,
+}
+
+impl Builder {
+    /// Clones the repository on first use and fetches it afterwards.
+    /// Returns the mirror's path.
+    pub async fn fetch(
+        &self,
+        repository_id: Uuid,
+        url: &str,
+        log: &mut Log,
+    ) -> anyhow::Result<PathBuf> {
+        let dir = self.state_dir.join("repositories");
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .with_context(|| format!("creating {}", dir.display()))?;
+        let mirror = dir.join(format!("{repository_id}.git"));
+        if mirror.exists() {
+            log.line(format!("fetching {url}")).await;
+            run(
+                git()
+                    .arg("-C")
+                    .arg(&mirror)
+                    .args(["fetch", "--prune", "--quiet", "origin"]),
+                log,
+            )
+            .await?;
+        } else {
+            log.line(format!("cloning {url}")).await;
+            let partial = dir.join(format!("{repository_id}.git.partial"));
+            let _ = tokio::fs::remove_dir_all(&partial).await;
+            run(
+                git()
+                    .args(["clone", "--mirror", "--quiet", "--"])
+                    .arg(url)
+                    .arg(&partial),
+                log,
+            )
+            .await?;
+            tokio::fs::rename(&partial, &mirror).await?;
+        }
+        Ok(mirror)
+    }
+
+    /// The commit `rev` names in the mirror.
+    pub async fn resolve(&self, mirror: &Path, rev: &str, log: &mut Log) -> anyhow::Result<String> {
+        let out = run(
+            git()
+                .arg("-C")
+                .arg(mirror)
+                .args(["rev-parse", "--verify", "--quiet", "--end-of-options"])
+                .arg(format!("{rev}^{{commit}}")),
+            log,
+        )
+        .await
+        .with_context(|| format!("{rev:?} is not a branch, tag, or commit of the repository"))?;
+        let commit = out.trim().to_owned();
+        anyhow::ensure!(
+            commit.len() >= 40 && commit.chars().all(|c| c.is_ascii_hexdigit()),
+            "unexpected commit {commit:?}"
+        );
+        Ok(commit)
+    }
+
+    /// Builds `nixosConfigurations.<configuration>` at `commit`, signs it,
+    /// and pushes it to the cache.
+    pub async fn build(
+        &self,
+        mirror: &Path,
+        commit: &str,
+        machine_id: Uuid,
+        configuration: &str,
+        log: &mut Log,
+    ) -> anyhow::Result<Built> {
+        let mirror = mirror.to_str().context("non-UTF-8 state directory")?;
+        let installable = format!(
+            "git+file://{mirror}?rev={commit}#nixosConfigurations.\"{configuration}\".config.system.build.toplevel"
+        );
+        let gcroots = self.state_dir.join("gcroots");
+        tokio::fs::create_dir_all(&gcroots).await?;
+        log.line(format!("building {installable}")).await;
+        let started = Instant::now();
+        let out = run(
+            Command::new("nix")
+                .args([
+                    "--extra-experimental-features",
+                    "nix-command flakes",
+                    "build",
+                    "--print-build-logs",
+                    "--print-out-paths",
+                    "--no-write-lock-file",
+                    "--out-link",
+                ])
+                // Keeps the latest system of each machine from being
+                // garbage collected.
+                .arg(gcroots.join(machine_id.to_string()))
+                .arg(&installable),
+            log,
+        )
+        .await?;
+        let store_path = out
+            .lines()
+            .last()
+            .map(str::trim)
+            .context("nix build printed no store path")?;
+        let store_path = StorePath::parse(store_path)?;
+        log.line(format!(
+            "built {store_path} in {}",
+            humantime::format_duration(Duration::from_secs(started.elapsed().as_secs()))
+        ))
+        .await;
+
+        let info = {
+            let path = store_path.clone();
+            tokio::task::spawn_blocking(move || mnix_nix::query_path_info(&path)).await??
+        };
+        let signature = self.signing_key.sign(&info);
+        log.line(format!("signed with {}", self.signing_key.name()))
+            .await;
+
+        if let Some(attic) = &self.attic {
+            log.line(format!("pushing to the Attic cache {}", attic.cache))
+                .await;
+            run(
+                Command::new("attic")
+                    .env("XDG_CONFIG_HOME", &attic.config_home)
+                    .args(["push", "--"])
+                    .arg(format!("{ATTIC_SERVER}:{}", attic.cache))
+                    .arg(store_path.as_str()),
+                log,
+            )
+            .await?;
+        }
+        Ok(Built {
+            store_path,
+            signature,
+        })
+    }
+}
+
+fn git() -> Command {
+    let mut command = Command::new("git");
+    // Never wait for a password prompt.
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    command
+}
+
+/// Runs a command, streaming its stderr to `log`, and returns its stdout.
+async fn run(command: &mut Command, log: &mut Log) -> anyhow::Result<String> {
+    let program = command
+        .as_std()
+        .get_program()
+        .to_string_lossy()
+        .into_owned();
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("running {program}"))?;
+    let mut stdout = child.stdout.take().expect("piped");
+    let stdout = tokio::spawn(async move {
+        let mut out = Vec::new();
+        stdout.read_to_end(&mut out).await.map(|_| out)
+    });
+    let mut lines = BufReader::new(child.stderr.take().expect("piped")).lines();
+    let mut last = String::new();
+    while let Some(line) = lines.next_line().await? {
+        log.line(line.clone()).await;
+        last = line;
+    }
+    let status = child.wait().await?;
+    let out = String::from_utf8_lossy(&stdout.await??).into_owned();
+    anyhow::ensure!(
+        status.success(),
+        "{program} failed ({status}){}",
+        if last.is_empty() {
+            String::new()
+        } else {
+            format!(": {last}")
+        }
+    );
+    Ok(out)
+}
+
+/// Buffers output for a deployment's log and writes it in batches.
+pub struct Log {
+    store: std::sync::Arc<dyn Store>,
+    deployment_id: Uuid,
+    machine_id: Option<Uuid>,
+    buffer: String,
+    flushed: Instant,
+}
+
+impl Log {
+    pub fn new(
+        store: std::sync::Arc<dyn Store>,
+        deployment_id: Uuid,
+        machine_id: Option<Uuid>,
+    ) -> Self {
+        Self {
+            store,
+            deployment_id,
+            machine_id,
+            buffer: String::new(),
+            flushed: Instant::now(),
+        }
+    }
+
+    pub async fn line(&mut self, line: impl Into<String>) {
+        let line = line.into().replace('\0', " ");
+        tracing::debug!(deployment = %self.deployment_id, "{line}");
+        self.buffer.push_str(&line);
+        self.buffer.push('\n');
+        if self.buffer.len() >= LOG_BUFFER || self.flushed.elapsed() >= LOG_FLUSH {
+            self.flush().await;
+        }
+    }
+
+    pub async fn flush(&mut self) {
+        self.flushed = Instant::now();
+        if self.buffer.is_empty() {
+            return;
+        }
+        let entry = NewLogEntry {
+            deployment_id: self.deployment_id,
+            machine_id: self.machine_id,
+            source: log_source::SERVER.to_owned(),
+            text: std::mem::take(&mut self.buffer),
+            created_at: OffsetDateTime::now_utc(),
+        };
+        // Losing log output must not fail the deployment.
+        if let Err(e) = self.store.append_log(&entry).await {
+            tracing::error!("writing the log of deployment {}: {e}", self.deployment_id);
+        }
+    }
+}

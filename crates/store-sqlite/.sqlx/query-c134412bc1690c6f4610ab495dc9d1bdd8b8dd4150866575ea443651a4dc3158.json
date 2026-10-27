@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE deployments SET status = 'failed', message = ?, finished_at = ?\n             WHERE id = ? AND finished_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "c134412bc1690c6f4610ab495dc9d1bdd8b8dd4150866575ea443651a4dc3158"
+}

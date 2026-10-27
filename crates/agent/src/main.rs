@@ -10,16 +10,16 @@ mod daemon;
 mod facts;
 mod health;
 mod host;
-mod signature;
-mod store_path;
+mod job;
 
 use std::fs::File;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
-use mnix_protocol::{ActivationMode, ActivationReport, ActivationStatus};
+use mnix_protocol::{ActivationMode, ActivationReport, ActivationStatus, ActivationTarget};
 
 /// Serializes activations on this machine.
 const LOCK_PATH: &str = "/run/manage-nix/activate.lock";
@@ -43,7 +43,14 @@ enum Command {
         store_path: String,
         #[arg(long, value_enum, default_value_t = Mode::Switch)]
         mode: Mode,
+        /// A signature on the path (`<key name>:<base64>`) to check in
+        /// addition to those Nix has. Repeatable.
+        #[arg(long = "signature", value_name = "SIGNATURE")]
+        signatures: Vec<String>,
     },
+    /// Run an activation requested by the server (started by `run`).
+    #[command(hide = true)]
+    ActivationJob { dir: PathBuf },
     /// Print facts about this machine as JSON.
     Facts,
     /// Connect to the control plane and stay connected.
@@ -88,6 +95,8 @@ fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        // Logs often go to files (activation logs) and the journal.
+        .with_ansi(std::io::stderr().is_terminal())
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
@@ -118,16 +127,28 @@ fn main() -> anyhow::Result<ExitCode> {
             }))?;
             Ok(ExitCode::SUCCESS)
         }
-        Some(Command::Activate { store_path, mode }) => {
+        Some(Command::Activate {
+            store_path,
+            mode,
+            signatures,
+        }) => {
             let _lock = lock()?;
-            let report = activate::activate(&host::NixosHost, &store_path, mode.into());
+            let request = activate::Request {
+                target: ActivationTarget::System { store_path },
+                mode: mode.into(),
+                signatures,
+            };
+            let report = activate::activate(&host::NixosHost, &request, &activate::Unobserved);
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(exit_code(&report))
         }
+        // The report goes to the job directory; stdout is the job's log.
+        Some(Command::ActivationJob { dir }) => Ok(exit_code(&job::run(&dir)?)),
     }
 }
 
-fn lock() -> anyhow::Result<File> {
+/// Takes the machine-wide activation lock, failing if it is held.
+pub(crate) fn lock() -> anyhow::Result<File> {
     let path = std::path::Path::new(LOCK_PATH);
     std::fs::create_dir_all(path.parent().unwrap_or(path))?;
     let file = File::create(path).with_context(|| format!("creating {LOCK_PATH}"))?;

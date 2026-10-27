@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO deployment_machines\n                     (deployment_id, machine_id, configuration, status, signatures, released_at)\n                 VALUES ($1, $2, $3, $4, '{}', $5)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6147f7e3ea76065d74c7e64235cca7e94b3826c0ebac34aca807c4140c29968f"
+}

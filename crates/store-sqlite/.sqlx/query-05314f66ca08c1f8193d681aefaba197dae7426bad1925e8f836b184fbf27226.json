@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE deployment_machines SET phase = ?, accepted_at = COALESCE(accepted_at, ?)\n             WHERE deployment_id = ? AND machine_id = ? AND status = 'activating'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "05314f66ca08c1f8193d681aefaba197dae7426bad1925e8f836b184fbf27226"
+}

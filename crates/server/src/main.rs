@@ -3,6 +3,8 @@
 mod agent;
 mod api;
 mod app;
+mod build;
+mod deploy;
 #[cfg(test)]
 mod e2e_tests;
 mod secret;
@@ -17,6 +19,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
+use mnix_nix::SecretKey;
 use mnix_store::Backend;
 use time::OffsetDateTime;
 
@@ -38,7 +41,7 @@ enum Command {
         database: DatabaseArgs,
     },
     /// Run the control plane: the HTTP API and the agent endpoint.
-    Serve(ServeArgs),
+    Serve(Box<ServeArgs>),
 }
 
 #[derive(Debug, Args)]
@@ -77,6 +80,54 @@ struct ServeArgs {
     /// How long new enrollment tokens are valid unless the request says.
     #[arg(long, value_parser = humantime::parse_duration, default_value = "1h")]
     enrollment_token_ttl: Duration,
+
+    /// Where the server keeps repository mirrors, garbage collector roots
+    /// for built systems, and the generated signing key.
+    #[arg(long, env = "MNIX_STATE_DIR", default_value = "/var/lib/manage-nix")]
+    state_dir: PathBuf,
+
+    /// Nix secret key (`nix key generate-secret`) the server signs built
+    /// systems with. Machines trust its public key in
+    /// `services.manage-nix.agent.trustedPublicKeys`. Defaults to
+    /// `<state dir>/signing-key`.
+    #[arg(long, env = "MNIX_SIGNING_KEY_FILE")]
+    signing_key_file: Option<PathBuf>,
+
+    /// Generate a key into --signing-key-file if the file does not exist.
+    #[arg(long)]
+    create_signing_key: bool,
+
+    /// The name of a generated signing key.
+    #[arg(long, default_value = "manage-nix-1")]
+    signing_key_name: String,
+
+    /// Attic server to push built systems to, for example
+    /// `https://cache.example.com/`. Without one, machines must be able to
+    /// fetch the systems from somewhere else.
+    #[arg(long, env = "MNIX_ATTIC_ENDPOINT", requires_all = ["attic_cache", "attic_token_file"])]
+    attic_endpoint: Option<String>,
+
+    /// The Attic cache to push to.
+    #[arg(long, env = "MNIX_ATTIC_CACHE", requires = "attic_endpoint")]
+    attic_cache: Option<String>,
+
+    /// File containing an Attic token that may push to the cache.
+    #[arg(long, env = "MNIX_ATTIC_TOKEN_FILE", requires = "attic_endpoint")]
+    attic_token_file: Option<PathBuf>,
+
+    /// How long a machine has, after a healthy activation, to reach the
+    /// server over a new connection before it rolls back on its own.
+    #[arg(long, value_parser = humantime::parse_duration, default_value = "60s")]
+    confirm_timeout: Duration,
+
+    /// How long a machine may take from receiving a system (or coming
+    /// online to receive it) to reporting the result.
+    #[arg(long, value_parser = humantime::parse_duration, default_value = "30m")]
+    activation_timeout: Duration,
+
+    /// How long fetching and building a deployment may take.
+    #[arg(long, value_parser = humantime::parse_duration, default_value = "1h")]
+    build_timeout: Duration,
 }
 
 #[tokio::main]
@@ -98,7 +149,7 @@ async fn main() -> anyhow::Result<()> {
             store.migrate().await?;
             println!("migrated {:?} database", store.backend());
         }
-        Some(Command::Serve(args)) => serve(args).await?,
+        Some(Command::Serve(args)) => serve(*args).await?,
     }
     Ok(())
 }
@@ -109,12 +160,44 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             && args.heartbeat_timeout > args.heartbeat_interval,
         "--heartbeat-timeout must be longer than --heartbeat-interval (at least 1s)"
     );
+    anyhow::ensure!(
+        args.confirm_timeout >= Duration::from_secs(5),
+        "--confirm-timeout must be at least 5s"
+    );
     let url = &args.database.database_url;
-    let _lock = match Backend::from_url(url)? {
+    let backend = Backend::from_url(url)?;
+    let _lock = match backend {
         Backend::Sqlite => sqlite_lock(url)?,
         Backend::Postgres => None,
     };
     let admin_token = admin_token(&args.admin_token_file, args.create_admin_token)?;
+    let signing_key = signing_key(
+        &args
+            .signing_key_file
+            .clone()
+            .unwrap_or_else(|| args.state_dir.join("signing-key")),
+        args.create_signing_key
+            .then_some(args.signing_key_name.as_str()),
+    )?;
+    tracing::info!("signing systems with {}", signing_key.public_key());
+    let attic = match (
+        &args.attic_endpoint,
+        &args.attic_cache,
+        &args.attic_token_file,
+    ) {
+        (Some(endpoint), Some(cache), Some(token_file)) => {
+            let token = std::fs::read_to_string(token_file).with_context(|| {
+                format!("reading the Attic token from {}", token_file.display())
+            })?;
+            Some(build::Attic::configure(
+                &args.state_dir,
+                endpoint,
+                cache,
+                token.trim(),
+            )?)
+        }
+        _ => None,
+    };
 
     let store = mnix_store::connect(url).await?;
     store.migrate().await?;
@@ -131,10 +214,25 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             heartbeat_interval: args.heartbeat_interval,
             heartbeat_timeout: args.heartbeat_timeout,
             default_token_ttl: args.enrollment_token_ttl,
+            confirm_timeout: args.confirm_timeout,
+            activation_timeout: args.activation_timeout,
+            build_timeout: args.build_timeout,
         },
         shutdown,
+        builder: build::Builder {
+            state_dir: args.state_dir.clone(),
+            signing_key,
+            attic,
+        },
+        queue: tokio::sync::Notify::new(),
+        activations: tokio::sync::watch::channel(0).0,
     });
+    if backend == Backend::Sqlite {
+        deploy::fail_interrupted_builds(&state).await?;
+    }
     tokio::spawn(agent::reap_stale_sessions(state.clone()));
+    tokio::spawn(deploy::run_worker(state.clone()));
+    tokio::spawn(deploy::run_sweeper(state.clone()));
 
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await
@@ -187,6 +285,32 @@ fn admin_token(path: &Path, create: bool) -> anyhow::Result<String> {
         path.display()
     );
     Ok(token)
+}
+
+/// Reads the signing key, generating it first if `create` names it and the
+/// file is missing.
+fn signing_key(path: &Path, create: Option<&str>) -> anyhow::Result<SecretKey> {
+    if let Some(name) = create.filter(|_| !path.exists()) {
+        let key = SecretKey::generate(name)?;
+        write_private(path, &format!("{}\n", key.to_secret_string()))?;
+        tracing::info!("generated a signing key in {}", path.display());
+    }
+    let key = std::fs::read_to_string(path)
+        .with_context(|| format!("reading the signing key from {}", path.display()))?;
+    SecretKey::parse(&key).with_context(|| format!("invalid signing key in {}", path.display()))
+}
+
+/// Creates a file readable only by its owner.
+pub fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
+    let _ = std::fs::remove_file(path);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    file.write_all(contents.as_bytes())?;
+    Ok(())
 }
 
 /// SQLite supports one server instance: hold an exclusive lock on
@@ -250,6 +374,22 @@ mod tests {
         assert!(err.contains("use Postgres"), "{err}");
         drop(first);
         assert!(sqlite_lock(&url).unwrap().is_some());
+    }
+
+    #[test]
+    fn signing_keys_are_generated_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("signing-key");
+        assert!(signing_key(&path, None).is_err());
+        let key = signing_key(&path, Some("mnix-test-1")).unwrap();
+        assert!(key.public_key().starts_with("mnix-test-1:"));
+        let again = signing_key(&path, Some("other-1")).unwrap();
+        assert_eq!(again.public_key(), key.public_key());
+        let mode = std::fs::metadata(&path).unwrap().permissions();
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777,
+            0o600
+        );
     }
 
     #[test]

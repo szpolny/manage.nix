@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO machine_tags (machine_id, tag)\n             SELECT $1, tag FROM UNNEST($2::text[]) AS tag\n             ON CONFLICT DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "10b97fbaaad98aeb47936a5f629d44c83c4629399797a5b7019a1c1bf023d16a"
+}

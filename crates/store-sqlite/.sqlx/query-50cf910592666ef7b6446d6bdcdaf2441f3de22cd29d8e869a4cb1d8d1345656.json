@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE machines SET repository_id = ?, configuration = ? WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "50cf910592666ef7b6446d6bdcdaf2441f3de22cd29d8e869a4cb1d8d1345656"
+}

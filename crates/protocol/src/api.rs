@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::Facts;
+use crate::{ActivationMode, ActivationPhase, ActivationReport, Facts};
 
 /// `POST /api/machines`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +54,229 @@ pub struct Machine {
     /// The running system, from `facts`.
     pub current_system: Option<String>,
     pub facts: Option<Facts>,
+    /// The repository the machine's configuration is built from.
+    #[serde(default)]
+    pub repository: Option<String>,
+    /// The machine's name under `nixosConfigurations` in that repository.
+    #[serde(default)]
+    pub configuration: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// `PUT /api/machines/:machine/configuration`: where the machine's system
+/// is built from. `configuration` defaults to the machine's name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetConfiguration {
+    pub repository: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration: Option<String>,
+}
+
+/// `PUT /api/machines/:machine/tags`: replaces the machine's tags.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetTags {
+    pub tags: Vec<String>,
+}
+
+/// `POST /api/repositories`
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateRepository {
+    pub name: String,
+    /// Anything `git clone` accepts: `https://...`, `ssh://...`,
+    /// `user@host:path`, `file:///...`, or an absolute path.
+    pub url: String,
+}
+
+/// A Git repository containing a flake with `nixosConfigurations`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Repository {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    pub created_at: String,
+}
+
+/// `POST /api/deployments`: build `rev` for the targets and activate it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateDeployment {
+    /// Machine names or IDs, or `tag:<tag>` for every machine with a tag.
+    /// All machines must be built from the same repository.
+    pub targets: Vec<String>,
+    /// A branch, tag, or commit; `HEAD` (the default branch) if omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
+    #[serde(default = "default_mode")]
+    pub mode: ActivationMode,
+    /// Who asked, for the deployment history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_by: Option<String>,
+}
+
+/// `POST /api/machines/:machine/rollback`: activate the machine's previous
+/// system profile generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateRollback {
+    #[serde(default = "default_mode")]
+    pub mode: ActivationMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_by: Option<String>,
+}
+
+fn default_mode() -> ActivationMode {
+    ActivationMode::Switch
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentKind {
+    /// Build a revision and activate it.
+    Deploy,
+    /// Activate each machine's previous system profile generation.
+    Rollback,
+}
+
+/// The state of a deployment as a whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentStatus {
+    /// Waiting for the server's builder.
+    Queued,
+    /// Fetching the revision and building systems.
+    Building,
+    /// Machines are activating their systems.
+    Activating,
+    /// Every machine succeeded.
+    Succeeded,
+    /// At least one machine failed or rolled back.
+    Failed,
+}
+
+/// The state of one machine in a deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MachineDeploymentStatus {
+    Queued,
+    /// Building, signing, and pushing the machine's system.
+    Building,
+    /// Sent to the agent (or waiting for it to connect).
+    Activating,
+    Succeeded,
+    /// The agent activated the system, found it unhealthy or unconfirmed,
+    /// and restored the previous one.
+    RolledBack,
+    /// The build, the activation, or a rollback failed, or the machine did
+    /// not answer in time.
+    Failed,
+}
+
+macro_rules! string_enum {
+    ($ty:ty { $($variant:ident = $s:literal),* $(,)? }) => {
+        impl $ty {
+            pub fn as_str(self) -> &'static str {
+                match self { $(Self::$variant => $s),* }
+            }
+
+            pub fn parse(s: &str) -> Option<Self> {
+                match s { $($s => Some(Self::$variant),)* _ => None }
+            }
+        }
+
+        impl std::fmt::Display for $ty {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+    };
+}
+
+string_enum!(DeploymentKind {
+    Deploy = "deploy",
+    Rollback = "rollback",
+});
+string_enum!(DeploymentStatus {
+    Queued = "queued",
+    Building = "building",
+    Activating = "activating",
+    Succeeded = "succeeded",
+    Failed = "failed",
+});
+string_enum!(MachineDeploymentStatus {
+    Queued = "queued",
+    Building = "building",
+    Activating = "activating",
+    Succeeded = "succeeded",
+    RolledBack = "rolled_back",
+    Failed = "failed",
+});
+
+impl DeploymentStatus {
+    pub fn is_finished(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed)
+    }
+}
+
+impl MachineDeploymentStatus {
+    pub fn is_finished(self) -> bool {
+        matches!(self, Self::Succeeded | Self::RolledBack | Self::Failed)
+    }
+}
+
+/// `GET /api/deployments` returns a list of these, newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Deployment {
+    pub id: String,
+    pub kind: DeploymentKind,
+    pub status: DeploymentStatus,
+    /// Why the deployment failed before reaching the machines.
+    pub message: Option<String>,
+    pub repository: Option<String>,
+    /// The revision as requested (`main`, `v1.2`, a commit).
+    pub rev: Option<String>,
+    /// The commit `rev` resolved to.
+    pub commit: Option<String>,
+    pub mode: ActivationMode,
+    pub requested_by: String,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub machines: Vec<DeploymentMachine>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeploymentMachine {
+    pub machine_id: String,
+    pub machine: String,
+    pub configuration: Option<String>,
+    pub status: MachineDeploymentStatus,
+    /// The phase the agent last reported.
+    pub phase: Option<ActivationPhase>,
+    /// The system built for (or rolled back to on) the machine.
+    pub store_path: Option<String>,
+    pub message: Option<String>,
+    /// The agent's report, once it finished.
+    pub report: Option<ActivationReport>,
+    pub finished_at: Option<String>,
+}
+
+/// `GET /api/deployments/:id/logs?after=<id>` returns these, oldest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogEntry {
+    /// Increases with every entry; pass the last one as `after`.
+    pub id: i64,
+    /// The machine the output is about, or null for the whole deployment.
+    pub machine: Option<String>,
+    /// `server` (fetching, building, pushing) or `agent` (activation).
+    pub source: String,
+    pub text: String,
+    pub created_at: String,
+}
+
+/// `GET /api/signing-key`: the key the server signs systems with. Add it
+/// to `services.manage-nix.agent.trustedPublicKeys` on every machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SigningKey {
+    pub public_key: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE deployment_machines SET status = $1\n             WHERE deployment_id = $2 AND machine_id = $3 AND finished_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1ef459d4f07879e26ba40695267efbeb64064e524246054ef30e52607e28dbbc"
+}

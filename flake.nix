@@ -147,6 +147,14 @@
             inherit self pkgs;
             backend = "postgres";
           };
+          vm-deploy-sqlite = import ./nix/tests/deploy.nix {
+            inherit self pkgs;
+            backend = "sqlite";
+          };
+          vm-deploy-postgres = import ./nix/tests/deploy.nix {
+            inherit self pkgs;
+            backend = "postgres";
+          };
         }
       );
 

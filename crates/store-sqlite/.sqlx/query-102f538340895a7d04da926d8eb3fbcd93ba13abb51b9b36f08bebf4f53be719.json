@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE deployments SET status = 'building', started_at = ?\n             WHERE id = (\n                 SELECT id FROM deployments WHERE status = 'queued'\n                 ORDER BY created_at, rowid LIMIT 1\n             )\n             RETURNING id",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "102f538340895a7d04da926d8eb3fbcd93ba13abb51b9b36f08bebf4f53be719"
+}

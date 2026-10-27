@@ -1,0 +1,88 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT dm.machine_id, m.name AS machine_name, dm.configuration, dm.status,\n                      dm.phase, dm.store_path, dm.signatures,\n                      dm.message, dm.report AS \"report: Json<ActivationReport>\",\n                      dm.released_at, dm.accepted_at, dm.finished_at\n               FROM deployment_machines AS dm JOIN machines AS m ON m.id = dm.machine_id\n               WHERE dm.deployment_id = $1\n               ORDER BY m.name COLLATE \"C\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "machine_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "machine_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "configuration",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "phase",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "store_path",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "signatures",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 7,
+        "name": "message",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "report: Json<ActivationReport>",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 9,
+        "name": "released_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 10,
+        "name": "accepted_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "finished_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "a2967e88a39f71eba00dcfd7c49742fb1099ccf15517b5f134a3c30d4d74517b"
+}

@@ -7,7 +7,8 @@
 //! Server code should depend on the `mnix-store` facade instead.
 
 use async_trait::async_trait;
-use mnix_protocol::Facts;
+use mnix_protocol::api::{DeploymentKind, DeploymentStatus, MachineDeploymentStatus};
+use mnix_protocol::{ActivationMode, ActivationPhase, ActivationReport, Facts};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -90,6 +91,134 @@ pub struct Machine {
     pub last_seen_at: Option<OffsetDateTime>,
     /// Whether an agent session is open (not yet closed or reaped).
     pub connected: bool,
+    /// The repository the machine's system is built from.
+    pub repository_id: Option<Uuid>,
+    /// The machine's name under `nixosConfigurations`.
+    pub configuration: Option<String>,
+    /// Sorted.
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Repository {
+    pub id: Uuid,
+    pub organization_id: Uuid,
+    pub name: String,
+    pub url: String,
+    pub created_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewDeployment {
+    pub id: Uuid,
+    pub organization_id: Uuid,
+    pub kind: DeploymentKind,
+    pub status: DeploymentStatus,
+    pub repository_id: Option<Uuid>,
+    pub rev: Option<String>,
+    pub mode: ActivationMode,
+    pub requested_by: String,
+    pub created_at: OffsetDateTime,
+    pub machines: Vec<NewDeploymentMachine>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewDeploymentMachine {
+    pub machine_id: Uuid,
+    pub configuration: Option<String>,
+    /// `queued` to build first, or `activating` to hand the request to the
+    /// agent at once (a rollback).
+    pub status: MachineDeploymentStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Deployment {
+    pub id: Uuid,
+    pub organization_id: Uuid,
+    pub kind: DeploymentKind,
+    pub status: DeploymentStatus,
+    pub message: Option<String>,
+    pub repository_id: Option<Uuid>,
+    pub rev: Option<String>,
+    pub commit_id: Option<String>,
+    pub mode: ActivationMode,
+    pub requested_by: String,
+    pub created_at: OffsetDateTime,
+    pub started_at: Option<OffsetDateTime>,
+    pub finished_at: Option<OffsetDateTime>,
+    /// Sorted by machine name.
+    pub machines: Vec<DeploymentMachine>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentMachine {
+    pub machine_id: Uuid,
+    pub machine_name: String,
+    pub configuration: Option<String>,
+    pub status: MachineDeploymentStatus,
+    pub phase: Option<ActivationPhase>,
+    pub store_path: Option<String>,
+    pub signatures: Vec<String>,
+    pub message: Option<String>,
+    pub report: Option<ActivationReport>,
+    pub released_at: Option<OffsetDateTime>,
+    pub accepted_at: Option<OffsetDateTime>,
+    pub finished_at: Option<OffsetDateTime>,
+}
+
+/// An activation the machine's agent has not acknowledged yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingActivation {
+    pub deployment_id: Uuid,
+    pub kind: DeploymentKind,
+    pub mode: ActivationMode,
+    /// `None` for a rollback.
+    pub store_path: Option<String>,
+    pub signatures: Vec<String>,
+}
+
+/// How a machine's part of a deployment ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineOutcome {
+    pub status: MachineDeploymentStatus,
+    pub message: Option<String>,
+    pub report: Option<ActivationReport>,
+}
+
+/// What [`Store::finish_deployment_machine`] changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Finished {
+    /// False if the machine had already finished; nothing changed.
+    pub machine: bool,
+    /// The deployment's final status, if this was its last machine.
+    pub deployment: Option<DeploymentStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewLogEntry {
+    pub deployment_id: Uuid,
+    pub machine_id: Option<Uuid>,
+    pub source: String,
+    pub text: String,
+    pub created_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogEntry {
+    pub id: i64,
+    pub machine_id: Option<Uuid>,
+    pub machine_name: Option<String>,
+    pub source: String,
+    pub text: String,
+    pub created_at: OffsetDateTime,
+}
+
+/// Where log entries come from.
+pub mod log_source {
+    /// The server: fetching, building, signing, pushing.
+    pub const SERVER: &str = "server";
+    /// The agent's activation output.
+    pub const AGENT: &str = "agent";
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -237,6 +366,145 @@ pub trait Store: Send + Sync + 'static {
 
     /// A machine's most recent events, newest first.
     async fn machine_events(&self, machine_id: Uuid, limit: u32) -> Result<Vec<Event>>;
+
+    /// Fails with [`Error::Conflict`] if the name is taken.
+    async fn create_repository(
+        &self,
+        organization_id: Uuid,
+        name: &str,
+        url: &str,
+        now: OffsetDateTime,
+    ) -> Result<Repository>;
+
+    /// The organization's repositories, sorted by name.
+    async fn repositories(&self, organization_id: Uuid) -> Result<Vec<Repository>>;
+
+    async fn repository(&self, id: Uuid) -> Result<Option<Repository>>;
+
+    /// Sets where the machine's system is built from.
+    async fn set_machine_configuration(
+        &self,
+        machine_id: Uuid,
+        repository_id: Uuid,
+        configuration: &str,
+    ) -> Result<()>;
+
+    /// Replaces the machine's tags.
+    async fn set_machine_tags(&self, machine_id: Uuid, tags: &[String]) -> Result<()>;
+
+    /// Creates a deployment and its machines. Machines created as
+    /// `activating` are released to their agents at once.
+    async fn create_deployment(&self, deployment: &NewDeployment) -> Result<()>;
+
+    async fn deployment(&self, id: Uuid) -> Result<Option<Deployment>>;
+
+    /// The organization's most recent deployments, newest first.
+    async fn deployments(&self, organization_id: Uuid, limit: u32) -> Result<Vec<Deployment>>;
+
+    /// Takes the oldest queued deployment for building (status `building`).
+    /// Safe to call from several servers at once: each deployment is
+    /// claimed once.
+    async fn claim_deployment(&self, now: OffsetDateTime) -> Result<Option<Uuid>>;
+
+    async fn set_deployment_commit(&self, id: Uuid, commit_id: &str) -> Result<()>;
+
+    /// Moves an unfinished deployment to `activating`.
+    async fn start_activating(&self, id: Uuid) -> Result<()>;
+
+    /// Fails a deployment and every machine in it that has not finished.
+    async fn fail_deployment(&self, id: Uuid, message: &str, now: OffsetDateTime) -> Result<()>;
+
+    /// Sets an unfinished machine's status (`building`).
+    async fn set_deployment_machine_status(
+        &self,
+        deployment_id: Uuid,
+        machine_id: Uuid,
+        status: MachineDeploymentStatus,
+    ) -> Result<()>;
+
+    /// Hands a built system to the machine's agent: status `activating`.
+    async fn release_activation(
+        &self,
+        deployment_id: Uuid,
+        machine_id: Uuid,
+        store_path: &str,
+        signatures: &[String],
+        now: OffsetDateTime,
+    ) -> Result<()>;
+
+    /// Activations for the machine that its agent has not acknowledged,
+    /// oldest first.
+    async fn pending_activations(&self, machine_id: Uuid) -> Result<Vec<PendingActivation>>;
+
+    /// Records the phase an agent reported, which also acknowledges the
+    /// request. Returns false if the machine is not activating (it finished
+    /// or timed out), in which case it must not be confirmed.
+    async fn record_activation_phase(
+        &self,
+        deployment_id: Uuid,
+        machine_id: Uuid,
+        phase: ActivationPhase,
+        now: OffsetDateTime,
+    ) -> Result<bool>;
+
+    /// Finishes a machine's part of a deployment, unless it already
+    /// finished, and finishes the deployment with its last machine. The
+    /// report's store path is recorded for rollbacks.
+    async fn finish_deployment_machine(
+        &self,
+        deployment_id: Uuid,
+        machine_id: Uuid,
+        outcome: &MachineOutcome,
+        now: OffsetDateTime,
+    ) -> Result<Finished>;
+
+    /// Machines still activating that were released before `cutoff`.
+    async fn expired_activations(&self, cutoff: OffsetDateTime) -> Result<Vec<(Uuid, Uuid)>>;
+
+    /// Deployments still building that started before `cutoff`.
+    async fn stale_builds(&self, cutoff: OffsetDateTime) -> Result<Vec<Uuid>>;
+
+    async fn append_log(&self, entry: &NewLogEntry) -> Result<()>;
+
+    /// Appends the part of an agent's log chunk (bytes `offset..` of its
+    /// activation log) that has not been received before.
+    async fn append_agent_log(
+        &self,
+        deployment_id: Uuid,
+        machine_id: Uuid,
+        offset: u64,
+        text: &str,
+        now: OffsetDateTime,
+    ) -> Result<()>;
+
+    /// Log entries with IDs greater than `after`, oldest first.
+    async fn deployment_logs(
+        &self,
+        deployment_id: Uuid,
+        after: i64,
+        limit: u32,
+    ) -> Result<Vec<LogEntry>>;
+}
+
+/// The part of an agent's log chunk at `offset` that is new when
+/// `received` bytes have arrived already, and the new received length.
+/// Chunks never overlap a character boundary (the agent sends whole lines),
+/// but a cut inside one moves forward to the next boundary.
+pub fn new_log_text(received: u64, offset: u64, text: &str) -> Option<(&str, u64)> {
+    let end = offset + text.len() as u64;
+    if end <= received {
+        return None;
+    }
+    let mut skip = usize::try_from(received.saturating_sub(offset)).ok()?;
+    while !text.is_char_boundary(skip) {
+        skip += 1;
+    }
+    Some((&text[skip..], end))
+}
+
+/// Parses a status or other enum stored as text.
+pub fn parse_enum<T>(value: &str, parse: impl FnOnce(&str) -> Option<T>) -> Result<T> {
+    parse(value).ok_or_else(|| Error::Corrupt(format!("unexpected value {value:?}")))
 }
 
 /// Name of the table sqlx uses to track applied migrations.
@@ -288,6 +556,18 @@ mod tests {
             Err(Error::UnsupportedUrl(_))
         ));
         assert!(Backend::from_url("no-scheme").is_err());
+    }
+
+    #[test]
+    fn agent_logs_keep_only_new_bytes() {
+        assert_eq!(new_log_text(0, 0, "abc"), Some(("abc", 3)));
+        assert_eq!(new_log_text(3, 0, "abc"), None);
+        assert_eq!(new_log_text(3, 0, "abcdef"), Some(("def", 6)));
+        assert_eq!(new_log_text(3, 3, "def"), Some(("def", 6)));
+        // A gap: keep it all.
+        assert_eq!(new_log_text(3, 10, "xyz"), Some(("xyz", 13)));
+        // Never split a character.
+        assert_eq!(new_log_text(1, 0, "\u{e9}x"), Some(("x", 3)));
     }
 
     #[test]

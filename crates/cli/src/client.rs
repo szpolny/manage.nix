@@ -58,6 +58,17 @@ impl Client {
             .with_context(|| format!("POST {url}"))?;
         decode(&url, response)
     }
+
+    pub fn put<T: DeserializeOwned>(&self, path: &str, body: &impl Serialize) -> anyhow::Result<T> {
+        let url = format!("{}{path}", self.base);
+        let response = self
+            .agent
+            .put(&url)
+            .header("Authorization", &self.authorization)
+            .send_json(body)
+            .with_context(|| format!("PUT {url}"))?;
+        decode(&url, response)
+    }
 }
 
 fn decode<T: DeserializeOwned>(

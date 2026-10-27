@@ -3,10 +3,13 @@
 use std::str::FromStr;
 
 use async_trait::async_trait;
-use mnix_protocol::Facts;
+use mnix_protocol::api::{DeploymentKind, DeploymentStatus, MachineDeploymentStatus};
+use mnix_protocol::{ActivationMode, ActivationPhase, ActivationReport, Facts};
 use mnix_store_core::{
-    disconnect_reason, group_columns, truncate_to_micros, Backend, ClosedSession, Error, Event,
-    Machine, NewEnrollmentToken, NewSession, Organization, Redemption, Result, Store, Table,
+    disconnect_reason, group_columns, log_source, new_log_text, parse_enum, truncate_to_micros,
+    Backend, ClosedSession, Deployment, DeploymentMachine, Error, Event, Finished, LogEntry,
+    Machine, MachineOutcome, NewDeployment, NewEnrollmentToken, NewLogEntry, NewSession,
+    Organization, PendingActivation, Redemption, Repository, Result, Store, Table,
     MIGRATIONS_TABLE,
 };
 use sqlx::migrate::Migrator;
@@ -48,6 +51,9 @@ struct MachineRow {
     facts_updated_at: Option<OffsetDateTime>,
     last_seen_at: Option<OffsetDateTime>,
     connected: bool,
+    repository_id: Option<Uuid>,
+    configuration: Option<String>,
+    tags: Vec<String>,
 }
 
 impl From<MachineRow> for Machine {
@@ -63,7 +69,103 @@ impl From<MachineRow> for Machine {
             facts_updated_at: row.facts_updated_at,
             last_seen_at: row.last_seen_at,
             connected: row.connected,
+            repository_id: row.repository_id,
+            configuration: row.configuration,
+            tags: row.tags,
         }
+    }
+}
+
+struct DeploymentRow {
+    id: Uuid,
+    organization_id: Uuid,
+    kind: String,
+    status: String,
+    message: Option<String>,
+    repository_id: Option<Uuid>,
+    rev: Option<String>,
+    commit_id: Option<String>,
+    mode: String,
+    requested_by: String,
+    created_at: OffsetDateTime,
+    started_at: Option<OffsetDateTime>,
+    finished_at: Option<OffsetDateTime>,
+}
+
+struct DeploymentMachineRow {
+    machine_id: Uuid,
+    machine_name: String,
+    configuration: Option<String>,
+    status: String,
+    phase: Option<String>,
+    store_path: Option<String>,
+    signatures: Vec<String>,
+    message: Option<String>,
+    report: Option<Json<ActivationReport>>,
+    released_at: Option<OffsetDateTime>,
+    accepted_at: Option<OffsetDateTime>,
+    finished_at: Option<OffsetDateTime>,
+}
+
+impl TryFrom<DeploymentMachineRow> for DeploymentMachine {
+    type Error = Error;
+
+    fn try_from(row: DeploymentMachineRow) -> Result<Self> {
+        Ok(Self {
+            machine_id: row.machine_id,
+            machine_name: row.machine_name,
+            configuration: row.configuration,
+            status: parse_enum(&row.status, MachineDeploymentStatus::parse)?,
+            phase: row
+                .phase
+                .as_deref()
+                .map(|p| parse_enum(p, ActivationPhase::parse))
+                .transpose()?,
+            store_path: row.store_path,
+            signatures: row.signatures,
+            message: row.message,
+            report: row.report.map(|Json(report)| report),
+            released_at: row.released_at,
+            accepted_at: row.accepted_at,
+            finished_at: row.finished_at,
+        })
+    }
+}
+
+impl PostgresStore {
+    async fn load_deployment(&self, row: DeploymentRow) -> Result<Deployment> {
+        let machines = sqlx::query_as!(
+            DeploymentMachineRow,
+            r#"SELECT dm.machine_id, m.name AS machine_name, dm.configuration, dm.status,
+                      dm.phase, dm.store_path, dm.signatures,
+                      dm.message, dm.report AS "report: Json<ActivationReport>",
+                      dm.released_at, dm.accepted_at, dm.finished_at
+               FROM deployment_machines AS dm JOIN machines AS m ON m.id = dm.machine_id
+               WHERE dm.deployment_id = $1
+               ORDER BY m.name COLLATE "C""#,
+            row.id
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(DeploymentMachine::try_from)
+        .collect::<Result<_>>()?;
+        Ok(Deployment {
+            id: row.id,
+            organization_id: row.organization_id,
+            kind: parse_enum(&row.kind, DeploymentKind::parse)?,
+            status: parse_enum(&row.status, DeploymentStatus::parse)?,
+            message: row.message,
+            repository_id: row.repository_id,
+            rev: row.rev,
+            commit_id: row.commit_id,
+            mode: parse_enum(&row.mode, ActivationMode::parse)?,
+            requested_by: row.requested_by,
+            created_at: row.created_at,
+            started_at: row.started_at,
+            finished_at: row.finished_at,
+            machines,
+        })
     }
 }
 
@@ -78,7 +180,12 @@ macro_rules! select_machines {
                       EXISTS (
                           SELECT 1 FROM agent_sessions AS s
                           WHERE s.machine_id = machines.id AND s.disconnected_at IS NULL
-                      ) AS "connected!"
+                      ) AS "connected!",
+                      repository_id, configuration,
+                      ARRAY(
+                          SELECT tag FROM machine_tags AS t
+                          WHERE t.machine_id = machines.id ORDER BY tag COLLATE "C"
+                      ) AS "tags!"
                FROM machines "# + $($where)*
         )
     };
@@ -168,6 +275,9 @@ impl Store for PostgresStore {
             facts_updated_at: None,
             last_seen_at: None,
             connected: false,
+            repository_id: None,
+            configuration: None,
+            tags: Vec::new(),
         })
     }
 
@@ -417,6 +527,509 @@ impl Store for PostgresStore {
              FROM events WHERE machine_id = $1
              ORDER BY created_at DESC LIMIT $2",
             machine_id,
+            i64::from(limit)
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+    async fn create_repository(
+        &self,
+        organization_id: Uuid,
+        name: &str,
+        url: &str,
+        now: OffsetDateTime,
+    ) -> Result<Repository> {
+        let repository = Repository {
+            id: Uuid::new_v4(),
+            organization_id,
+            name: name.to_owned(),
+            url: url.to_owned(),
+            created_at: truncate_to_micros(now),
+        };
+        sqlx::query!(
+            "INSERT INTO repositories (id, organization_id, name, url, created_at)
+             VALUES ($1, $2, $3, $4, $5)",
+            repository.id,
+            organization_id,
+            name,
+            url,
+            repository.created_at
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| match Error::from(e) {
+            Error::Conflict(_) => Error::Conflict(format!("repository {name:?}")),
+            e => e,
+        })?;
+        Ok(repository)
+    }
+
+    async fn repositories(&self, organization_id: Uuid) -> Result<Vec<Repository>> {
+        Ok(sqlx::query_as!(
+            Repository,
+            r#"SELECT id, organization_id, name, url, created_at FROM repositories
+               WHERE organization_id = $1 ORDER BY name COLLATE "C""#,
+            organization_id
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn repository(&self, repository_id: Uuid) -> Result<Option<Repository>> {
+        Ok(sqlx::query_as!(
+            Repository,
+            "SELECT id, organization_id, name, url, created_at FROM repositories WHERE id = $1",
+            repository_id
+        )
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    async fn set_machine_configuration(
+        &self,
+        machine_id: Uuid,
+        repository_id: Uuid,
+        configuration: &str,
+    ) -> Result<()> {
+        sqlx::query!(
+            "UPDATE machines SET repository_id = $1, configuration = $2 WHERE id = $3",
+            repository_id,
+            configuration,
+            machine_id
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn set_machine_tags(&self, machine_id: Uuid, tags: &[String]) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query!("DELETE FROM machine_tags WHERE machine_id = $1", machine_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query!(
+            "INSERT INTO machine_tags (machine_id, tag)
+             SELECT $1, tag FROM UNNEST($2::text[]) AS tag
+             ON CONFLICT DO NOTHING",
+            machine_id,
+            tags
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn create_deployment(&self, d: &NewDeployment) -> Result<()> {
+        let now = truncate_to_micros(d.created_at);
+        let mut tx = self.pool.begin().await?;
+        sqlx::query!(
+            "INSERT INTO deployments (id, organization_id, kind, status, repository_id, rev,
+                                      mode, requested_by, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            d.id,
+            d.organization_id,
+            d.kind.as_str(),
+            d.status.as_str(),
+            d.repository_id,
+            d.rev,
+            d.mode.as_str(),
+            d.requested_by,
+            now
+        )
+        .execute(&mut *tx)
+        .await?;
+        for m in &d.machines {
+            let released_at = (m.status == MachineDeploymentStatus::Activating).then_some(now);
+            sqlx::query!(
+                "INSERT INTO deployment_machines
+                     (deployment_id, machine_id, configuration, status, signatures, released_at)
+                 VALUES ($1, $2, $3, $4, '{}', $5)",
+                d.id,
+                m.machine_id,
+                m.configuration,
+                m.status.as_str(),
+                released_at
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn deployment(&self, deployment_id: Uuid) -> Result<Option<Deployment>> {
+        let row = sqlx::query_as!(
+            DeploymentRow,
+            "SELECT id, organization_id, kind, status, message, repository_id, rev, commit_id,
+                    mode, requested_by, created_at, started_at, finished_at
+             FROM deployments WHERE id = $1",
+            deployment_id
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(row) => Ok(Some(self.load_deployment(row).await?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn deployments(&self, organization_id: Uuid, limit: u32) -> Result<Vec<Deployment>> {
+        let rows = sqlx::query_as!(
+            DeploymentRow,
+            "SELECT id, organization_id, kind, status, message, repository_id, rev, commit_id,
+                    mode, requested_by, created_at, started_at, finished_at
+             FROM deployments WHERE organization_id = $1
+             ORDER BY created_at DESC, id DESC LIMIT $2",
+            organization_id,
+            i64::from(limit)
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut deployments = Vec::with_capacity(rows.len());
+        for row in rows {
+            deployments.push(self.load_deployment(row).await?);
+        }
+        Ok(deployments)
+    }
+
+    async fn claim_deployment(&self, now: OffsetDateTime) -> Result<Option<Uuid>> {
+        // SKIP LOCKED: concurrent servers each claim a different deployment.
+        Ok(sqlx::query_scalar!(
+            "UPDATE deployments SET status = 'building', started_at = $1
+             WHERE id = (
+                 SELECT id FROM deployments WHERE status = 'queued'
+                 ORDER BY created_at LIMIT 1
+                 FOR UPDATE SKIP LOCKED
+             )
+             RETURNING id",
+            truncate_to_micros(now)
+        )
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    async fn set_deployment_commit(&self, deployment_id: Uuid, commit_id: &str) -> Result<()> {
+        sqlx::query!(
+            "UPDATE deployments SET commit_id = $1 WHERE id = $2",
+            commit_id,
+            deployment_id
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn start_activating(&self, deployment_id: Uuid) -> Result<()> {
+        sqlx::query!(
+            "UPDATE deployments SET status = 'activating'
+             WHERE id = $1 AND finished_at IS NULL",
+            deployment_id
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn fail_deployment(
+        &self,
+        deployment_id: Uuid,
+        message: &str,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let now = truncate_to_micros(now);
+        let mut tx = self.pool.begin().await?;
+        sqlx::query!(
+            "SELECT id FROM deployments WHERE id = $1 FOR UPDATE",
+            deployment_id
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        sqlx::query!(
+            "UPDATE deployment_machines SET status = 'failed', message = $1, finished_at = $2
+             WHERE deployment_id = $3 AND finished_at IS NULL",
+            message,
+            now,
+            deployment_id
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query!(
+            "UPDATE deployments SET status = 'failed', message = $1, finished_at = $2
+             WHERE id = $3 AND finished_at IS NULL",
+            message,
+            now,
+            deployment_id
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn set_deployment_machine_status(
+        &self,
+        deployment_id: Uuid,
+        machine_id: Uuid,
+        status: MachineDeploymentStatus,
+    ) -> Result<()> {
+        sqlx::query!(
+            "UPDATE deployment_machines SET status = $1
+             WHERE deployment_id = $2 AND machine_id = $3 AND finished_at IS NULL",
+            status.as_str(),
+            deployment_id,
+            machine_id
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn release_activation(
+        &self,
+        deployment_id: Uuid,
+        machine_id: Uuid,
+        store_path: &str,
+        signatures: &[String],
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        sqlx::query!(
+            "UPDATE deployment_machines
+             SET status = 'activating', store_path = $1, signatures = $2, released_at = $3
+             WHERE deployment_id = $4 AND machine_id = $5 AND finished_at IS NULL",
+            store_path,
+            signatures,
+            truncate_to_micros(now),
+            deployment_id,
+            machine_id
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn pending_activations(&self, machine_id: Uuid) -> Result<Vec<PendingActivation>> {
+        sqlx::query!(
+            "SELECT dm.deployment_id, d.kind, d.mode, dm.store_path, dm.signatures
+             FROM deployment_machines AS dm JOIN deployments AS d ON d.id = dm.deployment_id
+             WHERE dm.machine_id = $1 AND dm.status = 'activating' AND dm.accepted_at IS NULL
+             ORDER BY dm.released_at",
+            machine_id
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(PendingActivation {
+                deployment_id: row.deployment_id,
+                kind: parse_enum(&row.kind, DeploymentKind::parse)?,
+                mode: parse_enum(&row.mode, ActivationMode::parse)?,
+                store_path: row.store_path,
+                signatures: row.signatures,
+            })
+        })
+        .collect()
+    }
+
+    async fn record_activation_phase(
+        &self,
+        deployment_id: Uuid,
+        machine_id: Uuid,
+        phase: ActivationPhase,
+        now: OffsetDateTime,
+    ) -> Result<bool> {
+        let result = sqlx::query!(
+            "UPDATE deployment_machines SET phase = $1, accepted_at = COALESCE(accepted_at, $2)
+             WHERE deployment_id = $3 AND machine_id = $4 AND status = 'activating'",
+            phase.as_str(),
+            truncate_to_micros(now),
+            deployment_id,
+            machine_id
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn finish_deployment_machine(
+        &self,
+        deployment_id: Uuid,
+        machine_id: Uuid,
+        outcome: &MachineOutcome,
+        now: OffsetDateTime,
+    ) -> Result<Finished> {
+        let now = truncate_to_micros(now);
+        let store_path = outcome
+            .report
+            .as_ref()
+            .map(|r| r.store_path.as_str())
+            .filter(|p| !p.is_empty());
+        let mut tx = self.pool.begin().await?;
+        // Machines finishing at the same time (on different replicas) take
+        // turns, so exactly one of them sees the deployment complete.
+        sqlx::query!(
+            "SELECT id FROM deployments WHERE id = $1 FOR UPDATE",
+            deployment_id
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let changed = sqlx::query!(
+            "UPDATE deployment_machines
+             SET status = $1, message = $2, report = $3, store_path = COALESCE(store_path, $4),
+                 finished_at = $5
+             WHERE deployment_id = $6 AND machine_id = $7 AND finished_at IS NULL",
+            outcome.status.as_str(),
+            outcome.message,
+            outcome.report.as_ref().map(Json) as _,
+            store_path,
+            now,
+            deployment_id,
+            machine_id
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        if !changed {
+            return Ok(Finished {
+                machine: false,
+                deployment: None,
+            });
+        }
+        let counts = sqlx::query!(
+            r#"SELECT COUNT(*) FILTER (WHERE finished_at IS NULL) AS "open!",
+                      COUNT(*) FILTER (WHERE status <> 'succeeded') AS "bad!"
+               FROM deployment_machines WHERE deployment_id = $1"#,
+            deployment_id
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let mut deployment = None;
+        if counts.open == 0 {
+            let final_status = match counts.bad {
+                0 => DeploymentStatus::Succeeded,
+                _ => DeploymentStatus::Failed,
+            };
+            let result = sqlx::query!(
+                "UPDATE deployments SET status = $1, finished_at = $2
+                 WHERE id = $3 AND finished_at IS NULL",
+                final_status.as_str(),
+                now,
+                deployment_id
+            )
+            .execute(&mut *tx)
+            .await?;
+            deployment = (result.rows_affected() > 0).then_some(final_status);
+        }
+        tx.commit().await?;
+        Ok(Finished {
+            machine: true,
+            deployment,
+        })
+    }
+
+    async fn expired_activations(&self, cutoff: OffsetDateTime) -> Result<Vec<(Uuid, Uuid)>> {
+        Ok(sqlx::query!(
+            "SELECT deployment_id, machine_id FROM deployment_machines
+             WHERE status = 'activating' AND released_at < $1",
+            truncate_to_micros(cutoff)
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| (row.deployment_id, row.machine_id))
+        .collect())
+    }
+
+    async fn stale_builds(&self, cutoff: OffsetDateTime) -> Result<Vec<Uuid>> {
+        Ok(sqlx::query_scalar!(
+            "SELECT id FROM deployments WHERE status = 'building' AND started_at < $1",
+            truncate_to_micros(cutoff)
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn append_log(&self, entry: &NewLogEntry) -> Result<()> {
+        sqlx::query!(
+            "INSERT INTO deployment_logs (deployment_id, machine_id, source, text, created_at)
+             VALUES ($1, $2, $3, $4, $5)",
+            entry.deployment_id,
+            entry.machine_id,
+            entry.source,
+            entry.text,
+            truncate_to_micros(entry.created_at)
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn append_agent_log(
+        &self,
+        deployment_id: Uuid,
+        machine_id: Uuid,
+        offset: u64,
+        text: &str,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let received = sqlx::query_scalar!(
+            "SELECT log_bytes FROM deployment_machines
+             WHERE deployment_id = $1 AND machine_id = $2
+             FOR UPDATE",
+            deployment_id,
+            machine_id
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(received) = received else {
+            return Ok(());
+        };
+        let Some((new, end)) = new_log_text(received as u64, offset, text) else {
+            return Ok(());
+        };
+        sqlx::query!(
+            "UPDATE deployment_machines SET log_bytes = $1
+             WHERE deployment_id = $2 AND machine_id = $3",
+            end as i64,
+            deployment_id,
+            machine_id
+        )
+        .execute(&mut *tx)
+        .await?;
+        if !new.is_empty() {
+            sqlx::query!(
+                "INSERT INTO deployment_logs (deployment_id, machine_id, source, text, created_at)
+                 VALUES ($1, $2, $3, $4, $5)",
+                deployment_id,
+                machine_id,
+                log_source::AGENT,
+                new,
+                truncate_to_micros(now)
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn deployment_logs(
+        &self,
+        deployment_id: Uuid,
+        after: i64,
+        limit: u32,
+    ) -> Result<Vec<LogEntry>> {
+        Ok(sqlx::query_as!(
+            LogEntry,
+            r#"SELECT l.id, l.machine_id, m.name AS "machine_name?", l.source, l.text,
+                      l.created_at
+               FROM deployment_logs AS l LEFT JOIN machines AS m ON m.id = l.machine_id
+               WHERE l.deployment_id = $1 AND l.id > $2
+               ORDER BY l.id LIMIT $3"#,
+            deployment_id,
+            after,
             i64::from(limit)
         )
         .fetch_all(&self.pool)

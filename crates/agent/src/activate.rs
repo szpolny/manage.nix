@@ -1,17 +1,22 @@
-//! Activating a system safely: verify, switch, check health, roll back.
+//! Activating a system safely: verify, switch, check health, confirm, roll
+//! back.
 //!
 //! The steps talk to the machine only through [`Host`], so the decisions
 //! (what to refuse, when to roll back, and how) are unit tested against a
 //! fake machine. [`crate::host::NixosHost`] is the real implementation.
+//! Progress and the final confirmation go through an [`Observer`]: the
+//! command line has none, and an activation for the server waits for the
+//! server's `confirm` (see [`crate::job`]).
 
 use std::path::Path;
 
 use anyhow::Context;
-use mnix_protocol::{ActivationMode, ActivationReport, ActivationStatus};
+use mnix_protocol::{
+    ActivationMode, ActivationPhase, ActivationReport, ActivationStatus, ActivationTarget,
+};
 
 use crate::config::{AgentConfig, HealthChecks};
-use crate::signature::{PathInfo, TrustedKeys};
-use crate::store_path::StorePath;
+use mnix_nix::{PathInfo, StorePath, TrustedKeys};
 
 /// A generation of the system profile: its number and system.
 pub type ProfileGeneration = (u64, StorePath);
@@ -28,12 +33,41 @@ pub trait Host {
     fn current_system(&self) -> anyhow::Result<StorePath>;
     /// The generation the system profile points at, if it exists.
     fn profile_generation(&self) -> anyhow::Result<Option<ProfileGeneration>>;
+    /// Every generation of the system profile.
+    fn profile_generations(&self) -> anyhow::Result<Vec<ProfileGeneration>>;
     fn set_profile(&self, path: &StorePath) -> anyhow::Result<()>;
     fn switch_profile_generation(&self, number: u64) -> anyhow::Result<()>;
     /// Runs `<system>/bin/switch-to-configuration <action>`.
     fn switch_to_configuration(&self, system: &StorePath, action: &str) -> anyhow::Result<()>;
     fn wait_until_healthy(&self, checks: &HealthChecks) -> Result<(), Vec<String>>;
 }
+
+/// What to activate and how.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Request {
+    pub target: ActivationTarget,
+    pub mode: ActivationMode,
+    /// Signatures on the target obtained some other way than from Nix (the
+    /// server sends them with the request).
+    pub signatures: Vec<String>,
+}
+
+/// Follows an activation.
+pub trait Observer {
+    /// The activation moved on to `phase`.
+    fn phase(&self, _phase: ActivationPhase) {}
+
+    /// Called once a `switch` or `test` activation is healthy. An error
+    /// rolls the machine back.
+    fn confirm(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Nobody is watching: no progress, and nothing to wait for.
+pub struct Unobserved;
+
+impl Observer for Unobserved {}
 
 /// The verified request and the state to restore on failure.
 #[derive(Debug)]
@@ -59,9 +93,13 @@ impl From<anyhow::Error> for Failure {
     }
 }
 
-pub fn activate(host: &dyn Host, store_path: &str, mode: ActivationMode) -> ActivationReport {
+pub fn activate(host: &dyn Host, request: &Request, observer: &dyn Observer) -> ActivationReport {
+    let mode = request.mode;
     let mut report = ActivationReport {
-        store_path: store_path.to_owned(),
+        store_path: match &request.target {
+            ActivationTarget::System { store_path } => store_path.clone(),
+            ActivationTarget::PreviousGeneration => String::new(),
+        },
         mode,
         status: ActivationStatus::Failed,
         system_changed: false,
@@ -70,17 +108,19 @@ pub fn activate(host: &dyn Host, store_path: &str, mode: ActivationMode) -> Acti
         failed_checks: Vec::new(),
     };
 
-    let plan = match plan(host, store_path) {
+    observer.phase(ActivationPhase::Activating);
+    let plan = match plan(host, request) {
         Ok(plan) => plan,
         Err(e) => {
-            tracing::error!("refusing to activate {store_path}: {e:#}");
+            tracing::error!("refusing to activate {}: {e:#}", describe(&request.target));
             report.message = Some(format!("refused: {e:#}"));
             return report;
         }
     };
+    report.store_path = plan.target.to_string();
     report.previous_system = Some(plan.previous_system.to_string());
 
-    let Err(failure) = apply(host, &plan, mode) else {
+    let Err(failure) = apply(host, &plan, mode, observer) else {
         tracing::info!("activated {} ({mode})", plan.target);
         report.status = ActivationStatus::Succeeded;
         report.system_changed = true;
@@ -88,6 +128,7 @@ pub fn activate(host: &dyn Host, store_path: &str, mode: ActivationMode) -> Acti
     };
     tracing::error!("activation failed, rolling back: {}", failure.message);
     report.failed_checks = failure.failed_checks;
+    observer.phase(ActivationPhase::RollingBack);
 
     match roll_back(host, &plan, mode) {
         Ok(()) => {
@@ -104,24 +145,41 @@ pub fn activate(host: &dyn Host, store_path: &str, mode: ActivationMode) -> Acti
     report
 }
 
-/// Checks everything that can be checked without changing the machine.
-fn plan(host: &dyn Host, store_path: &str) -> anyhow::Result<Plan> {
-    let target = StorePath::parse(store_path)?;
+fn describe(target: &ActivationTarget) -> &str {
+    match target {
+        ActivationTarget::System { store_path } => store_path,
+        ActivationTarget::PreviousGeneration => "the previous generation",
+    }
+}
 
+/// Checks everything that can be checked without changing the machine.
+fn plan(host: &dyn Host, request: &Request) -> anyhow::Result<Plan> {
     let config = host
         .agent_config(Path::new("/"))?
         .context("the agent is not configured (no /etc/manage-nix/agent.json)")?;
-    let keys = TrustedKeys::parse(&config.trusted_public_keys)?;
-    anyhow::ensure!(
-        !keys.is_empty(),
-        "no trusted public keys are configured \
-         (services.manage-nix.agent.trustedPublicKeys)"
-    );
 
-    host.realise(&target)
-        .with_context(|| format!("fetching {target}"))?;
-    let key = keys.verify(&host.path_info(&target)?)?;
-    tracing::info!("{target} is signed by trusted key {key}");
+    let target = match &request.target {
+        ActivationTarget::System { store_path } => {
+            let target = StorePath::parse(store_path)?;
+            let keys = TrustedKeys::parse(&config.trusted_public_keys)?;
+            anyhow::ensure!(
+                !keys.is_empty(),
+                "no trusted public keys are configured \
+                 (services.manage-nix.agent.trustedPublicKeys)"
+            );
+            host.realise(&target)
+                .with_context(|| format!("fetching {target}"))?;
+            let key = keys.verify(&host.path_info(&target)?, &request.signatures)?;
+            tracing::info!("{target} is signed by trusted key {key}");
+            target
+        }
+        // Root put every profile generation there; it needs no signature.
+        ActivationTarget::PreviousGeneration => {
+            let (number, target) = previous_generation(host)?;
+            tracing::info!("rolling back to generation {number}: {target}");
+            target
+        }
+    };
 
     anyhow::ensure!(
         host.is_nixos_system(&target),
@@ -140,7 +198,28 @@ fn plan(host: &dyn Host, store_path: &str) -> anyhow::Result<Plan> {
     })
 }
 
-fn apply(host: &dyn Host, plan: &Plan, mode: ActivationMode) -> Result<(), Failure> {
+/// The newest generation older than the profile's current one whose system
+/// is not the running system.
+fn previous_generation(host: &dyn Host) -> anyhow::Result<ProfileGeneration> {
+    let (current, _) = host
+        .profile_generation()?
+        .context("there is no system profile to roll back")?;
+    let running = host.current_system()?;
+    host.profile_generations()?
+        .into_iter()
+        .filter(|(number, system)| *number < current && *system != running)
+        .max_by_key(|(number, _)| *number)
+        .with_context(|| {
+            format!("no generation before {current} has a different system to roll back to")
+        })
+}
+
+fn apply(
+    host: &dyn Host,
+    plan: &Plan,
+    mode: ActivationMode,
+    observer: &dyn Observer,
+) -> Result<(), Failure> {
     if mode.sets_profile() {
         host.set_profile(&plan.target)?;
     }
@@ -154,16 +233,21 @@ fn apply(host: &dyn Host, plan: &Plan, mode: ActivationMode) -> Result<(), Failu
     }
     if plan.health_checks.is_empty() {
         tracing::warn!("no health checks are configured");
-        return Ok(());
+    } else {
+        observer.phase(ActivationPhase::CheckingHealth);
+        host.wait_until_healthy(&plan.health_checks)
+            .map_err(|failed_checks| Failure {
+                message: format!(
+                    "health checks did not pass within {}s",
+                    plan.health_checks.timeout_secs
+                ),
+                failed_checks,
+            })?;
     }
-    host.wait_until_healthy(&plan.health_checks)
-        .map_err(|failed_checks| Failure {
-            message: format!(
-                "health checks did not pass within {}s",
-                plan.health_checks.timeout_secs
-            ),
-            failed_checks,
-        })
+    observer.confirm().map_err(|message| Failure {
+        message,
+        failed_checks: Vec::new(),
+    })
 }
 
 /// Restores what `apply` may have changed: the boot default for `switch` and
@@ -262,6 +346,43 @@ mod tests {
         StorePath::parse(s).unwrap()
     }
 
+    fn request(path: &str, mode: ActivationMode) -> Request {
+        Request {
+            target: ActivationTarget::System {
+                store_path: path.to_owned(),
+            },
+            mode,
+            signatures: Vec::new(),
+        }
+    }
+
+    fn run(host: &Fake, path: &str, mode: ActivationMode) -> ActivationReport {
+        activate(host, &request(path, mode), &Unobserved)
+    }
+
+    /// Records phases, and confirms (or not) when asked.
+    #[derive(Default)]
+    struct Watcher {
+        phases: RefCell<Vec<ActivationPhase>>,
+        refuse: bool,
+    }
+
+    impl Observer for Watcher {
+        fn phase(&self, phase: ActivationPhase) {
+            self.phases.borrow_mut().push(phase);
+        }
+
+        fn confirm(&self) -> Result<(), String> {
+            self.phases
+                .borrow_mut()
+                .push(ActivationPhase::AwaitingConfirmation);
+            match self.refuse {
+                true => Err("no confirmation".to_owned()),
+                false => Ok(()),
+            }
+        }
+    }
+
     fn config(checks: bool) -> AgentConfig {
         AgentConfig {
             version: 1,
@@ -324,6 +445,9 @@ mod tests {
             let n = *self.generation.borrow();
             Ok(Some((n as u64 + 1, self.profile.borrow()[n].clone())))
         }
+        fn profile_generations(&self) -> anyhow::Result<Vec<ProfileGeneration>> {
+            Ok((1..).zip(self.profile.borrow().iter().cloned()).collect())
+        }
         fn set_profile(&self, path: &StorePath) -> anyhow::Result<()> {
             self.log.borrow_mut().push(format!("set-profile {path}"));
             self.profile.borrow_mut().push(path.clone());
@@ -358,7 +482,7 @@ mod tests {
     #[test]
     fn healthy_switch_succeeds() {
         let host = Fake::new();
-        let report = activate(&host, NEW, ActivationMode::Switch);
+        let report = run(&host, NEW, ActivationMode::Switch);
         assert_eq!(report.status, ActivationStatus::Succeeded, "{report:?}");
         assert!(report.system_changed);
         assert_eq!(report.previous_system.as_deref(), Some(OLD));
@@ -380,7 +504,7 @@ mod tests {
             healthy: false,
             ..Fake::new()
         };
-        let report = activate(&host, NEW, ActivationMode::Switch);
+        let report = run(&host, NEW, ActivationMode::Switch);
         assert_eq!(report.status, ActivationStatus::RolledBack, "{report:?}");
         assert!(!report.system_changed);
         assert_eq!(
@@ -408,7 +532,7 @@ mod tests {
             failing_actions: BTreeSet::from([(NEW.into(), "test".into())]),
             ..Fake::new()
         };
-        let report = activate(&host, NEW, ActivationMode::Test);
+        let report = run(&host, NEW, ActivationMode::Test);
         assert_eq!(report.status, ActivationStatus::RolledBack, "{report:?}");
         assert_eq!(
             host.log(),
@@ -428,7 +552,7 @@ mod tests {
             failing_actions: BTreeSet::from([(OLD.into(), "test".into())]),
             ..Fake::new()
         };
-        let report = activate(&host, NEW, ActivationMode::Switch);
+        let report = run(&host, NEW, ActivationMode::Switch);
         assert_eq!(report.status, ActivationStatus::Failed);
         assert!(report.system_changed);
         assert!(report.message.unwrap().contains("rollback failed"));
@@ -440,7 +564,7 @@ mod tests {
             healthy: false,
             ..Fake::new()
         };
-        let report = activate(&host, NEW, ActivationMode::Boot);
+        let report = run(&host, NEW, ActivationMode::Boot);
         assert_eq!(report.status, ActivationStatus::Succeeded);
         assert_eq!(
             host.log(),
@@ -459,12 +583,12 @@ mod tests {
             ..Fake::new()
         };
         host.configs.insert(NEW.into(), config(false));
-        let report = activate(&host, NEW, ActivationMode::Switch);
+        let report = run(&host, NEW, ActivationMode::Switch);
         assert_eq!(report.status, ActivationStatus::Succeeded);
     }
 
     fn assert_refused(host: Fake, path: &str, reason: &str) {
-        let report = activate(&host, path, ActivationMode::Switch);
+        let report = run(&host, path, ActivationMode::Switch);
         assert_eq!(report.status, ActivationStatus::Failed, "{report:?}");
         assert!(!report.system_changed);
         let message = report.message.unwrap();
@@ -518,6 +642,118 @@ mod tests {
             .trusted_public_keys
             .clear();
         assert_refused(host, NEW, "no trusted public keys");
+    }
+
+    #[test]
+    fn signatures_may_come_with_the_request() {
+        let host = Fake {
+            signatures: vec![],
+            ..Fake::new()
+        };
+        let mut req = request(NEW, ActivationMode::Switch);
+        req.signatures = vec![signature("other-1", NEW)];
+        let report = activate(&host, &req, &Unobserved);
+        assert!(report.message.unwrap().contains("signed by: other-1"));
+        req.signatures.push(signature("test-1", NEW));
+        let report = activate(&host, &req, &Unobserved);
+        assert_eq!(report.status, ActivationStatus::Succeeded, "{report:?}");
+    }
+
+    #[test]
+    fn phases_are_reported_in_order() {
+        let host = Fake {
+            healthy: false,
+            ..Fake::new()
+        };
+        let watcher = Watcher::default();
+        activate(&host, &request(NEW, ActivationMode::Switch), &watcher);
+        assert_eq!(
+            *watcher.phases.borrow(),
+            [
+                ActivationPhase::Activating,
+                ActivationPhase::CheckingHealth,
+                ActivationPhase::RollingBack
+            ]
+        );
+
+        let host = Fake::new();
+        let watcher = Watcher::default();
+        let report = activate(&host, &request(NEW, ActivationMode::Switch), &watcher);
+        assert_eq!(report.status, ActivationStatus::Succeeded);
+        assert_eq!(
+            *watcher.phases.borrow(),
+            [
+                ActivationPhase::Activating,
+                ActivationPhase::CheckingHealth,
+                ActivationPhase::AwaitingConfirmation
+            ]
+        );
+    }
+
+    #[test]
+    fn a_missing_confirmation_rolls_back() {
+        let host = Fake::new();
+        let watcher = Watcher {
+            refuse: true,
+            ..Watcher::default()
+        };
+        let report = activate(&host, &request(NEW, ActivationMode::Switch), &watcher);
+        assert_eq!(report.status, ActivationStatus::RolledBack, "{report:?}");
+        assert_eq!(report.message.as_deref(), Some("no confirmation"));
+        assert_eq!(*host.current.borrow(), sp(OLD));
+        assert_eq!(host.profile_system(), sp(OLD));
+    }
+
+    #[test]
+    fn boot_mode_needs_no_confirmation() {
+        let host = Fake::new();
+        let watcher = Watcher {
+            refuse: true,
+            ..Watcher::default()
+        };
+        let report = activate(&host, &request(NEW, ActivationMode::Boot), &watcher);
+        assert_eq!(report.status, ActivationStatus::Succeeded, "{report:?}");
+    }
+
+    fn rollback() -> Request {
+        Request {
+            target: ActivationTarget::PreviousGeneration,
+            mode: ActivationMode::Switch,
+            signatures: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn rolls_back_to_the_previous_generation_without_a_signature() {
+        let host = Fake::new();
+        run(&host, NEW, ActivationMode::Switch);
+        let host = Fake {
+            signatures: vec![],
+            ..host
+        };
+        host.log.borrow_mut().clear();
+        // The old system enables the agent too.
+        let mut host = host;
+        host.configs.insert(OLD.into(), config(true));
+        let report = activate(&host, &rollback(), &Unobserved);
+        assert_eq!(report.status, ActivationStatus::Succeeded, "{report:?}");
+        assert_eq!(report.store_path, OLD);
+        assert_eq!(report.previous_system.as_deref(), Some(NEW));
+        assert_eq!(*host.current.borrow(), sp(OLD));
+        assert_eq!(host.profile_system(), sp(OLD));
+        // Rolling back again returns to the newer system.
+        let report = activate(&host, &rollback(), &Unobserved);
+        assert_eq!(report.store_path, NEW, "{report:?}");
+    }
+
+    #[test]
+    fn rollback_needs_an_earlier_different_generation() {
+        let host = Fake::new();
+        let report = activate(&host, &rollback(), &Unobserved);
+        assert_eq!(report.status, ActivationStatus::Failed);
+        assert_eq!(report.store_path, "");
+        assert!(report.message.unwrap().contains("no generation before 1"));
+        assert!(host.log().is_empty());
     }
 
     #[test]

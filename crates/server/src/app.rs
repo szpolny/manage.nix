@@ -10,9 +10,10 @@ use axum::{Json, Router};
 use mnix_protocol::api::ErrorBody;
 use mnix_store::{Event, Organization, Store};
 use time::OffsetDateTime;
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 use uuid::Uuid;
 
+use crate::build::Builder;
 use crate::{agent, api};
 
 /// Settings that shape the API's behaviour.
@@ -21,6 +22,13 @@ pub struct Settings {
     pub heartbeat_interval: Duration,
     pub heartbeat_timeout: Duration,
     pub default_token_ttl: Duration,
+    /// How long an agent waits for `confirm` after a healthy activation.
+    pub confirm_timeout: Duration,
+    /// How long a machine may take from receiving a system to reporting
+    /// the result (including waiting to come online).
+    pub activation_timeout: Duration,
+    /// How long fetching and building one deployment may take.
+    pub build_timeout: Duration,
 }
 
 pub struct AppState {
@@ -33,11 +41,21 @@ pub struct AppState {
     /// Becomes true when the server is shutting down, so agent sessions
     /// close cleanly.
     pub shutdown: watch::Receiver<bool>,
+    pub builder: Builder,
+    /// Wakes the build worker when a deployment is queued.
+    pub queue: Notify,
+    /// Bumped when activations are released, so agent sessions look for
+    /// them. (Sessions on other servers notice at their next heartbeat.)
+    pub activations: watch::Sender<u64>,
 }
 
 pub type State = Arc<AppState>;
 
 impl AppState {
+    pub fn activations_changed(&self) {
+        self.activations.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
     /// Records an event, logging (not returning) failures: losing an event
     /// must not fail the request that caused it.
     pub async fn event(&self, machine_id: Option<Uuid>, kind: &str, data: serde_json::Value) {

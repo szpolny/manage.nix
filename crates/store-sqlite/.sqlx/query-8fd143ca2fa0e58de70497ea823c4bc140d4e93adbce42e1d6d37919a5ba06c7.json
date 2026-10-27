@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE deployment_machines SET status = ?\n             WHERE deployment_id = ? AND machine_id = ? AND finished_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "8fd143ca2fa0e58de70497ea823c4bc140d4e93adbce42e1d6d37919a5ba06c7"
+}

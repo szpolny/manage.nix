@@ -7,6 +7,7 @@
 //! - [`api`] holds the HTTP API's request and response bodies.
 //! - [`Facts`] and [`ActivationReport`] are what the agent reports about
 //!   itself; `mnix-agent facts` and `mnix-agent activate` print them too.
+//! - [`Activate`] is the one command the server can give an agent.
 
 pub mod api;
 
@@ -47,6 +48,27 @@ pub enum AgentMessage {
     Heartbeat,
     /// The machine's facts changed since the last `hello` or `facts`.
     Facts { facts: Facts },
+    /// An activation the server asked for has reached a new phase. Sent on
+    /// every new session for activations that have not finished, so the
+    /// server knows the agent has the request.
+    ActivationStatus {
+        deployment_id: String,
+        phase: ActivationPhase,
+    },
+    /// Output of an activation: the bytes of the agent's activation log
+    /// starting at `offset`. The agent sends each log from the start on every
+    /// new session; the server keeps what it has not seen.
+    ActivationLog {
+        deployment_id: String,
+        offset: u64,
+        text: String,
+    },
+    /// An activation finished. Sent on every new session until the server
+    /// answers `result_received`.
+    ActivationResult {
+        deployment_id: String,
+        report: ActivationReport,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +94,84 @@ pub enum ServerMessage {
     },
     /// The server is about to close the connection.
     Error { message: String },
+    /// Activate a system. The server sends it again on every new session
+    /// until the agent reports a phase for it, so agents ignore requests
+    /// for deployments they already know.
+    Activate(Activate),
+    /// The answer to `activation_status` with phase `awaiting_confirmation`:
+    /// the machine reached the server over a new connection after the
+    /// switch, so it can keep the new system.
+    Confirm { deployment_id: String },
+    /// The server has stored an `activation_result`; the agent can forget
+    /// the activation.
+    ResultReceived { deployment_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Activate {
+    /// The deployment this activation belongs to (a UUID).
+    pub deployment_id: String,
+    pub target: ActivationTarget,
+    pub mode: ActivationMode,
+    /// Signatures on the target's top-level path, checked like the ones Nix
+    /// stores with the path. The server signs what it builds.
+    #[serde(default)]
+    pub signatures: Vec<String>,
+    /// How long the agent waits for `confirm` after a `switch` or `test`
+    /// activation is healthy before rolling back on its own.
+    pub confirm_timeout_secs: u64,
+}
+
+/// What to activate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ActivationTarget {
+    /// A NixOS system's top-level store path, signed by a trusted key.
+    System { store_path: String },
+    /// The newest earlier generation of the system profile that differs
+    /// from the running system (`mnix rollback`). Profile generations need
+    /// no signature: root installed them.
+    PreviousGeneration,
+}
+
+/// How far an activation has got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivationPhase {
+    /// The agent has the request and will start it.
+    Accepted,
+    /// Fetching and checking the system, then switching to it.
+    Activating,
+    /// Running the new system's health checks.
+    CheckingHealth,
+    /// Healthy; waiting for `confirm` over a new connection.
+    AwaitingConfirmation,
+    /// Something failed; restoring the previous system.
+    RollingBack,
+}
+
+impl ActivationPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Activating => "activating",
+            Self::CheckingHealth => "checking_health",
+            Self::AwaitingConfirmation => "awaiting_confirmation",
+            Self::RollingBack => "rolling_back",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        [
+            Self::Accepted,
+            Self::Activating,
+            Self::CheckingHealth,
+            Self::AwaitingConfirmation,
+            Self::RollingBack,
+        ]
+        .into_iter()
+        .find(|p| p.as_str() == s)
+    }
 }
 
 /// What a machine reports about itself.
@@ -125,6 +225,12 @@ impl ActivationMode {
         }
     }
 
+    pub fn parse(s: &str) -> Option<Self> {
+        [Self::Switch, Self::Boot, Self::Test]
+            .into_iter()
+            .find(|m| m.as_str() == s)
+    }
+
     /// Whether the system profile (and so the boot default) changes.
     pub fn sets_profile(self) -> bool {
         matches!(self, Self::Switch | Self::Boot)
@@ -158,6 +264,8 @@ pub enum ActivationStatus {
 /// The outcome of one `activate` request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActivationReport {
+    /// The system that was (to be) activated; empty if a
+    /// `previous_generation` target could not be resolved.
     pub store_path: String,
     pub mode: ActivationMode,
     pub status: ActivationStatus,
@@ -215,6 +323,55 @@ mod tests {
             serde_json::to_value(&welcome).unwrap()["type"],
             serde_json::json!("welcome")
         );
+    }
+
+    #[test]
+    fn activate_carries_a_tagged_target() {
+        let activate = ServerMessage::Activate(Activate {
+            deployment_id: "d".to_owned(),
+            target: ActivationTarget::System {
+                store_path: "/nix/store/x-nixos-system".to_owned(),
+            },
+            mode: ActivationMode::Switch,
+            signatures: vec!["k:sig".to_owned()],
+            confirm_timeout_secs: 60,
+        });
+        let json = serde_json::to_value(&activate).unwrap();
+        assert_eq!(json["type"], "activate");
+        assert_eq!(
+            json["target"],
+            serde_json::json!({"type": "system", "store_path": "/nix/store/x-nixos-system"})
+        );
+        let rollback: ServerMessage = serde_json::from_value(serde_json::json!({
+            "type": "activate",
+            "deployment_id": "d",
+            "target": {"type": "previous_generation"},
+            "mode": "switch",
+            "confirm_timeout_secs": 60
+        }))
+        .unwrap();
+        assert!(matches!(
+            rollback,
+            ServerMessage::Activate(Activate { target: ActivationTarget::PreviousGeneration, ref signatures, .. })
+                if signatures.is_empty()
+        ));
+    }
+
+    #[test]
+    fn phases_and_modes_round_trip_as_strings() {
+        for phase in [
+            ActivationPhase::Accepted,
+            ActivationPhase::AwaitingConfirmation,
+            ActivationPhase::RollingBack,
+        ] {
+            assert_eq!(ActivationPhase::parse(phase.as_str()), Some(phase));
+            assert_eq!(
+                serde_json::to_value(phase).unwrap(),
+                serde_json::json!(phase.as_str())
+            );
+        }
+        assert_eq!(ActivationMode::parse("test"), Some(ActivationMode::Test));
+        assert_eq!(ActivationMode::parse("reboot"), None);
     }
 
     #[test]

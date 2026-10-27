@@ -1,0 +1,86 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT dm.machine_id, m.name AS machine_name, dm.configuration, dm.status,\n                      dm.phase, dm.store_path, dm.signatures, dm.message, dm.report,\n                      dm.released_at, dm.accepted_at, dm.finished_at\n               FROM deployment_machines AS dm JOIN machines AS m ON m.id = dm.machine_id\n               WHERE dm.deployment_id = ?\n               ORDER BY m.name",
+  "describe": {
+    "columns": [
+      {
+        "name": "machine_id",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "machine_name",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "configuration",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "status",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "phase",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "store_path",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "signatures",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "message",
+        "ordinal": 7,
+        "type_info": "Text"
+      },
+      {
+        "name": "report",
+        "ordinal": 8,
+        "type_info": "Text"
+      },
+      {
+        "name": "released_at",
+        "ordinal": 9,
+        "type_info": "Text"
+      },
+      {
+        "name": "accepted_at",
+        "ordinal": 10,
+        "type_info": "Text"
+      },
+      {
+        "name": "finished_at",
+        "ordinal": 11,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "a86c4351d630a7ddd84f0f1619d08e34e2af5239d45bdc51fb03c9469c9bb76b"
+}

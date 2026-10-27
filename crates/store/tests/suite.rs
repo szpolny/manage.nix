@@ -9,10 +9,12 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use mnix_protocol::Facts;
+use mnix_protocol::api::{DeploymentKind, DeploymentStatus, MachineDeploymentStatus};
+use mnix_protocol::{ActivationMode, ActivationPhase, ActivationReport, ActivationStatus, Facts};
 use mnix_store::{
-    disconnect_reason, Backend, Error, Event, NewEnrollmentToken, NewSession, PostgresStore,
-    Redemption, SqliteStore, Store,
+    disconnect_reason, log_source, Backend, Error, Event, MachineOutcome, NewDeployment,
+    NewDeploymentMachine, NewEnrollmentToken, NewLogEntry, NewSession, PostgresStore, Redemption,
+    SqliteStore, Store,
 };
 use sqlx::postgres::PgConnectOptions;
 use sqlx::{Connection, PgConnection};
@@ -107,10 +109,15 @@ store_test!(migrate_creates_tables, |store: Arc<dyn Store>| async move {
         names,
         [
             "agent_sessions",
+            "deployment_logs",
+            "deployment_machines",
+            "deployments",
             "enrollment_tokens",
             "events",
+            "machine_tags",
             "machines",
             "organizations",
+            "repositories",
             "server_meta"
         ]
     );
@@ -526,3 +533,378 @@ async fn backends_produce_the_same_logical_schema() {
         postgres.schema().await.unwrap()
     );
 }
+
+store_test!(
+    repositories_and_configurations,
+    |store: Arc<dyn Store>| async move {
+        let org = store.ensure_organization("default", T0).await.unwrap();
+        let infra = store
+            .create_repository(org.id, "infra", "https://git.example/infra", T0)
+            .await
+            .unwrap();
+        store
+            .create_repository(org.id, "homelab", "/srv/git/homelab", T0)
+            .await
+            .unwrap();
+        let err = store
+            .create_repository(org.id, "infra", "x", T0)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Conflict(_)), "{err:?}");
+        let names: Vec<_> = store
+            .repositories(org.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(names, ["homelab", "infra"]);
+        assert_eq!(
+            store.repository(infra.id).await.unwrap(),
+            Some(infra.clone())
+        );
+
+        let machine = store.create_machine(org.id, "web-1", T0).await.unwrap();
+        assert_eq!(machine.repository_id, None);
+        store
+            .set_machine_configuration(machine.id, infra.id, "web")
+            .await
+            .unwrap();
+        store
+            .set_machine_tags(machine.id, &["web".into(), "eu".into(), "web".into()])
+            .await
+            .unwrap();
+        let record = store.machine(machine.id).await.unwrap().unwrap();
+        assert_eq!(record.repository_id, Some(infra.id));
+        assert_eq!(record.configuration.as_deref(), Some("web"));
+        assert_eq!(record.tags, ["eu", "web"]);
+        store.set_machine_tags(machine.id, &[]).await.unwrap();
+        assert!(store.machines(org.id).await.unwrap()[0].tags.is_empty());
+    }
+);
+
+/// A queued deployment of `machines` (already created) from `infra`.
+async fn queued_deployment(
+    store: &dyn Store,
+    org: Uuid,
+    machines: &[Uuid],
+    at: OffsetDateTime,
+) -> Uuid {
+    let repository = match store.repositories(org).await.unwrap().pop() {
+        Some(r) => r,
+        None => store
+            .create_repository(org, "infra", "/srv/git/infra", T0)
+            .await
+            .unwrap(),
+    };
+    let id = Uuid::new_v4();
+    store
+        .create_deployment(&NewDeployment {
+            id,
+            organization_id: org,
+            kind: DeploymentKind::Deploy,
+            status: DeploymentStatus::Queued,
+            repository_id: Some(repository.id),
+            rev: Some("main".to_owned()),
+            mode: ActivationMode::Switch,
+            requested_by: "alice".to_owned(),
+            created_at: at,
+            machines: machines
+                .iter()
+                .map(|&machine_id| NewDeploymentMachine {
+                    machine_id,
+                    configuration: Some("conf".to_owned()),
+                    status: MachineDeploymentStatus::Queued,
+                })
+                .collect(),
+        })
+        .await
+        .unwrap();
+    id
+}
+
+fn report(status: ActivationStatus, store_path: &str) -> ActivationReport {
+    ActivationReport {
+        store_path: store_path.to_owned(),
+        mode: ActivationMode::Switch,
+        status,
+        system_changed: status == ActivationStatus::Succeeded,
+        previous_system: Some("/nix/store/old".to_owned()),
+        message: None,
+        failed_checks: vec![],
+    }
+}
+
+store_test!(deployments_go_from_queue_to_result, |store: Arc<
+    dyn Store,
+>| async move {
+    let (org, web) = enrolled_machine(&*store, "web").await;
+    let (_, db) = enrolled_machine(&*store, "db").await;
+    let first = queued_deployment(&*store, org, &[web, db], T0).await;
+    let second = queued_deployment(&*store, org, &[web], T0 + Duration::seconds(1)).await;
+
+    let listed = store.deployments(org, 10).await.unwrap();
+    assert_eq!(
+        listed.iter().map(|d| d.id).collect::<Vec<_>>(),
+        [second, first]
+    );
+    let d = &listed[1];
+    assert_eq!(d.status, DeploymentStatus::Queued);
+    assert_eq!(
+        (d.kind, d.mode),
+        (DeploymentKind::Deploy, ActivationMode::Switch)
+    );
+    assert_eq!(d.rev.as_deref(), Some("main"));
+    assert_eq!(d.requested_by, "alice");
+    let names: Vec<_> = d.machines.iter().map(|m| m.machine_name.as_str()).collect();
+    assert_eq!(names, ["db", "web"]);
+    assert!(d
+        .machines
+        .iter()
+        .all(|m| m.status == MachineDeploymentStatus::Queued));
+
+    // Oldest first, each once.
+    let started = T0 + Duration::seconds(5);
+    assert_eq!(store.claim_deployment(started).await.unwrap(), Some(first));
+    assert_eq!(store.claim_deployment(started).await.unwrap(), Some(second));
+    assert_eq!(store.claim_deployment(started).await.unwrap(), None);
+
+    store.set_deployment_commit(first, "abc123").await.unwrap();
+    store
+        .set_deployment_machine_status(first, web, MachineDeploymentStatus::Building)
+        .await
+        .unwrap();
+    let sigs = vec!["mnix-1:sig".to_owned()];
+    store
+        .release_activation(first, web, "/nix/store/new-web", &sigs, started)
+        .await
+        .unwrap();
+    store.start_activating(first).await.unwrap();
+    let d = store.deployment(first).await.unwrap().unwrap();
+    assert_eq!(d.status, DeploymentStatus::Activating);
+    assert_eq!(d.commit_id.as_deref(), Some("abc123"));
+    assert_eq!(d.started_at, Some(started));
+    let m = d.machines.iter().find(|m| m.machine_id == web).unwrap();
+    assert_eq!(m.status, MachineDeploymentStatus::Activating);
+    assert_eq!(m.store_path.as_deref(), Some("/nix/store/new-web"));
+    assert_eq!(m.signatures, sigs);
+    assert_eq!(m.released_at, Some(started));
+
+    let pending = store.pending_activations(web).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].deployment_id, first);
+    assert_eq!(pending[0].kind, DeploymentKind::Deploy);
+    assert_eq!(pending[0].store_path.as_deref(), Some("/nix/store/new-web"));
+    assert_eq!(pending[0].signatures, sigs);
+    assert!(store.pending_activations(db).await.unwrap().is_empty());
+
+    // A phase acknowledges the request.
+    assert!(store
+        .record_activation_phase(first, web, ActivationPhase::Accepted, started)
+        .await
+        .unwrap());
+    assert!(store.pending_activations(web).await.unwrap().is_empty());
+    assert!(!store
+        .record_activation_phase(first, db, ActivationPhase::Accepted, started)
+        .await
+        .unwrap());
+
+    let done = T0 + Duration::seconds(30);
+    let succeeded = MachineOutcome {
+        status: MachineDeploymentStatus::Succeeded,
+        message: None,
+        report: Some(report(ActivationStatus::Succeeded, "/nix/store/new-web")),
+    };
+    let finished = store
+        .finish_deployment_machine(first, web, &succeeded, done)
+        .await
+        .unwrap();
+    assert!(finished.machine && finished.deployment.is_none());
+    // Finishing twice changes nothing.
+    let again = store
+        .finish_deployment_machine(first, web, &succeeded, done)
+        .await
+        .unwrap();
+    assert!(!again.machine);
+    assert!(!store
+        .record_activation_phase(first, web, ActivationPhase::AwaitingConfirmation, done)
+        .await
+        .unwrap());
+
+    let failed = MachineOutcome {
+        status: MachineDeploymentStatus::Failed,
+        message: Some("build failed".to_owned()),
+        report: None,
+    };
+    let finished = store
+        .finish_deployment_machine(first, db, &failed, done)
+        .await
+        .unwrap();
+    assert_eq!(finished.deployment, Some(DeploymentStatus::Failed));
+    let d = store.deployment(first).await.unwrap().unwrap();
+    assert_eq!(d.status, DeploymentStatus::Failed);
+    assert_eq!(d.finished_at, Some(done));
+    let m = d.machines.iter().find(|m| m.machine_id == web).unwrap();
+    assert_eq!(m.report, succeeded.report);
+    assert_eq!(m.phase, Some(ActivationPhase::Accepted));
+    assert_eq!(m.finished_at, Some(done));
+    let m = d.machines.iter().find(|m| m.machine_id == db).unwrap();
+    assert_eq!(m.message.as_deref(), Some("build failed"));
+    // Finished deployments stay finished.
+    store.start_activating(first).await.unwrap();
+    assert_eq!(
+        store.deployment(first).await.unwrap().unwrap().status,
+        DeploymentStatus::Failed
+    );
+
+    let finished = store
+        .finish_deployment_machine(second, web, &succeeded, done)
+        .await
+        .unwrap();
+    assert_eq!(finished.deployment, Some(DeploymentStatus::Succeeded));
+});
+
+store_test!(
+    rollbacks_are_released_at_once,
+    |store: Arc<dyn Store>| async move {
+        let (org, web) = enrolled_machine(&*store, "web").await;
+        let id = Uuid::new_v4();
+        store
+            .create_deployment(&NewDeployment {
+                id,
+                organization_id: org,
+                kind: DeploymentKind::Rollback,
+                status: DeploymentStatus::Activating,
+                repository_id: None,
+                rev: None,
+                mode: ActivationMode::Test,
+                requested_by: "bob".to_owned(),
+                created_at: T0,
+                machines: vec![NewDeploymentMachine {
+                    machine_id: web,
+                    configuration: None,
+                    status: MachineDeploymentStatus::Activating,
+                }],
+            })
+            .await
+            .unwrap();
+        let pending = store.pending_activations(web).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            (
+                pending[0].kind,
+                pending[0].mode,
+                pending[0].store_path.as_deref()
+            ),
+            (DeploymentKind::Rollback, ActivationMode::Test, None)
+        );
+        assert!(pending[0].signatures.is_empty());
+        // The store path the agent rolled back to is recorded.
+        store
+            .finish_deployment_machine(
+                id,
+                web,
+                &MachineOutcome {
+                    status: MachineDeploymentStatus::Succeeded,
+                    message: None,
+                    report: Some(report(ActivationStatus::Succeeded, "/nix/store/previous")),
+                },
+                T0,
+            )
+            .await
+            .unwrap();
+        let d = store.deployment(id).await.unwrap().unwrap();
+        assert_eq!(d.status, DeploymentStatus::Succeeded);
+        assert_eq!(
+            d.machines[0].store_path.as_deref(),
+            Some("/nix/store/previous")
+        );
+    }
+);
+
+store_test!(stuck_deployments_are_found_and_failed, |store: Arc<
+    dyn Store,
+>| async move {
+    let (org, web) = enrolled_machine(&*store, "web").await;
+    let (_, db) = enrolled_machine(&*store, "db").await;
+    let building = queued_deployment(&*store, org, &[db], T0).await;
+    let activating = queued_deployment(&*store, org, &[web], T0).await;
+    store.claim_deployment(T0).await.unwrap();
+    store.claim_deployment(T0).await.unwrap();
+    store
+        .release_activation(activating, web, "/nix/store/x", &[], T0)
+        .await
+        .unwrap();
+    store.start_activating(activating).await.unwrap();
+
+    let later = T0 + Duration::minutes(10);
+    assert_eq!(store.stale_builds(later).await.unwrap(), [building]);
+    assert!(store.stale_builds(T0).await.unwrap().is_empty());
+    assert_eq!(
+        store.expired_activations(later).await.unwrap(),
+        [(activating, web)]
+    );
+    assert!(store.expired_activations(T0).await.unwrap().is_empty());
+
+    store
+        .fail_deployment(building, "interrupted", later)
+        .await
+        .unwrap();
+    let d = store.deployment(building).await.unwrap().unwrap();
+    assert_eq!(d.status, DeploymentStatus::Failed);
+    assert_eq!(d.message.as_deref(), Some("interrupted"));
+    assert_eq!(d.machines[0].status, MachineDeploymentStatus::Failed);
+    assert_eq!(d.machines[0].message.as_deref(), Some("interrupted"));
+    assert!(store.stale_builds(later).await.unwrap().is_empty());
+});
+
+store_test!(
+    logs_keep_order_and_drop_repeated_agent_output,
+    |store: Arc<dyn Store>| async move {
+        let (org, web) = enrolled_machine(&*store, "web").await;
+        let deployment = queued_deployment(&*store, org, &[web], T0).await;
+        store
+            .append_log(&NewLogEntry {
+                deployment_id: deployment,
+                machine_id: None,
+                source: log_source::SERVER.to_owned(),
+                text: "fetching\n".to_owned(),
+                created_at: T0,
+            })
+            .await
+            .unwrap();
+        for (offset, text) in [
+            (0, "one\n"),
+            (0, "one\n"),
+            (0, "one\ntwo\n"),
+            (8, "three\n"),
+        ] {
+            store
+                .append_agent_log(deployment, web, offset, text, T0)
+                .await
+                .unwrap();
+        }
+        // Unknown deployments are ignored.
+        store
+            .append_agent_log(Uuid::new_v4(), web, 0, "x", T0)
+            .await
+            .unwrap();
+
+        let logs = store.deployment_logs(deployment, 0, 100).await.unwrap();
+        let texts: Vec<_> = logs.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, ["fetching\n", "one\n", "two\n", "three\n"]);
+        assert_eq!(logs[0].source, "server");
+        assert_eq!(logs[0].machine_name, None);
+        assert_eq!(logs[1].source, "agent");
+        assert_eq!(logs[1].machine_name.as_deref(), Some("web"));
+        assert_eq!(logs[1].machine_id, Some(web));
+        assert!(logs.windows(2).all(|w| w[0].id < w[1].id));
+
+        let rest = store
+            .deployment_logs(deployment, logs[1].id, 1)
+            .await
+            .unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].text, "two\n");
+    }
+);

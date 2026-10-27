@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE deployments SET status = 'failed', message = $1, finished_at = $2\n             WHERE id = $3 AND finished_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Timestamptz",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b18cc511f35ae856aa7c62459d76819d29dabffd3675e6b258b46afb2c4ae1c2"
+}

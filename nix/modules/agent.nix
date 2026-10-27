@@ -4,6 +4,12 @@
 # control plane (once, using `enrollmentTokenFile`) and keeps a WebSocket to
 # it open. The credential it receives is kept in /var/lib/manage-nix.
 #
+# Systems the server deploys run in their own transient units
+# (`mnix-activation-<deployment>.service`), so an activation finishes, or
+# rolls back, even when the switch restarts this service or breaks the
+# network. The machine fetches systems through Nix's own substituters, so
+# configure `nix.settings.substituters` for the server's cache.
+#
 # The agent reads `/etc/manage-nix/agent.json` from two places: trusted keys
 # from the running system, and health checks from the system being activated
 # (`<toplevel>/etc/manage-nix/agent.json`), so each configuration declares
@@ -77,8 +83,9 @@ in
       example = [ "manage-nix-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=" ];
       description = ''
         Nix signing keys (`name:base64`) trusted to sign systems for this
-        machine. The agent refuses to activate a system whose top-level
-        store path has no valid signature from one of these keys. Nix's own
+        machine; include the control plane's key (`mnix signing-key`). The
+        agent refuses to activate a system whose top-level store path has no
+        valid signature from one of these keys. Nix's own
         `trusted-public-keys` still govern the rest of the closure when it
         is substituted.
 
@@ -149,6 +156,8 @@ in
       wants = [ "network-online.target" ];
       after = [ "network-online.target" ];
       environment.RUST_LOG = lib.mkDefault "info";
+      # nix-store, nix-env, and nix for activations.
+      path = [ config.nix.package ];
       serviceConfig = {
         ExecStart = lib.escapeShellArgs (
           [
@@ -162,7 +171,7 @@ in
             cfg.enrollmentTokenFile
           ]
         );
-        # Root: activating systems (M3) needs it.
+        # Root: activating systems needs it.
         StateDirectory = "manage-nix";
         StateDirectoryMode = "0700";
         Restart = "always";

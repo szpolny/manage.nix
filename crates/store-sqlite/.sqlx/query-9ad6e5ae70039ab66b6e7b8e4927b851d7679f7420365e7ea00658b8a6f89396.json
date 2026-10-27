@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE deployment_machines\n             SET status = ?, message = ?, report = ?, store_path = COALESCE(store_path, ?),\n                 finished_at = ?\n             WHERE deployment_id = ? AND machine_id = ? AND finished_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 7
+    },
+    "nullable": []
+  },
+  "hash": "9ad6e5ae70039ab66b6e7b8e4927b851d7679f7420365e7ea00658b8a6f89396"
+}

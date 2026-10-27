@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, organization_id, name, created_at, enrolled_at, agent_version,\n                      facts AS \"facts: Json<Facts>\", facts_updated_at, last_seen_at,\n                      EXISTS (\n                          SELECT 1 FROM agent_sessions AS s\n                          WHERE s.machine_id = machines.id AND s.disconnected_at IS NULL\n                      ) AS \"connected!\"\n               FROM machines WHERE id = $1",
+  "query": "SELECT id, organization_id, name, created_at, enrolled_at, agent_version,\n                      facts AS \"facts: Json<Facts>\", facts_updated_at, last_seen_at,\n                      EXISTS (\n                          SELECT 1 FROM agent_sessions AS s\n                          WHERE s.machine_id = machines.id AND s.disconnected_at IS NULL\n                      ) AS \"connected!\",\n                      repository_id, configuration,\n                      ARRAY(\n                          SELECT tag FROM machine_tags AS t\n                          WHERE t.machine_id = machines.id ORDER BY tag COLLATE \"C\"\n                      ) AS \"tags!\"\n               FROM machines WHERE id = $1",
   "describe": {
     "columns": [
       {
@@ -52,6 +52,21 @@
         "ordinal": 9,
         "name": "connected!",
         "type_info": "Bool"
+      },
+      {
+        "ordinal": 10,
+        "name": "repository_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 11,
+        "name": "configuration",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "tags!",
+        "type_info": "TextArray"
       }
     ],
     "parameters": {
@@ -69,8 +84,11 @@
       true,
       true,
       true,
+      null,
+      true,
+      true,
       null
     ]
   },
-  "hash": "d24b1f7478db6b5e8c2babf871cda833b8e3cb9f8374d44d206d95a53b8e3430"
+  "hash": "ddfb812c4417fec7243c1f5f0d5b330eda5a82748a2e74748e5deb84f20a5d94"
 }

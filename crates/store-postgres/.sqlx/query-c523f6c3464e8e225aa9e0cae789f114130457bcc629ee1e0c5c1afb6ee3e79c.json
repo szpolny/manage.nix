@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COUNT(*) FILTER (WHERE finished_at IS NULL) AS \"open!\",\n                      COUNT(*) FILTER (WHERE status <> 'succeeded') AS \"bad!\"\n               FROM deployment_machines WHERE deployment_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "open!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "bad!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "c523f6c3464e8e225aa9e0cae789f114130457bcc629ee1e0c5c1afb6ee3e79c"
+}

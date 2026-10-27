@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE deployment_machines SET log_bytes = ?\n             WHERE deployment_id = ? AND machine_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "1d8b85db35403946369540421b90a502f060e154ee666fa827eb2a47059efe0c"
+}

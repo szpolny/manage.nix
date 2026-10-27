@@ -3,6 +3,10 @@
 # The server speaks plain HTTP on `listenAddress:port`. Put a TLS-terminating
 # reverse proxy (nginx, Caddy) in front of it, with WebSocket upgrades enabled
 # for `/api/agent/ws`; agents only connect over HTTPS in production.
+#
+# The server builds machines' systems itself, as the `manage-nix` user,
+# through this machine's Nix daemon, signs them with its signing key, and
+# pushes them to Attic if `attic.endpoint` is set.
 self:
 {
   config,
@@ -16,6 +20,8 @@ let
   packages = self.packages.${pkgs.stdenv.hostPlatform.system};
 
   stateDir = "/var/lib/manage-nix";
+  signingKeyFile =
+    if cfg.signingKeyFile == null then "${stateDir}/signing-key" else cfg.signingKeyFile;
   localPostgresUrl = "postgres://manage-nix@localhost/manage-nix?host=/run/postgresql";
   adminTokenFile =
     if cfg.adminTokenFile == null then "${stateDir}/admin-token" else cfg.adminTokenFile;
@@ -111,6 +117,71 @@ in
       default = "1h";
       description = "How long enrollment tokens are valid unless `mnix machine add --expires-in` says otherwise.";
     };
+
+    signingKeyFile = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "/run/secrets/manage-nix-signing-key";
+      description = ''
+        Nix secret key (from `nix key generate-secret`) the server signs
+        built systems with. If null, the server generates one on first start
+        in {file}`${stateDir}/signing-key`. Print the public key with
+        `mnix signing-key` and add it to
+        {option}`services.manage-nix.agent.trustedPublicKeys` on every
+        machine.
+      '';
+    };
+
+    attic = {
+      endpoint = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "https://cache.example.com/";
+        description = ''
+          Attic server to push built systems to. Machines must substitute
+          from that cache ({option}`nix.settings.substituters`, with the
+          cache's public key in {option}`nix.settings.trusted-public-keys`).
+        '';
+      };
+
+      cache = mkOption {
+        type = types.str;
+        default = "manage-nix";
+        description = "The Attic cache to push to.";
+      };
+
+      tokenFile = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "File with an Attic token allowed to push to the cache.";
+      };
+    };
+
+    confirmTimeout = mkOption {
+      type = types.ints.positive;
+      default = 60;
+      description = ''
+        Seconds a machine has, after a healthy `switch` or `test`
+        activation, to reach the server over a new connection. Machines
+        that do not roll back on their own.
+      '';
+    };
+
+    activationTimeout = mkOption {
+      type = types.str;
+      default = "30m";
+      description = ''
+        How long a machine may take to report the result of an activation,
+        counted from when its system was built (so including any time
+        offline).
+      '';
+    };
+
+    buildTimeout = mkOption {
+      type = types.str;
+      default = "1h";
+      description = "How long fetching and building one deployment may take.";
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -118,6 +189,10 @@ in
       {
         assertion = cfg.heartbeatTimeout > cfg.heartbeatInterval;
         message = "services.manage-nix.server.heartbeatTimeout must be longer than heartbeatInterval.";
+      }
+      {
+        assertion = cfg.attic.endpoint == null || cfg.attic.tokenFile != null;
+        message = "services.manage-nix.server.attic.tokenFile must be set with attic.endpoint.";
       }
     ];
 
@@ -153,6 +228,12 @@ in
         MNIX_DATABASE_URL = cfg.database.url;
         RUST_LOG = lib.mkDefault "info";
       };
+      # Builds run through the Nix daemon; git fetches repositories.
+      path = [
+        config.nix.package
+        pkgs.git
+      ]
+      ++ lib.optional (cfg.attic.endpoint != null) pkgs.attic-client;
       serviceConfig = {
         ExecStart = lib.escapeShellArgs (
           [
@@ -170,8 +251,27 @@ in
             "${toString cfg.heartbeatTimeout}s"
             "--enrollment-token-ttl"
             cfg.enrollmentTokenTtl
+            "--state-dir"
+            stateDir
+            "--signing-key-file"
+            signingKeyFile
+            "--confirm-timeout"
+            "${toString cfg.confirmTimeout}s"
+            "--activation-timeout"
+            cfg.activationTimeout
+            "--build-timeout"
+            cfg.buildTimeout
           ]
           ++ lib.optional (cfg.adminTokenFile == null) "--create-admin-token"
+          ++ lib.optional (cfg.signingKeyFile == null) "--create-signing-key"
+          ++ lib.optionals (cfg.attic.endpoint != null) [
+            "--attic-endpoint"
+            cfg.attic.endpoint
+            "--attic-cache"
+            cfg.attic.cache
+            "--attic-token-file"
+            cfg.attic.tokenFile
+          ]
         );
         EnvironmentFile = lib.mkIf (cfg.environmentFile != null) cfg.environmentFile;
         User = "manage-nix";

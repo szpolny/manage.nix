@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM machine_tags WHERE machine_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f1f84d15049b3838bc95a28674305a17cbcb526fc8249e4e8a727bcb1b5d8d57"
+}
