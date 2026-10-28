@@ -1,6 +1,6 @@
 # Releases with release-please: every push to main updates a release PR
 # from the Conventional Commits since the last release. Merging it tags
-# `vX.Y.Z` and publishes a GitHub release.
+# `vX.Y.Z-alpha.N` and publishes it as a GitHub pre-release.
 #
 # release-please bumps the version in Cargo.toml, web/package.json, and
 # web/package-lock.json (release-please-config.json); this workflow then

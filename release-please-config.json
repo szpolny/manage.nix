@@ -3,6 +3,9 @@
   "release-type": "simple",
   "include-component-in-tag": false,
   "bump-minor-pre-major": true,
+  "versioning": "prerelease",
+  "prerelease-type": "alpha",
+  "prerelease": true,
   "changelog-sections": [
     { "type": "feat", "section": "Features" },
     { "type": "fix", "section": "Bug Fixes" },
@@ -22,7 +25,9 @@
         { "type": "toml", "path": "Cargo.toml", "jsonpath": "$.workspace.package.version" },
         { "type": "json", "path": "web/package.json", "jsonpath": "$.version" },
         { "type": "json", "path": "web/package-lock.json", "jsonpath": "$.version" },
-        { "type": "json", "path": "web/package-lock.json", "jsonpath": "$.packages[''].version" }
+        { "type": "json", "path": "web/package-lock.json", "jsonpath": "$.packages[''].version" },
+        { "type": "generic", "path": "README.md" },
+        { "type": "generic", "path": "docs/installation.md" }
       ]
     }
   }
