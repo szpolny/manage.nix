@@ -13,9 +13,9 @@ use mnix_protocol::{ActivationMode, ActivationPhase, Facts};
 use mnix_store_core::{
     disconnect_reason, group_columns, log_source, new_log_text, parse_enum, truncate_to_micros,
     Backend, ClosedSession, Deployment, DeploymentMachine, Error, Event, Finished, LogEntry,
-    Machine, MachineOutcome, NewDeployment, NewEnrollmentToken, NewLogEntry, NewSession,
-    Organization, PendingActivation, Redemption, Repository, Result, Store, Table,
-    MIGRATIONS_TABLE,
+    Machine, MachineDeploymentRecord, MachineOutcome, NewDeployment, NewEnrollmentToken,
+    NewLogEntry, NewSession, NewUserSession, Organization, PendingActivation, Redemption,
+    Repository, Result, Store, SystemRevision, Table, User, MIGRATIONS_TABLE,
 };
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
@@ -1175,6 +1175,292 @@ impl Store for SqliteStore {
             })
         })
         .collect()
+    }
+
+    async fn machine_deployments(
+        &self,
+        machine_id: Uuid,
+        limit: u32,
+    ) -> Result<Vec<MachineDeploymentRecord>> {
+        let machine_id = id(machine_id);
+        sqlx::query_as!(
+            MachineDeploymentRow,
+            r#"SELECT dm.deployment_id, dm.machine_id, d.kind, d.mode, d.rev, d.commit_id,
+                      d.requested_by, dm.status, dm.store_path, dm.message, d.created_at,
+                      dm.finished_at
+               FROM deployment_machines AS dm JOIN deployments AS d ON d.id = dm.deployment_id
+               WHERE dm.machine_id = ?
+               ORDER BY d.created_at DESC, d.rowid DESC LIMIT ?"#,
+            machine_id,
+            limit
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(MachineDeploymentRecord::try_from)
+        .collect()
+    }
+
+    async fn latest_machine_deployments(
+        &self,
+        organization_id: Uuid,
+    ) -> Result<Vec<MachineDeploymentRecord>> {
+        let org = id(organization_id);
+        sqlx::query_as!(
+            MachineDeploymentRow,
+            r#"SELECT dm.deployment_id, dm.machine_id, d.kind, d.mode, d.rev, d.commit_id,
+                      d.requested_by, dm.status, dm.store_path, dm.message, d.created_at,
+                      dm.finished_at
+               FROM deployment_machines AS dm JOIN deployments AS d ON d.id = dm.deployment_id
+               WHERE d.organization_id = ? AND d.id = (
+                   SELECT d2.id
+                   FROM deployment_machines AS dm2
+                   JOIN deployments AS d2 ON d2.id = dm2.deployment_id
+                   WHERE dm2.machine_id = dm.machine_id
+                   ORDER BY d2.created_at DESC, d2.rowid DESC LIMIT 1
+               )"#,
+            org
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(MachineDeploymentRecord::try_from)
+        .collect()
+    }
+
+    async fn system_revisions(
+        &self,
+        organization_id: Uuid,
+        store_paths: &[String],
+    ) -> Result<Vec<SystemRevision>> {
+        let org = id(organization_id);
+        let paths = serde_json::to_string(store_paths)?;
+        let rows = sqlx::query!(
+            r#"SELECT dm.store_path AS "store_path!", d.id, d.repository_id, d.rev,
+                      d.commit_id AS "commit_id!", d.created_at
+               FROM deployment_machines AS dm JOIN deployments AS d ON d.id = dm.deployment_id
+               WHERE d.organization_id = ? AND d.kind = 'deploy' AND d.commit_id IS NOT NULL
+                 AND dm.store_path IN (SELECT value FROM json_each(?))
+               ORDER BY d.created_at, d.rowid"#,
+            org,
+            paths
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut revisions = Vec::<SystemRevision>::new();
+        // Oldest first, so the newest deployment of each path wins.
+        for row in rows {
+            let revision = SystemRevision {
+                store_path: row.store_path,
+                deployment_id: parse_id(&row.id)?,
+                repository_id: row.repository_id.as_deref().map(parse_id).transpose()?,
+                rev: row.rev,
+                commit_id: row.commit_id,
+                created_at: parse_ts(&row.created_at)?,
+            };
+            revisions.retain(|r| r.store_path != revision.store_path);
+            revisions.push(revision);
+        }
+        Ok(revisions)
+    }
+
+    async fn create_user(
+        &self,
+        organization_id: Uuid,
+        username: &str,
+        password_hash: &str,
+        now: OffsetDateTime,
+    ) -> Result<User> {
+        let user_id = Uuid::new_v4();
+        let (user_id_s, org, now_s) = (id(user_id), id(organization_id), ts(now));
+        sqlx::query!(
+            "INSERT INTO users (id, organization_id, username, password_hash, created_at,
+                                password_changed_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            user_id_s,
+            org,
+            username,
+            password_hash,
+            now_s,
+            now_s
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| match Error::from(e) {
+            Error::Conflict(_) => Error::Conflict(format!("user {username:?}")),
+            e => e,
+        })?;
+        Ok(User {
+            id: user_id,
+            organization_id,
+            username: username.to_owned(),
+            password_hash: password_hash.to_owned(),
+            created_at: truncate_to_micros(now),
+            password_changed_at: truncate_to_micros(now),
+        })
+    }
+
+    async fn user_count(&self, organization_id: Uuid) -> Result<u64> {
+        let org = id(organization_id);
+        let n = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) AS "n!: i64" FROM users WHERE organization_id = ?"#,
+            org
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(u64::try_from(n).unwrap_or(0))
+    }
+
+    async fn user_by_name(&self, organization_id: Uuid, username: &str) -> Result<Option<User>> {
+        let org = id(organization_id);
+        sqlx::query_as!(
+            UserRow,
+            "SELECT id, organization_id, username, password_hash, created_at, password_changed_at
+             FROM users WHERE organization_id = ? AND username = ?",
+            org,
+            username
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .map(User::try_from)
+        .transpose()
+    }
+
+    async fn set_user_password(
+        &self,
+        user_id: Uuid,
+        password_hash: &str,
+        keep_session: Option<&str>,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let (user_id, now) = (id(user_id), ts(now));
+        let mut tx = self.pool.begin().await?;
+        sqlx::query!(
+            "UPDATE users SET password_hash = ?, password_changed_at = ? WHERE id = ?",
+            password_hash,
+            now,
+            user_id
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query!(
+            "DELETE FROM user_sessions WHERE user_id = ? AND token_hash IS NOT ?",
+            user_id,
+            keep_session
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn create_user_session(&self, session: &NewUserSession) -> Result<()> {
+        let (session_id, user_id) = (id(Uuid::new_v4()), id(session.user_id));
+        let (created_at, expires_at) = (ts(session.created_at), ts(session.expires_at));
+        sqlx::query!(
+            "INSERT INTO user_sessions (id, user_id, token_hash, created_at, expires_at)
+             VALUES (?, ?, ?, ?, ?)",
+            session_id,
+            user_id,
+            session.token_hash,
+            created_at,
+            expires_at
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn session_user(&self, token_hash: &str, now: OffsetDateTime) -> Result<Option<User>> {
+        let now = ts(now);
+        sqlx::query_as!(
+            UserRow,
+            "SELECT u.id, u.organization_id, u.username, u.password_hash, u.created_at,
+                    u.password_changed_at
+             FROM user_sessions AS s JOIN users AS u ON u.id = s.user_id
+             WHERE s.token_hash = ? AND s.expires_at > ?",
+            token_hash,
+            now
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .map(User::try_from)
+        .transpose()
+    }
+
+    async fn delete_user_session(&self, token_hash: &str) -> Result<()> {
+        sqlx::query!("DELETE FROM user_sessions WHERE token_hash = ?", token_hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_expired_user_sessions(&self, now: OffsetDateTime) -> Result<u64> {
+        let now = ts(now);
+        let result = sqlx::query!("DELETE FROM user_sessions WHERE expires_at <= ?", now)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+struct MachineDeploymentRow {
+    deployment_id: String,
+    machine_id: String,
+    kind: String,
+    mode: String,
+    rev: Option<String>,
+    commit_id: Option<String>,
+    requested_by: String,
+    status: String,
+    store_path: Option<String>,
+    message: Option<String>,
+    created_at: String,
+    finished_at: Option<String>,
+}
+
+impl TryFrom<MachineDeploymentRow> for MachineDeploymentRecord {
+    type Error = Error;
+
+    fn try_from(row: MachineDeploymentRow) -> Result<Self> {
+        Ok(Self {
+            deployment_id: parse_id(&row.deployment_id)?,
+            machine_id: parse_id(&row.machine_id)?,
+            kind: parse_enum(&row.kind, DeploymentKind::parse)?,
+            mode: parse_enum(&row.mode, ActivationMode::parse)?,
+            rev: row.rev,
+            commit_id: row.commit_id,
+            requested_by: row.requested_by,
+            status: parse_enum(&row.status, MachineDeploymentStatus::parse)?,
+            store_path: row.store_path,
+            message: row.message,
+            created_at: parse_ts(&row.created_at)?,
+            finished_at: parse_opt_ts(row.finished_at)?,
+        })
+    }
+}
+
+struct UserRow {
+    id: String,
+    organization_id: String,
+    username: String,
+    password_hash: String,
+    created_at: String,
+    password_changed_at: String,
+}
+
+impl TryFrom<UserRow> for User {
+    type Error = Error;
+
+    fn try_from(row: UserRow) -> Result<Self> {
+        Ok(Self {
+            id: parse_id(&row.id)?,
+            organization_id: parse_id(&row.organization_id)?,
+            username: row.username,
+            password_hash: row.password_hash,
+            created_at: parse_ts(&row.created_at)?,
+            password_changed_at: parse_ts(&row.password_changed_at)?,
+        })
     }
 }
 

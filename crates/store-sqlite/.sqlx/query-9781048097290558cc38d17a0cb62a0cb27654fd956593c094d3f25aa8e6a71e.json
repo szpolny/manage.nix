@@ -1,0 +1,86 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT dm.deployment_id, dm.machine_id, d.kind, d.mode, d.rev, d.commit_id,\n                      d.requested_by, dm.status, dm.store_path, dm.message, d.created_at,\n                      dm.finished_at\n               FROM deployment_machines AS dm JOIN deployments AS d ON d.id = dm.deployment_id\n               WHERE dm.machine_id = ?\n               ORDER BY d.created_at DESC, d.rowid DESC LIMIT ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "deployment_id",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "machine_id",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "kind",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "mode",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "rev",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "commit_id",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "requested_by",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "status",
+        "ordinal": 7,
+        "type_info": "Text"
+      },
+      {
+        "name": "store_path",
+        "ordinal": 8,
+        "type_info": "Text"
+      },
+      {
+        "name": "message",
+        "ordinal": 9,
+        "type_info": "Text"
+      },
+      {
+        "name": "created_at",
+        "ordinal": 10,
+        "type_info": "Text"
+      },
+      {
+        "name": "finished_at",
+        "ordinal": 11,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "9781048097290558cc38d17a0cb62a0cb27654fd956593c094d3f25aa8e6a71e"
+}

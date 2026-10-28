@@ -3,11 +3,15 @@
 mod agent;
 mod api;
 mod app;
+mod auth;
 mod build;
+mod closure;
 mod deploy;
 #[cfg(test)]
 mod e2e_tests;
+mod events;
 mod secret;
+mod web;
 
 use std::fs::File;
 use std::io::Write;
@@ -42,6 +46,14 @@ enum Command {
     },
     /// Run the control plane: the HTTP API and the agent endpoint.
     Serve(Box<ServeArgs>),
+    /// Set a user's password, creating the user if needed. Reads the
+    /// password from the first line of standard input and logs the user out
+    /// everywhere.
+    SetPassword {
+        #[command(flatten)]
+        database: DatabaseArgs,
+        username: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -128,6 +140,25 @@ struct ServeArgs {
     /// How long fetching and building a deployment may take.
     #[arg(long, value_parser = humantime::parse_duration, default_value = "1h")]
     build_timeout: Duration,
+
+    /// The built web UI to serve at `/`.
+    #[arg(long, env = "MNIX_WEB_DIR")]
+    web_dir: Option<PathBuf>,
+
+    /// How long a web UI login lasts.
+    #[arg(long, value_parser = humantime::parse_duration, default_value = "7d")]
+    session_lifetime: Duration,
+
+    /// Let browsers send the session cookie over plain HTTP. Only for
+    /// testing: in production the server sits behind an HTTPS proxy.
+    #[arg(long)]
+    insecure_cookies: bool,
+
+    /// The password of the `admin` user created on first start (when there
+    /// are no users). Without it, the server generates one into
+    /// `<state dir>/initial-admin-password`.
+    #[arg(long, env = "MNIX_INITIAL_ADMIN_PASSWORD_FILE")]
+    initial_admin_password_file: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -150,6 +181,24 @@ async fn main() -> anyhow::Result<()> {
             println!("migrated {:?} database", store.backend());
         }
         Some(Command::Serve(args)) => serve(*args).await?,
+        Some(Command::SetPassword { database, username }) => {
+            let mut password = String::new();
+            std::io::stdin()
+                .read_line(&mut password)
+                .context("reading the password from standard input")?;
+            let password = password.trim_end_matches(['\n', '\r']);
+            let store = mnix_store::connect(&database.database_url).await?;
+            store.migrate().await?;
+            let organization = store
+                .ensure_organization(DEFAULT_ORGANIZATION, OffsetDateTime::now_utc())
+                .await?;
+            let created = auth::set_password(&*store, organization.id, &username, password).await?;
+            if created {
+                println!("created the user {username}");
+            } else {
+                println!("changed the password of {username}");
+            }
+        }
     }
     Ok(())
 }
@@ -204,6 +253,20 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let organization = store
         .ensure_organization(DEFAULT_ORGANIZATION, OffsetDateTime::now_utc())
         .await?;
+    auth::ensure_initial_user(
+        &*store,
+        organization.id,
+        args.initial_admin_password_file.as_deref(),
+        &args.state_dir.join("initial-admin-password"),
+    )
+    .await?;
+    if let Some(dir) = &args.web_dir {
+        anyhow::ensure!(
+            dir.join("index.html").is_file(),
+            "--web-dir {} has no index.html",
+            dir.display()
+        );
+    }
 
     let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
     let state = Arc::new(app::AppState {
@@ -217,6 +280,8 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             confirm_timeout: args.confirm_timeout,
             activation_timeout: args.activation_timeout,
             build_timeout: args.build_timeout,
+            session_lifetime: args.session_lifetime,
+            secure_cookies: !args.insecure_cookies,
         },
         shutdown,
         builder: build::Builder {
@@ -226,6 +291,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         },
         queue: tokio::sync::Notify::new(),
         activations: tokio::sync::watch::channel(0).0,
+        web_dir: args.web_dir.clone(),
     });
     if backend == Backend::Sqlite {
         deploy::fail_interrupted_builds(&state).await?;
@@ -233,6 +299,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     tokio::spawn(agent::reap_stale_sessions(state.clone()));
     tokio::spawn(deploy::run_worker(state.clone()));
     tokio::spawn(deploy::run_sweeper(state.clone()));
+    tokio::spawn(auth::delete_expired_sessions(state.clone()));
 
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await

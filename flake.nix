@@ -70,7 +70,41 @@
             mnix-agent = buildBin "mnix-agent" "mnix-agent";
             mnix-server = buildBin "mnix-server" "mnix-server";
             mnix = buildBin "mnix-cli" "mnix";
+            mnix-web = webFor pkgs;
           };
+        };
+
+      # The web UI: static files that `mnix-server --web-dir` serves.
+      webFor =
+        pkgs:
+        pkgs.buildNpmPackage {
+          pname = "mnix-web";
+          version = (lib.importJSON ./web/package.json).version;
+          src = lib.cleanSourceWith {
+            src = ./web;
+            name = "mnix-web-source";
+            filter =
+              path: _type:
+              !builtins.elem (baseNameOf path) [
+                "node_modules"
+                ".svelte-kit"
+                "build"
+              ];
+          };
+          # Every package comes from the lock file; no hash to update.
+          npmDeps = pkgs.importNpmLock { npmRoot = ./web; };
+          inherit (pkgs.importNpmLock) npmConfigHook;
+          doCheck = true;
+          checkPhase = ''
+            runHook preCheck
+            npm run check
+            runHook postCheck
+          '';
+          installPhase = ''
+            runHook preInstall
+            cp -r build $out
+            runHook postInstall
+          '';
         };
     in
     {
@@ -154,6 +188,11 @@
           vm-deploy-postgres = import ./nix/tests/deploy.nix {
             inherit self pkgs;
             backend = "postgres";
+          };
+          vm-web = import ./nix/tests/deploy.nix {
+            inherit self pkgs;
+            backend = "sqlite";
+            scenario = "web";
           };
         }
       );

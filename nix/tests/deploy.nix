@@ -20,13 +20,22 @@
 # machines) is real.
 #
 # Runs once per database backend: `backend` is "sqlite" or "postgres".
+#
+# M4: with `scenario = "web"`, a browser on a `client` node does the same
+# through the web UI instead (nix/tests/web/e2e.py, Playwright): it logs in,
+# enrolls machine1, configures it, deploys revision a and follows the live
+# log, and then sees the revision and the generation diff on the machine's
+# page.
 {
   self,
   pkgs,
   backend,
+  scenario ? "cli",
 }:
 let
   inherit (pkgs) lib;
+  web = scenario == "web";
+  adminPassword = pkgs.writeText "mnix-admin-password" "correct horse battery";
 
   testKey = {
     public = ./keys/mnix-test-1.public;
@@ -62,6 +71,9 @@ let
       # Test nodes leave switch-to-configuration out unless asked; real
       # machines have it.
       system.switch.enable = true;
+      # Test VMs boot their kernel directly. On x86_64 the default GRUB
+      # would try (and fail) to install itself on every switch.
+      boot.loader.grub.enable = false;
       documentation.enable = false;
       environment.systemPackages = [ pkgs.curl ];
       virtualisation.memorySize = 1536;
@@ -106,6 +118,7 @@ let
             self = manage-nix;
             pkgs = nixpkgs.legacyPackages.${hostSystem};
             backend = "${backend}";
+            scenario = "${scenario}";
           };
         in
         {
@@ -120,10 +133,22 @@ let
     nodes: name: revision:
     (nodes.${name}.system.build.mnixWithRevision revisions.${revision}).config.system.build.toplevel;
   deployed = [
-    [ "machine1" "a" ]
-    [ "machine1" "b" ]
-    [ "machine2" "a" ]
-    [ "machine2" "c" ]
+    [
+      "machine1"
+      "a"
+    ]
+    [
+      "machine1"
+      "b"
+    ]
+    [
+      "machine2"
+      "a"
+    ]
+    [
+      "machine2"
+      "c"
+    ]
   ];
 
   atticEnvironment = pkgs.runCommand "atticd-env" { } ''
@@ -131,7 +156,7 @@ let
   '';
 in
 pkgs.testers.runNixOSTest {
-  name = "manage-nix-deploy-${backend}";
+  name = "manage-nix-${if web then "web" else "deploy"}-${backend}";
 
   nodes = {
     server =
@@ -146,6 +171,9 @@ pkgs.testers.runNixOSTest {
           heartbeatTimeout = 6;
           signingKeyFile = "/etc/mnix-test/signing.secret";
           confirmTimeout = 20;
+          # The browser reaches the server over plain HTTP.
+          secureCookies = !web;
+          initialAdminPasswordFile = "${adminPassword}";
           attic = {
             endpoint = "http://server:8081/";
             cache = "mnix";
@@ -201,17 +229,161 @@ pkgs.testers.runNixOSTest {
           additionalPaths = [
             repositoryFlake
           ]
-          ++ map (d: systemOf nodes (lib.elemAt d 0) (lib.elemAt d 1)) deployed;
+          ++ map (d: systemOf nodes (lib.elemAt d 0) (lib.elemAt d 1)) deployed
+          # The system machine1 boots, to diff against what it is deployed.
+          ++ lib.optional web nodes.machine1.system.build.toplevel;
         };
       };
     machine1 = machine;
     machine2 = machine;
+  }
+  // lib.optionalAttrs web {
+    client =
+      { pkgs, ... }:
+      {
+        environment.systemPackages = [
+          (pkgs.python3.withPackages (ps: [ ps.playwright ]))
+        ];
+        environment.variables = {
+          PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
+          PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS = "true";
+          MNIX_PASSWORD_FILE = "${adminPassword}";
+        };
+        environment.etc."mnix-test/e2e.py".source = ./web/e2e.py;
+        documentation.enable = false;
+        virtualisation = {
+          memorySize = 2048;
+          cores = 2;
+        };
+      };
   };
 
   testScript =
     { nodes, ... }:
     let
       system = systemOf nodes;
+
+      # The web UI, in a browser on `client`. Commands print their results
+      # last.
+      webScript = ''
+        from datetime import timedelta
+
+        def browser(args):
+            try:
+                out = client.succeed(
+                    f"python3 /etc/mnix-test/e2e.py {args}", timeout=timedelta(minutes=25)
+                )
+            except Exception:
+                client.execute("ls /tmp/e2e")
+                client.copy_from_machine("/tmp/e2e", "screenshots")
+                raise
+            print(out)
+            lines = out.strip().splitlines()
+            return lines[-1] if lines else ""
+
+        with subtest("a browser logs in, enrolls machine1, and configures it"):
+            client.wait_for_unit("multi-user.target")
+            token = browser("enroll machine1")
+            assert token.startswith("mnix_enroll_"), token
+            machine1.wait_for_unit("multi-user.target")
+            machine1.succeed(f"echo {token} > ${tokenFile}")
+            machine1.systemctl("restart mnix-agent.service")
+            browser("configure machine1 infra")
+
+        with subtest("the browser deploys revision a and follows it to the end"):
+            deployment = browser("deploy machine1 a")
+            d = json.loads(mnix(f"deploys show {deployment} --json"))
+            assert d["status"] == "succeeded", d
+            assert d["requested_by"] == "admin", d
+            assert running(machine1) == "${system "machine1" "a"}"
+            machine1.succeed("grep -qx a /etc/mnix-test/revision")
+
+        with subtest("the machine page shows the revision and the generation diff"):
+            browser("verify machine1 a")
+      '';
+
+      cliScript = ''
+        with subtest("machines enroll and are configured"):
+            for node in [machine1, machine2]:
+                token = mnix(f"machine add {node.name}").strip()
+                node.wait_for_unit("multi-user.target")
+                node.succeed(f"echo {token} > ${tokenFile}")
+                node.systemctl("restart mnix-agent.service")
+                mnix(f"machine configure {node.name} --repo infra")
+                mnix(f"machine tag {node.name} fleet")
+            for node in [machine1, machine2]:
+                wait_for_status(node.name, "online")
+            booted = {node.name: running(node) for node in [machine1, machine2]}
+            # Nothing of revision a is on the machines yet.
+            machine1.fail("nix-store --check-validity ${system "machine1" "a"}")
+
+        with subtest("revision a is built, fetched from Attic, and activated"):
+            d = deploy("tag:fleet --rev a --as tester", expect_success=True)
+            assert d["status"] == "succeeded", d
+            assert d["rev"] == "a" and len(d["commit"]) == 40, d
+            assert d["requested_by"] == "tester", d
+            expected = {"machine1": "${system "machine1" "a"}", "machine2": "${system "machine2" "a"}"}
+            for m in d["machines"]:
+                assert m["status"] == "succeeded", m
+                assert m["store_path"] == expected[m["machine"]], m
+            for node in [machine1, machine2]:
+                assert running(node) == expected[node.name]
+                assert profile(node) == expected[node.name]
+                node.succeed("grep -qx a /etc/mnix-test/revision")
+                node.succeed("curl --fail --silent http://127.0.0.1:8000/ | grep -qx a")
+                server.wait_until_succeeds(
+                    "mnix --token-file /var/lib/manage-nix/admin-token machines --json"
+                    f" | jq -e '.[] | select(.name == \"{node.name}\") | .current_system == \"{expected[node.name]}\"'",
+                    timeout=60,
+                )
+            logs = mnix(f"deploys logs {d['id']}")
+            assert "pushing to the Attic cache mnix" in logs, logs
+            assert "signed with mnix-test-1" in logs, logs
+            assert "the server confirmed the new system" in logs, logs
+
+        with subtest("revision b fails its health checks and machine1 rolls back to a"):
+            d = deploy("machine1 --rev b", expect_success=False)
+            m = d["machines"][0]
+            assert d["status"] == "failed" and m["status"] == "rolled_back", d
+            assert m["report"]["failed_checks"], m
+            assert "health checks did not pass" in m["message"], m
+            assert running(machine1) == expected["machine1"]
+            assert profile(machine1) == expected["machine1"]
+            machine1.succeed("grep -qx a /etc/mnix-test/revision")
+            machine1.wait_until_succeeds("curl --fail --silent http://127.0.0.1:8000/")
+
+        with subtest("revision c cuts machine2 off and it rolls back to a by itself"):
+            d = deploy("machine2 --rev c", expect_success=False)
+            m = d["machines"][0]
+            assert d["status"] == "failed" and m["status"] == "rolled_back", d
+            assert "did not reach the server" in m["message"], m
+            assert not m["report"]["failed_checks"], m
+            assert running(machine2) == expected["machine2"]
+            assert profile(machine2) == expected["machine2"]
+            machine2.succeed("grep -qx a /etc/mnix-test/revision")
+            wait_for_status("machine2", "online")
+            machine2.succeed("journalctl -u mnix-agent | grep 'reconnecting to show'")
+
+        with subtest("deployments are listed with their results"):
+            listed = mnix("deploys")
+            assert listed.count("failed") == 2 and "succeeded" in listed, listed
+            shown = mnix(f"deploys show {d['id'][:8]}")
+            assert "rolled_back" in shown and "machine2" in shown, shown
+
+        with subtest("mnix rollback returns machine1 to the system it booted"):
+            status, out = server.execute(
+                "timeout 600 mnix --token-file /var/lib/manage-nix/admin-token rollback machine1"
+            )
+            print(out)
+            assert status == 0, out
+            d = json.loads(mnix("deploys --limit 1 --json"))[0]
+            assert d["kind"] == "rollback" and d["status"] == "succeeded", d
+            assert d["machines"][0]["store_path"] == booted["machine1"], d
+            assert running(machine1) == booted["machine1"]
+            machine1.fail("test -e /etc/mnix-test/revision")
+            wait_for_status("machine1", "online")
+            wait_for_status("machine2", "online")
+      '';
     in
     ''
       import json
@@ -302,86 +474,6 @@ pkgs.testers.runNixOSTest {
           server.succeed("chown -R manage-nix:manage-nix /srv/git/infra")
           mnix("repo add infra /srv/git/infra")
           assert "infra" in mnix("repos")
-
-      with subtest("machines enroll and are configured"):
-          for node in [machine1, machine2]:
-              token = mnix(f"machine add {node.name}").strip()
-              node.wait_for_unit("multi-user.target")
-              node.succeed(f"echo {token} > ${tokenFile}")
-              node.systemctl("restart mnix-agent.service")
-              mnix(f"machine configure {node.name} --repo infra")
-              mnix(f"machine tag {node.name} fleet")
-          for node in [machine1, machine2]:
-              wait_for_status(node.name, "online")
-          booted = {node.name: running(node) for node in [machine1, machine2]}
-          # Nothing of revision a is on the machines yet.
-          machine1.fail("nix-store --check-validity ${system "machine1" "a"}")
-
-      with subtest("revision a is built, fetched from Attic, and activated"):
-          d = deploy("tag:fleet --rev a --as tester", expect_success=True)
-          assert d["status"] == "succeeded", d
-          assert d["rev"] == "a" and len(d["commit"]) == 40, d
-          assert d["requested_by"] == "tester", d
-          expected = {"machine1": "${system "machine1" "a"}", "machine2": "${system "machine2" "a"}"}
-          for m in d["machines"]:
-              assert m["status"] == "succeeded", m
-              assert m["store_path"] == expected[m["machine"]], m
-          for node in [machine1, machine2]:
-              assert running(node) == expected[node.name]
-              assert profile(node) == expected[node.name]
-              node.succeed("grep -qx a /etc/mnix-test/revision")
-              node.succeed("curl --fail --silent http://127.0.0.1:8000/ | grep -qx a")
-              server.wait_until_succeeds(
-                  "mnix --token-file /var/lib/manage-nix/admin-token machines --json"
-                  f" | jq -e '.[] | select(.name == \"{node.name}\") | .current_system == \"{expected[node.name]}\"'",
-                  timeout=60,
-              )
-          logs = mnix(f"deploys logs {d['id']}")
-          assert "pushing to the Attic cache mnix" in logs, logs
-          assert "signed with mnix-test-1" in logs, logs
-          assert "the server confirmed the new system" in logs, logs
-
-      with subtest("revision b fails its health checks and machine1 rolls back to a"):
-          d = deploy("machine1 --rev b", expect_success=False)
-          m = d["machines"][0]
-          assert d["status"] == "failed" and m["status"] == "rolled_back", d
-          assert m["report"]["failed_checks"], m
-          assert "health checks did not pass" in m["message"], m
-          assert running(machine1) == expected["machine1"]
-          assert profile(machine1) == expected["machine1"]
-          machine1.succeed("grep -qx a /etc/mnix-test/revision")
-          machine1.wait_until_succeeds("curl --fail --silent http://127.0.0.1:8000/")
-
-      with subtest("revision c cuts machine2 off and it rolls back to a by itself"):
-          d = deploy("machine2 --rev c", expect_success=False)
-          m = d["machines"][0]
-          assert d["status"] == "failed" and m["status"] == "rolled_back", d
-          assert "did not reach the server" in m["message"], m
-          assert not m["report"]["failed_checks"], m
-          assert running(machine2) == expected["machine2"]
-          assert profile(machine2) == expected["machine2"]
-          machine2.succeed("grep -qx a /etc/mnix-test/revision")
-          wait_for_status("machine2", "online")
-          machine2.succeed("journalctl -u mnix-agent | grep 'reconnecting to show'")
-
-      with subtest("deployments are listed with their results"):
-          listed = mnix("deploys")
-          assert listed.count("failed") == 2 and "succeeded" in listed, listed
-          shown = mnix(f"deploys show {d['id'][:8]}")
-          assert "rolled_back" in shown and "machine2" in shown, shown
-
-      with subtest("mnix rollback returns machine1 to the system it booted"):
-          status, out = server.execute(
-              "timeout 600 mnix --token-file /var/lib/manage-nix/admin-token rollback machine1"
-          )
-          print(out)
-          assert status == 0, out
-          d = json.loads(mnix("deploys --limit 1 --json"))[0]
-          assert d["kind"] == "rollback" and d["status"] == "succeeded", d
-          assert d["machines"][0]["store_path"] == booted["machine1"], d
-          assert running(machine1) == booted["machine1"]
-          machine1.fail("test -e /etc/mnix-test/revision")
-          wait_for_status("machine1", "online")
-          wait_for_status("machine2", "online")
-    '';
+    ''
+    + (if web then webScript else cliScript);
 }

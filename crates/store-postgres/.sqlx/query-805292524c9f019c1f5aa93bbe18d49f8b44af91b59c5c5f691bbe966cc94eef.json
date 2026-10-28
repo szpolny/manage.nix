@@ -1,0 +1,88 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT dm.deployment_id, dm.machine_id, d.kind, d.mode, d.rev, d.commit_id,\n                    d.requested_by, dm.status, dm.store_path, dm.message, d.created_at,\n                    dm.finished_at\n             FROM deployment_machines AS dm JOIN deployments AS d ON d.id = dm.deployment_id\n             WHERE d.organization_id = $1 AND d.id = (\n                 SELECT d2.id\n                 FROM deployment_machines AS dm2\n                 JOIN deployments AS d2 ON d2.id = dm2.deployment_id\n                 WHERE dm2.machine_id = dm.machine_id\n                 ORDER BY d2.created_at DESC, d2.id DESC LIMIT 1\n             )",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "deployment_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "machine_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "mode",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "rev",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "commit_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "requested_by",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "store_path",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "message",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "finished_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "805292524c9f019c1f5aa93bbe18d49f8b44af91b59c5c5f691bbe966cc94eef"
+}

@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT dm.store_path AS \"store_path!\", d.id, d.repository_id, d.rev,\n                      d.commit_id AS \"commit_id!\", d.created_at\n               FROM deployment_machines AS dm JOIN deployments AS d ON d.id = dm.deployment_id\n               WHERE d.organization_id = ? AND d.kind = 'deploy' AND d.commit_id IS NOT NULL\n                 AND dm.store_path IN (SELECT value FROM json_each(?))\n               ORDER BY d.created_at, d.rowid",
+  "describe": {
+    "columns": [
+      {
+        "name": "store_path!",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "id",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "repository_id",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "rev",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "commit_id!",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "created_at",
+        "ordinal": 5,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      true,
+      false,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "30ddbda30501e6146b786b27825c86e37989ba9a1de6606eec49ac3e99299df7"
+}

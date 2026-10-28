@@ -1,5 +1,6 @@
 //! The HTTP application: shared state, routes, and error responses.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,7 +15,7 @@ use tokio::sync::{watch, Notify};
 use uuid::Uuid;
 
 use crate::build::Builder;
-use crate::{agent, api};
+use crate::{agent, api, auth, web};
 
 /// Settings that shape the API's behaviour.
 #[derive(Debug, Clone)]
@@ -29,6 +30,10 @@ pub struct Settings {
     pub activation_timeout: Duration,
     /// How long fetching and building one deployment may take.
     pub build_timeout: Duration,
+    /// How long a login lasts.
+    pub session_lifetime: Duration,
+    /// Mark the session cookie `Secure` (HTTPS only).
+    pub secure_cookies: bool,
 }
 
 pub struct AppState {
@@ -47,6 +52,8 @@ pub struct AppState {
     /// Bumped when activations are released, so agent sessions look for
     /// them. (Sessions on other servers notice at their next heartbeat.)
     pub activations: watch::Sender<u64>,
+    /// The built web UI, served at `/` if set.
+    pub web_dir: Option<PathBuf>,
 }
 
 pub type State = Arc<AppState>;
@@ -74,12 +81,17 @@ impl AppState {
 }
 
 pub fn router(state: State) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .merge(api::routes(state.clone()))
+        .route("/api/session", post(auth::login))
         .route(mnix_protocol::ENROLL_PATH, post(agent::enroll))
-        .route(mnix_protocol::AGENT_WS_PATH, get(agent::connect))
-        .with_state(state)
+        .route(mnix_protocol::AGENT_WS_PATH, get(agent::connect));
+    let router = match &state.web_dir {
+        Some(dir) => router.fallback_service(web::service(dir)),
+        None => router.fallback(|| async { ApiError::not_found("page") }),
+    };
+    router.with_state(state)
 }
 
 /// API timestamps: RFC 3339 in UTC, to the second (`2026-10-22T08:00:00Z`).

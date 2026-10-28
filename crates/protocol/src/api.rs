@@ -62,6 +62,89 @@ pub struct Machine {
     pub configuration: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// The revision the running system was built from, if a deployment
+    /// built it.
+    #[serde(default)]
+    pub revision: Option<Revision>,
+    /// The machine's most recent deployment.
+    #[serde(default)]
+    pub last_deployment: Option<MachineDeployment>,
+}
+
+/// Where a system came from: the newest deployment that built it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Revision {
+    pub deployment_id: String,
+    pub repository: Option<String>,
+    /// The revision as requested (`main`, `v1.2`, a commit).
+    pub rev: Option<String>,
+    pub commit: String,
+}
+
+/// `GET /api/machines/:machine/deployments` returns these, newest first:
+/// the machine's part in each deployment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineDeployment {
+    pub deployment_id: String,
+    pub kind: DeploymentKind,
+    pub mode: ActivationMode,
+    pub rev: Option<String>,
+    pub commit: Option<String>,
+    pub requested_by: String,
+    /// The machine's status in the deployment.
+    pub status: MachineDeploymentStatus,
+    pub store_path: Option<String>,
+    pub message: Option<String>,
+    pub created_at: String,
+    pub finished_at: Option<String>,
+}
+
+/// `GET /api/machines/:machine/generations` returns the machine's system
+/// profile generations (from its facts), newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationView {
+    pub number: u64,
+    pub store_path: String,
+    pub created_at: String,
+    /// The generation the profile points at (the boot default).
+    pub current: bool,
+    /// Whether this is the running system.
+    pub running: bool,
+    /// Whether the machine booted this system.
+    pub booted: bool,
+    pub revision: Option<Revision>,
+}
+
+/// `GET /api/machines/:machine/diff?from=<generation>&to=<generation>`:
+/// `nix store diff-closures` between two of the machine's generations,
+/// computed on the server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClosureDiff {
+    pub from: String,
+    pub to: String,
+    /// One line per changed package: `name: 1.0 → 1.1, +12.3 KiB`.
+    pub diff: String,
+}
+
+/// `POST /api/session`: log in. The response sets the session cookie.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Login {
+    pub username: String,
+    pub password: String,
+}
+
+/// `GET /api/session`: who is logged in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Session {
+    pub username: String,
+}
+
+/// `PUT /api/session/password`: change the logged-in user's password.
+/// Ends the user's other sessions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangePassword {
+    pub current_password: String,
+    pub new_password: String,
 }
 
 /// `PUT /api/machines/:machine/configuration`: where the machine's system

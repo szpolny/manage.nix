@@ -1,27 +1,29 @@
-//! The admin HTTP API used by `mnix` (and later the web UI). Every route
-//! requires `Authorization: Bearer <admin token>`.
+//! The HTTP API used by `mnix` and the web UI. Every route requires the
+//! admin token or a logged-in user's session cookie (see [`crate::auth`]).
 
 use std::collections::HashMap;
 use std::time::Duration;
 
-use axum::extract::{Path, Query, Request, State};
-use axum::http::{header, StatusCode};
-use axum::middleware::{self, Next};
-use axum::response::Response;
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::middleware;
 use axum::routing::{get, post, put};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
+use mnix_nix::StorePath;
 use mnix_protocol::api::{
-    CreateDeployment, CreateEnrollmentToken, CreateMachine, CreateRepository, CreateRollback,
-    CreatedMachine, Deployment, DeploymentMachine, EnrollmentToken, LogEntry, Machine,
-    MachineStatus, Repository, SetConfiguration, SetTags, SigningKey,
+    ClosureDiff, CreateDeployment, CreateEnrollmentToken, CreateMachine, CreateRepository,
+    CreateRollback, CreatedMachine, Deployment, DeploymentMachine, EnrollmentToken, GenerationView,
+    LogEntry, Machine, MachineDeployment, MachineStatus, Repository, Revision, SetConfiguration,
+    SetTags, SigningKey,
 };
-use mnix_store::NewEnrollmentToken;
+use mnix_store::{MachineDeploymentRecord, NewEnrollmentToken, SystemRevision};
 use serde::Deserialize;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::app::{rfc3339, ApiError, State as AppState};
-use crate::{deploy, secret};
+use crate::auth::{self, Principal};
+use crate::{closure, deploy, events, secret};
 
 /// The longest an enrollment token may be valid.
 const MAX_TOKEN_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -44,6 +46,12 @@ pub fn routes(state: AppState) -> axum::Router<AppState> {
         .route("/api/machines/{machine}/tags", put(set_tags))
         .route("/api/machines/{machine}/rollback", post(create_rollback))
         .route(
+            "/api/machines/{machine}/deployments",
+            get(list_machine_deployments),
+        )
+        .route("/api/machines/{machine}/generations", get(list_generations))
+        .route("/api/machines/{machine}/diff", get(diff_generations))
+        .route(
             "/api/repositories",
             get(list_repositories).post(create_repository),
         )
@@ -53,26 +61,14 @@ pub fn routes(state: AppState) -> axum::Router<AppState> {
         )
         .route("/api/deployments/{deployment}", get(get_deployment))
         .route("/api/deployments/{deployment}/logs", get(deployment_logs))
+        .route(
+            "/api/deployments/{deployment}/events",
+            get(events::deployment_events),
+        )
         .route("/api/signing-key", get(signing_key))
-        .route_layer(middleware::from_fn_with_state(state, require_admin))
-}
-
-async fn require_admin(
-    State(state): State<AppState>,
-    request: Request,
-    next: Next,
-) -> Result<Response, ApiError> {
-    let token = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(secret::bearer);
-    // Comparing hashes keeps the comparison's timing independent of the
-    // token's contents.
-    match token {
-        Some(token) if secret::hash(token) == state.admin_token_hash => Ok(next.run(request).await),
-        _ => Err(ApiError::unauthorized("missing or invalid admin token")),
-    }
+        .route("/api/session", get(auth::session).delete(auth::logout))
+        .route("/api/session/password", put(auth::change_password))
+        .route_layer(middleware::from_fn_with_state(state, auth::authenticate))
 }
 
 /// Repository names by ID, for views.
@@ -86,16 +82,70 @@ async fn repository_names(state: &AppState) -> Result<HashMap<Uuid, String>, Api
         .collect())
 }
 
-async fn list_machines(State(state): State<AppState>) -> Result<Json<Vec<Machine>>, ApiError> {
+/// The revisions `store_paths` were built from, by path.
+async fn revisions(
+    state: &AppState,
+    store_paths: Vec<String>,
+    repositories: &HashMap<Uuid, String>,
+) -> Result<HashMap<String, Revision>, ApiError> {
+    if store_paths.is_empty() {
+        return Ok(HashMap::new());
+    }
+    Ok(state
+        .store
+        .system_revisions(state.organization.id, &store_paths)
+        .await?
+        .into_iter()
+        .map(|r| (r.store_path.clone(), revision_view(r, repositories)))
+        .collect())
+}
+
+/// API views of `machines`, with the revisions of their running systems
+/// and their latest deployments.
+async fn machine_views(
+    state: &AppState,
+    machines: &[mnix_store::Machine],
+) -> Result<Vec<Machine>, ApiError> {
     let now = OffsetDateTime::now_utc();
-    let machines = state.store.machines(state.organization.id).await?;
-    let repositories = repository_names(&state).await?;
-    Ok(Json(
-        machines
-            .iter()
-            .map(|m| machine_view(m, &repositories, now, state.settings.heartbeat_timeout))
+    let repositories = repository_names(state).await?;
+    let current: Vec<String> = machines
+        .iter()
+        .filter_map(|m| m.facts.as_ref().map(|f| f.current_system.clone()))
+        .collect();
+    let revisions = revisions(state, current, &repositories).await?;
+    let mut latest: HashMap<Uuid, MachineDeploymentRecord> = match machines {
+        [machine] => state
+            .store
+            .machine_deployments(machine.id, 1)
+            .await?
+            .into_iter()
+            .map(|r| (r.machine_id, r))
             .collect(),
-    ))
+        _ => state
+            .store
+            .latest_machine_deployments(state.organization.id)
+            .await?
+            .into_iter()
+            .map(|r| (r.machine_id, r))
+            .collect(),
+    };
+    Ok(machines
+        .iter()
+        .map(|m| {
+            let mut view = machine_view(m, &repositories, now, state.settings.heartbeat_timeout);
+            view.revision = m
+                .facts
+                .as_ref()
+                .and_then(|f| revisions.get(&f.current_system).cloned());
+            view.last_deployment = latest.remove(&m.id).map(machine_deployment_view);
+            view
+        })
+        .collect())
+}
+
+async fn list_machines(State(state): State<AppState>) -> Result<Json<Vec<Machine>>, ApiError> {
+    let machines = state.store.machines(state.organization.id).await?;
+    Ok(Json(machine_views(&state, &machines).await?))
 }
 
 async fn get_machine(
@@ -103,12 +153,88 @@ async fn get_machine(
     Path(machine): Path<String>,
 ) -> Result<Json<Machine>, ApiError> {
     let machine = find_machine(&state, &machine).await?;
-    Ok(Json(machine_view(
-        &machine,
-        &repository_names(&state).await?,
-        OffsetDateTime::now_utc(),
-        state.settings.heartbeat_timeout,
-    )))
+    let mut views = machine_views(&state, std::slice::from_ref(&machine)).await?;
+    Ok(Json(views.remove(0)))
+}
+
+async fn list_machine_deployments(
+    State(state): State<AppState>,
+    Path(machine): Path<String>,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<Vec<MachineDeployment>>, ApiError> {
+    let machine = find_machine(&state, &machine).await?;
+    let limit = query.limit.unwrap_or(20).clamp(1, MAX_DEPLOYMENTS);
+    let records = state.store.machine_deployments(machine.id, limit).await?;
+    Ok(Json(
+        records.into_iter().map(machine_deployment_view).collect(),
+    ))
+}
+
+async fn list_generations(
+    State(state): State<AppState>,
+    Path(machine): Path<String>,
+) -> Result<Json<Vec<GenerationView>>, ApiError> {
+    let machine = find_machine(&state, &machine).await?;
+    let Some(facts) = machine.facts else {
+        return Ok(Json(Vec::new()));
+    };
+    let repositories = repository_names(&state).await?;
+    let paths = facts
+        .generations
+        .iter()
+        .map(|g| g.store_path.clone())
+        .collect();
+    let revisions = revisions(&state, paths, &repositories).await?;
+    Ok(Json(
+        facts
+            .generations
+            .iter()
+            .rev()
+            .map(|g| GenerationView {
+                number: g.number,
+                store_path: g.store_path.clone(),
+                created_at: g.created_at.clone(),
+                current: g.current,
+                running: g.store_path == facts.current_system,
+                booted: facts.booted_system.as_deref() == Some(g.store_path.as_str()),
+                revision: revisions.get(&g.store_path).cloned(),
+            })
+            .collect(),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct DiffQuery {
+    from: u64,
+    to: u64,
+}
+
+async fn diff_generations(
+    State(state): State<AppState>,
+    Path(machine): Path<String>,
+    Query(query): Query<DiffQuery>,
+) -> Result<Json<ClosureDiff>, ApiError> {
+    let machine = find_machine(&state, &machine).await?;
+    let generations = machine.facts.map(|f| f.generations).unwrap_or_default();
+    let path = |number: u64| {
+        let generation = generations
+            .iter()
+            .find(|g| g.number == number)
+            .ok_or_else(|| ApiError::not_found(format!("generation {number}")))?;
+        StorePath::parse(&generation.store_path).map_err(|e| {
+            ApiError::bad_request(format!("generation {number} has an invalid path: {e}"))
+        })
+    };
+    let (from, to) = (path(query.from)?, path(query.to)?);
+    let diff = closure::diff(&from, &to).await.map_err(|e| {
+        tracing::warn!("{e}");
+        ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
+    })?;
+    Ok(Json(ClosureDiff {
+        from: from.to_string(),
+        to: to.to_string(),
+        diff,
+    }))
 }
 
 async fn set_configuration(
@@ -168,9 +294,13 @@ async fn set_tags(
 
 async fn create_rollback(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(machine): Path<String>,
-    Json(request): Json<CreateRollback>,
+    Json(mut request): Json<CreateRollback>,
 ) -> Result<(StatusCode, Json<Deployment>), ApiError> {
+    if let Some(username) = principal.username() {
+        request.requested_by = Some(username.to_owned());
+    }
     let machine = find_machine(&state, &machine).await?;
     let id = deploy::create_rollback(&state, &machine, request).await?;
     Ok((
@@ -258,8 +388,13 @@ async fn list_deployments(
 
 async fn create_deployment(
     State(state): State<AppState>,
-    Json(request): Json<CreateDeployment>,
+    Extension(principal): Extension<Principal>,
+    Json(mut request): Json<CreateDeployment>,
 ) -> Result<(StatusCode, Json<Deployment>), ApiError> {
+    // Users are who they logged in as; admin token clients say who they are.
+    if let Some(username) = principal.username() {
+        request.requested_by = Some(username.to_owned());
+    }
     let id = deploy::create(&state, request).await?;
     Ok((
         StatusCode::CREATED,
@@ -267,7 +402,10 @@ async fn create_deployment(
     ))
 }
 
-async fn find_deployment(state: &AppState, key: &str) -> Result<mnix_store::Deployment, ApiError> {
+pub async fn find_deployment(
+    state: &AppState,
+    key: &str,
+) -> Result<mnix_store::Deployment, ApiError> {
     let not_found = || ApiError::not_found(format!("deployment {key:?}"));
     let id = Uuid::parse_str(key).map_err(|_| not_found())?;
     state
@@ -278,7 +416,7 @@ async fn find_deployment(state: &AppState, key: &str) -> Result<mnix_store::Depl
         .ok_or_else(not_found)
 }
 
-async fn deployment_view(state: &AppState, id: Uuid) -> Result<Deployment, ApiError> {
+pub async fn deployment_view(state: &AppState, id: Uuid) -> Result<Deployment, ApiError> {
     let deployment = find_deployment(state, &id.to_string()).await?;
     Ok(deployment_from(
         &deployment,
@@ -317,18 +455,17 @@ async fn deployment_logs(
             query.limit.unwrap_or(500).clamp(1, MAX_LOG_ENTRIES),
         )
         .await?;
-    Ok(Json(
-        entries
-            .into_iter()
-            .map(|e| LogEntry {
-                id: e.id,
-                machine: e.machine_name,
-                source: e.source,
-                text: e.text,
-                created_at: rfc3339(e.created_at),
-            })
-            .collect(),
-    ))
+    Ok(Json(entries.into_iter().map(log_entry_view).collect()))
+}
+
+pub fn log_entry_view(entry: mnix_store::LogEntry) -> LogEntry {
+    LogEntry {
+        id: entry.id,
+        machine: entry.machine_name,
+        source: entry.source,
+        text: entry.text,
+        created_at: rfc3339(entry.created_at),
+    }
 }
 
 async fn signing_key(State(state): State<AppState>) -> Json<SigningKey> {
@@ -481,6 +618,33 @@ pub fn status(
     }
 }
 
+fn revision_view(revision: SystemRevision, repositories: &HashMap<Uuid, String>) -> Revision {
+    Revision {
+        deployment_id: revision.deployment_id.to_string(),
+        repository: revision
+            .repository_id
+            .and_then(|id| repositories.get(&id).cloned()),
+        rev: revision.rev,
+        commit: revision.commit_id,
+    }
+}
+
+fn machine_deployment_view(record: MachineDeploymentRecord) -> MachineDeployment {
+    MachineDeployment {
+        deployment_id: record.deployment_id.to_string(),
+        kind: record.kind,
+        mode: record.mode,
+        rev: record.rev,
+        commit: record.commit_id,
+        requested_by: record.requested_by,
+        status: record.status,
+        store_path: record.store_path,
+        message: record.message,
+        created_at: rfc3339(record.created_at),
+        finished_at: record.finished_at.map(rfc3339),
+    }
+}
+
 fn repository_view(repository: &mnix_store::Repository) -> Repository {
     Repository {
         id: repository.id.to_string(),
@@ -548,6 +712,8 @@ fn machine_view(
             .and_then(|id| repositories.get(&id).cloned()),
         configuration: machine.configuration.clone(),
         tags: machine.tags.clone(),
+        revision: None,
+        last_deployment: None,
     }
 }
 

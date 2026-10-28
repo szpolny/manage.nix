@@ -18,7 +18,7 @@ A dashboard and control plane for fleets of Nix-managed machines.
 | `migrations/{sqlite,postgres}` | sqlx migrations, same numbering in both |
 | `nix/modules` | NixOS modules (`nixosModules.agent`, `nixosModules.server`) |
 | `nix/tests` | NixOS VM tests, one per milestone |
-| `web/` | SvelteKit UI (from M4) |
+| `web/` | The web UI: a SvelteKit single-page app (`packages.mnix-web`) |
 
 ## Control plane
 
@@ -36,6 +36,24 @@ On the machine, set `services.manage-nix.agent.server.url` and
 `enrollmentTokenFile` (a file holding that token). The `mnix-agent` service
 enrolls once, stores its credential in `/var/lib/manage-nix`, and stays
 connected. The protocol's message types live in `crates/protocol`.
+
+## Web UI
+
+The server serves the web UI at `/` (`nixosModules.server` does by default).
+On first start it creates the user `admin` with the password in
+`services.manage-nix.server.initialAdminPasswordFile`, or a generated one in
+`/var/lib/manage-nix/initial-admin-password`; change it on the account page.
+To set a password (or add a user) on the server:
+
+```sh
+echo 'new password' | sudo -u manage-nix MNIX_DATABASE_URL=sqlite:///var/lib/manage-nix/db.sqlite \
+  mnix-server set-password alice
+```
+
+The session cookie is `Secure`, so serve the UI over HTTPS (or set
+`secureCookies = false` for a test setup). Disable response buffering for
+`/api/deployments/*/events` in the proxy: the deploy page follows logs over
+server-sent events.
 
 ## Deploying
 
@@ -76,10 +94,21 @@ cargo test           # unit tests; store tests run against SQLite
 nix flake check -L   # everything CI runs
 ```
 
+The UI lives in `web/` (SvelteKit 3, Svelte 5). `npm run dev` there proxies
+`/api` to a server on `127.0.0.1:8080`; start one with `--insecure-cookies`
+so the browser keeps the session cookie over plain HTTP. `npm run check`
+type-checks it; the flake's `mnix-web` build runs that too. Adding a
+dependency only needs `package-lock.json` updated (`npm install`): Nix reads
+every package from it.
+
 Store tests also run against Postgres when `MNIX_TEST_POSTGRES_URL` points
 at a server where the user may create databases (each test creates its own
 database). The `store-postgres` flake check starts a throwaway server and
 sets this for you.
+
+`checks.*.vm-web` is the browser test: the deployment test's machines plus a
+client VM where Playwright drives Chromium through the UI
+(`nix/tests/web/e2e.py`).
 
 NixOS VM tests (`checks.*.vm-*`) run on Linux with KVM, and natively on
 Apple Silicon macOS: there the test driver runs QEMU with Apple's

@@ -1,0 +1,89 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT dm.deployment_id, dm.machine_id, d.kind, d.mode, d.rev, d.commit_id,\n                    d.requested_by, dm.status, dm.store_path, dm.message, d.created_at,\n                    dm.finished_at\n             FROM deployment_machines AS dm JOIN deployments AS d ON d.id = dm.deployment_id\n             WHERE dm.machine_id = $1\n             ORDER BY d.created_at DESC, d.id DESC LIMIT $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "deployment_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "machine_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "mode",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "rev",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "commit_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "requested_by",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "store_path",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "message",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "finished_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "997c0f5951c05ced7cadcc0d41ef05dba28659f57dc1a0ae7856637dfdf7eae3"
+}

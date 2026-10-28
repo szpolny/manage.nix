@@ -623,6 +623,8 @@ mod tests {
             repository: None,
             configuration: None,
             tags: Vec::new(),
+            revision: None,
+            last_deployment: None,
         };
         let table = machine_table(
             &[

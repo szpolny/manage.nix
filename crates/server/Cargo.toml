@@ -12,9 +12,11 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+argon2.workspace = true
 axum.workspace = true
 base64.workspace = true
 clap.workspace = true
+futures-util.workspace = true
 getrandom.workspace = true
 humantime.workspace = true
 mnix-nix.workspace = true
@@ -23,14 +25,16 @@ mnix-store.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
+tower.workspace = true
+tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-futures-util.workspace = true
 tempfile.workspace = true
 tokio-tungstenite.workspace = true
 ureq.workspace = true

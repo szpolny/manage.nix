@@ -1,8 +1,10 @@
 # NixOS module for mnix-server, the manage.nix control plane.
 #
-# The server speaks plain HTTP on `listenAddress:port`. Put a TLS-terminating
-# reverse proxy (nginx, Caddy) in front of it, with WebSocket upgrades enabled
-# for `/api/agent/ws`; agents only connect over HTTPS in production.
+# The server speaks plain HTTP on `listenAddress:port` and serves the web UI
+# there too. Put a TLS-terminating reverse proxy (nginx, Caddy) in front of
+# it, with WebSocket upgrades enabled for `/api/agent/ws` and response
+# buffering off for `/api/deployments/*/events` (server-sent events); agents
+# and browsers only connect over HTTPS in production.
 #
 # The server builds machines' systems itself, as the `manage-nix` user,
 # through this machine's Nix daemon, signs them with its signing key, and
@@ -42,6 +44,40 @@ in
       default = packages.mnix;
       defaultText = lib.literalExpression "manage-nix.packages.\${system}.mnix";
       description = "The `mnix` command-line client to install, or null for none.";
+    };
+
+    webPackage = mkOption {
+      type = types.nullOr types.package;
+      default = packages.mnix-web;
+      defaultText = lib.literalExpression "manage-nix.packages.\${system}.mnix-web";
+      description = "The web UI to serve at `/`, or null for the API only.";
+    };
+
+    secureCookies = mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        Mark the web UI's session cookie `Secure`, so browsers send it only
+        over HTTPS. Turn this off only to test without a TLS proxy.
+      '';
+    };
+
+    sessionLifetime = mkOption {
+      type = types.str;
+      default = "7d";
+      description = "How long a web UI login lasts.";
+    };
+
+    initialAdminPasswordFile = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "/run/secrets/manage-nix-admin-password";
+      description = ''
+        Password of the `admin` user the server creates on first start, when
+        it has no users. If null, the server generates one into
+        {file}`${stateDir}/initial-admin-password`. Change it after logging
+        in, or with `mnix-server set-password admin`.
+      '';
     };
 
     listenAddress = mkOption {
@@ -261,6 +297,17 @@ in
             cfg.activationTimeout
             "--build-timeout"
             cfg.buildTimeout
+            "--session-lifetime"
+            cfg.sessionLifetime
+          ]
+          ++ lib.optionals (cfg.webPackage != null) [
+            "--web-dir"
+            "${cfg.webPackage}"
+          ]
+          ++ lib.optional (!cfg.secureCookies) "--insecure-cookies"
+          ++ lib.optionals (cfg.initialAdminPasswordFile != null) [
+            "--initial-admin-password-file"
+            cfg.initialAdminPasswordFile
           ]
           ++ lib.optional (cfg.adminTokenFile == null) "--create-admin-token"
           ++ lib.optional (cfg.signingKeyFile == null) "--create-signing-key"

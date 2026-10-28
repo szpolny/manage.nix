@@ -269,6 +269,56 @@ pub struct Event {
     pub created_at: OffsetDateTime,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct User {
+    pub id: Uuid,
+    pub organization_id: Uuid,
+    pub username: String,
+    /// An Argon2id PHC string.
+    pub password_hash: String,
+    pub created_at: OffsetDateTime,
+    pub password_changed_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewUserSession {
+    pub user_id: Uuid,
+    /// SHA-256 (hex) of the session cookie; the cookie is never stored.
+    pub token_hash: String,
+    pub created_at: OffsetDateTime,
+    pub expires_at: OffsetDateTime,
+}
+
+/// A machine's part in one deployment, for the machine's history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineDeploymentRecord {
+    pub deployment_id: Uuid,
+    pub machine_id: Uuid,
+    pub kind: DeploymentKind,
+    pub mode: ActivationMode,
+    pub rev: Option<String>,
+    pub commit_id: Option<String>,
+    pub requested_by: String,
+    /// The machine's status in the deployment.
+    pub status: MachineDeploymentStatus,
+    pub store_path: Option<String>,
+    pub message: Option<String>,
+    pub created_at: OffsetDateTime,
+    pub finished_at: Option<OffsetDateTime>,
+}
+
+/// The revision a system was built from: the newest deployment that built
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemRevision {
+    pub store_path: String,
+    pub deployment_id: Uuid,
+    pub repository_id: Option<Uuid>,
+    pub rev: Option<String>,
+    pub commit_id: String,
+    pub created_at: OffsetDateTime,
+}
+
 /// Why a session ended.
 pub mod disconnect_reason {
     /// The agent or the network closed the connection.
@@ -484,6 +534,63 @@ pub trait Store: Send + Sync + 'static {
         after: i64,
         limit: u32,
     ) -> Result<Vec<LogEntry>>;
+
+    /// The machine's most recent deployments, newest first.
+    async fn machine_deployments(
+        &self,
+        machine_id: Uuid,
+        limit: u32,
+    ) -> Result<Vec<MachineDeploymentRecord>>;
+
+    /// Each of the organization's machines' most recent deployment.
+    async fn latest_machine_deployments(
+        &self,
+        organization_id: Uuid,
+    ) -> Result<Vec<MachineDeploymentRecord>>;
+
+    /// For each of `store_paths` a deployment built (with a resolved
+    /// commit), the newest such deployment. Paths no deployment built are
+    /// left out.
+    async fn system_revisions(
+        &self,
+        organization_id: Uuid,
+        store_paths: &[String],
+    ) -> Result<Vec<SystemRevision>>;
+
+    /// Fails with [`Error::Conflict`] if the organization already has a
+    /// user with that name.
+    async fn create_user(
+        &self,
+        organization_id: Uuid,
+        username: &str,
+        password_hash: &str,
+        now: OffsetDateTime,
+    ) -> Result<User>;
+
+    async fn user_count(&self, organization_id: Uuid) -> Result<u64>;
+
+    async fn user_by_name(&self, organization_id: Uuid, username: &str) -> Result<Option<User>>;
+
+    /// Replaces the user's password and ends their sessions, except the
+    /// one whose token hashes to `keep_session` (the session changing it).
+    async fn set_user_password(
+        &self,
+        user_id: Uuid,
+        password_hash: &str,
+        keep_session: Option<&str>,
+        now: OffsetDateTime,
+    ) -> Result<()>;
+
+    async fn create_user_session(&self, session: &NewUserSession) -> Result<()>;
+
+    /// The user whose session token hashes to `token_hash`, if the session
+    /// has not expired.
+    async fn session_user(&self, token_hash: &str, now: OffsetDateTime) -> Result<Option<User>>;
+
+    async fn delete_user_session(&self, token_hash: &str) -> Result<()>;
+
+    /// Deletes expired sessions and returns how many there were.
+    async fn delete_expired_user_sessions(&self, now: OffsetDateTime) -> Result<u64>;
 }
 
 /// The part of an agent's log chunk at `offset` that is new when

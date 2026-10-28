@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT DISTINCT ON (dm.store_path)\n                      dm.store_path AS \"store_path!\", d.id AS deployment_id, d.repository_id,\n                      d.rev, d.commit_id AS \"commit_id!\", d.created_at\n               FROM deployment_machines AS dm JOIN deployments AS d ON d.id = dm.deployment_id\n               WHERE d.organization_id = $1 AND d.kind = 'deploy' AND d.commit_id IS NOT NULL\n                 AND dm.store_path = ANY($2)\n               ORDER BY dm.store_path, d.created_at DESC, d.id DESC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "store_path!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "deployment_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "repository_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "rev",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "commit_id!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      true,
+      false,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "ad40870e229a0d09d21c6cdcc34a1db8d851b6ddfa565ff6182e4cf0da4481c3"
+}

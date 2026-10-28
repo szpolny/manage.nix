@@ -13,8 +13,8 @@ use mnix_protocol::api::{DeploymentKind, DeploymentStatus, MachineDeploymentStat
 use mnix_protocol::{ActivationMode, ActivationPhase, ActivationReport, ActivationStatus, Facts};
 use mnix_store::{
     disconnect_reason, log_source, Backend, Error, Event, MachineOutcome, NewDeployment,
-    NewDeploymentMachine, NewEnrollmentToken, NewLogEntry, NewSession, PostgresStore, Redemption,
-    SqliteStore, Store,
+    NewDeploymentMachine, NewEnrollmentToken, NewLogEntry, NewSession, NewUserSession,
+    PostgresStore, Redemption, SqliteStore, Store,
 };
 use sqlx::postgres::PgConnectOptions;
 use sqlx::{Connection, PgConnection};
@@ -118,7 +118,9 @@ store_test!(migrate_creates_tables, |store: Arc<dyn Store>| async move {
             "machines",
             "organizations",
             "repositories",
-            "server_meta"
+            "server_meta",
+            "user_sessions",
+            "users"
         ]
     );
 });
@@ -906,5 +908,216 @@ store_test!(
             .unwrap();
         assert_eq!(rest.len(), 1);
         assert_eq!(rest[0].text, "two\n");
+    }
+);
+
+store_test!(machine_history_and_system_revisions, |store: Arc<
+    dyn Store,
+>| async move {
+    let (org, web) = enrolled_machine(&*store, "web").await;
+    let (_, db) = enrolled_machine(&*store, "db").await;
+    let (_, idle) = enrolled_machine(&*store, "idle").await;
+    assert!(store
+        .latest_machine_deployments(org)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let first = queued_deployment(&*store, org, &[web, db], T0).await;
+    let second = queued_deployment(&*store, org, &[web], T0 + Duration::seconds(1)).await;
+    for (deployment, at) in [(first, T0), (second, T0 + Duration::seconds(1))] {
+        assert_eq!(store.claim_deployment(at).await.unwrap(), Some(deployment));
+    }
+    store
+        .set_deployment_commit(first, "commit-1")
+        .await
+        .unwrap();
+    store
+        .set_deployment_commit(second, "commit-2")
+        .await
+        .unwrap();
+    // Both deployments built the same system for web (the commits differ
+    // only for db); the newer one counts.
+    for (deployment, machine, path) in [
+        (first, web, "/nix/store/web-1"),
+        (first, db, "/nix/store/db-1"),
+        (second, web, "/nix/store/web-1"),
+    ] {
+        store
+            .release_activation(deployment, machine, path, &[], T0)
+            .await
+            .unwrap();
+    }
+    store
+        .finish_deployment_machine(
+            first,
+            db,
+            &MachineOutcome {
+                status: MachineDeploymentStatus::Failed,
+                message: Some("broken".to_owned()),
+                report: None,
+            },
+            T0 + Duration::seconds(2),
+        )
+        .await
+        .unwrap();
+
+    let history = store.machine_deployments(web, 10).await.unwrap();
+    assert_eq!(
+        history.iter().map(|h| h.deployment_id).collect::<Vec<_>>(),
+        [second, first]
+    );
+    assert_eq!(history[0].machine_id, web);
+    assert_eq!(history[0].kind, DeploymentKind::Deploy);
+    assert_eq!(history[0].commit_id.as_deref(), Some("commit-2"));
+    assert_eq!(history[0].status, MachineDeploymentStatus::Activating);
+    assert_eq!(history[0].requested_by, "alice");
+    assert_eq!(store.machine_deployments(web, 1).await.unwrap().len(), 1);
+
+    let db_history = store.machine_deployments(db, 10).await.unwrap();
+    assert_eq!(db_history.len(), 1);
+    assert_eq!(db_history[0].status, MachineDeploymentStatus::Failed);
+    assert_eq!(db_history[0].message.as_deref(), Some("broken"));
+    assert_eq!(db_history[0].finished_at, Some(T0 + Duration::seconds(2)));
+    assert!(store
+        .machine_deployments(idle, 10)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let mut latest = store.latest_machine_deployments(org).await.unwrap();
+    latest.sort_by_key(|r| r.deployment_id == second);
+    assert_eq!(
+        latest
+            .iter()
+            .map(|r| (r.machine_id, r.deployment_id))
+            .collect::<Vec<_>>(),
+        [(db, first), (web, second)]
+    );
+
+    let mut revisions = store
+        .system_revisions(
+            org,
+            &[
+                "/nix/store/web-1".to_owned(),
+                "/nix/store/db-1".to_owned(),
+                "/nix/store/unknown".to_owned(),
+            ],
+        )
+        .await
+        .unwrap();
+    revisions.sort_by(|a, b| a.store_path.cmp(&b.store_path));
+    assert_eq!(revisions.len(), 2);
+    assert_eq!(revisions[0].store_path, "/nix/store/db-1");
+    assert_eq!(revisions[0].commit_id, "commit-1");
+    assert_eq!(revisions[1].store_path, "/nix/store/web-1");
+    assert_eq!(revisions[1].deployment_id, second);
+    assert_eq!(revisions[1].commit_id, "commit-2");
+    assert_eq!(revisions[1].rev.as_deref(), Some("main"));
+    assert!(revisions[1].repository_id.is_some());
+    assert!(store.system_revisions(org, &[]).await.unwrap().is_empty());
+});
+
+store_test!(users_are_unique_per_organization, |store: Arc<
+    dyn Store,
+>| async move {
+    let org = store.ensure_organization("default", T0).await.unwrap();
+    let other = store.ensure_organization("other", T0).await.unwrap();
+    assert_eq!(store.user_count(org.id).await.unwrap(), 0);
+    let alice = store
+        .create_user(org.id, "alice", "hash-1", T0)
+        .await
+        .unwrap();
+    assert_eq!(alice.created_at, T0);
+    assert_eq!(alice.password_changed_at, T0);
+    assert!(matches!(
+        store.create_user(org.id, "alice", "hash-2", T0).await,
+        Err(Error::Conflict(_))
+    ));
+    store
+        .create_user(other.id, "alice", "hash-3", T0)
+        .await
+        .unwrap();
+    assert_eq!(store.user_count(org.id).await.unwrap(), 1);
+    assert_eq!(
+        store.user_by_name(org.id, "alice").await.unwrap(),
+        Some(alice)
+    );
+    assert_eq!(store.user_by_name(org.id, "bob").await.unwrap(), None);
+});
+
+store_test!(
+    user_sessions_expire_and_end_with_a_new_password,
+    |store: Arc<dyn Store>| async move {
+        let org = store.ensure_organization("default", T0).await.unwrap();
+        let alice = store
+            .create_user(org.id, "alice", "hash-1", T0)
+            .await
+            .unwrap();
+        for (token, hours) in [("s1", 1), ("s2", 1), ("s3", 2)] {
+            store
+                .create_user_session(&NewUserSession {
+                    user_id: alice.id,
+                    token_hash: token.to_owned(),
+                    created_at: T0,
+                    expires_at: T0 + Duration::hours(hours),
+                })
+                .await
+                .unwrap();
+        }
+        let user = store.session_user("s1", T0).await.unwrap().unwrap();
+        assert_eq!(user.username, "alice");
+        assert_eq!(store.session_user("nope", T0).await.unwrap(), None);
+        // Expired at exactly `expires_at`.
+        assert_eq!(
+            store
+                .session_user("s1", T0 + Duration::hours(1))
+                .await
+                .unwrap(),
+            None
+        );
+
+        store.delete_user_session("s2").await.unwrap();
+        assert_eq!(store.session_user("s2", T0).await.unwrap(), None);
+
+        // Changing the password keeps only the session that changed it.
+        let later = T0 + Duration::minutes(5);
+        store
+            .set_user_password(alice.id, "hash-2", Some("s3"), later)
+            .await
+            .unwrap();
+        assert_eq!(store.session_user("s1", T0).await.unwrap(), None);
+        let user = store.session_user("s3", T0).await.unwrap().unwrap();
+        assert_eq!(user.password_hash, "hash-2");
+        assert_eq!(user.password_changed_at, later);
+        store
+            .set_user_password(alice.id, "hash-3", None, later)
+            .await
+            .unwrap();
+        assert_eq!(store.session_user("s3", T0).await.unwrap(), None);
+
+        store
+            .create_user_session(&NewUserSession {
+                user_id: alice.id,
+                token_hash: "s4".to_owned(),
+                created_at: T0,
+                expires_at: T0 + Duration::hours(1),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .delete_expired_user_sessions(T0 + Duration::minutes(59))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .delete_expired_user_sessions(T0 + Duration::hours(1))
+                .await
+                .unwrap(),
+            1
+        );
     }
 );

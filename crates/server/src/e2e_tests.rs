@@ -26,6 +26,7 @@ const ADMIN_TOKEN: &str = "test-admin-token-0123456789";
 
 struct Server {
     base: String,
+    state: Arc<AppState>,
     _dir: tempfile::TempDir,
     shutdown: tokio::sync::watch::Sender<bool>,
 }
@@ -35,6 +36,14 @@ async fn start(heartbeat_timeout: Duration) -> Server {
 }
 
 async fn start_with(heartbeat_timeout: Duration, activation_timeout: Duration) -> Server {
+    launch(heartbeat_timeout, activation_timeout, None).await
+}
+
+async fn launch(
+    heartbeat_timeout: Duration,
+    activation_timeout: Duration,
+    web_dir: Option<std::path::PathBuf>,
+) -> Server {
     let dir = tempfile::tempdir().unwrap();
     let url = format!("sqlite://{}", dir.path().join("db.sqlite").display());
     let store = mnix_store::connect(&url).await.unwrap();
@@ -55,6 +64,8 @@ async fn start_with(heartbeat_timeout: Duration, activation_timeout: Duration) -
             confirm_timeout: Duration::from_secs(60),
             activation_timeout,
             build_timeout: Duration::from_secs(60),
+            session_lifetime: Duration::from_secs(3600),
+            secure_cookies: true,
         },
         shutdown: shutdown_rx,
         builder: crate::build::Builder {
@@ -64,17 +75,46 @@ async fn start_with(heartbeat_timeout: Duration, activation_timeout: Duration) -
         },
         queue: tokio::sync::Notify::new(),
         activations: tokio::sync::watch::channel(0).0,
+        web_dir,
     });
     tokio::spawn(crate::agent::reap_stale_sessions(state.clone()));
     tokio::spawn(crate::deploy::run_worker(state.clone()));
     tokio::spawn(crate::deploy::run_sweeper(state.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
-    tokio::spawn(async move { axum::serve(listener, app::router(state)).await });
+    let router = app::router(state.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await });
     Server {
         base,
+        state,
         _dir: dir,
         shutdown,
+    }
+}
+
+/// A response to [`Server::raw`].
+struct Raw {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: String,
+}
+
+impl Raw {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn json(&self) -> serde_json::Value {
+        serde_json::from_str(&self.body).unwrap_or(json!(null))
+    }
+
+    /// The `name=value` part of the Set-Cookie header.
+    fn cookie(&self) -> String {
+        let set = self.header("set-cookie").expect("a Set-Cookie header");
+        set.split(';').next().unwrap().to_owned()
     }
 }
 
@@ -126,6 +166,83 @@ impl Server {
         })
         .await
         .unwrap()
+    }
+
+    /// Sends a request with arbitrary headers and returns everything.
+    async fn raw(
+        &self,
+        method: &'static str,
+        path: &str,
+        headers: &[(&'static str, &str)],
+        body: Option<serde_json::Value>,
+    ) -> Raw {
+        let url = format!("http://{}{path}", self.base);
+        let headers: Vec<(&'static str, String)> =
+            headers.iter().map(|(n, v)| (*n, (*v).to_owned())).collect();
+        tokio::task::spawn_blocking(move || {
+            let agent: ureq::Agent = ureq::Agent::config_builder()
+                .http_status_as_error(false)
+                .build()
+                .into();
+            let mut response = match method {
+                "GET" | "DELETE" => {
+                    let mut req = if method == "GET" {
+                        agent.get(&url)
+                    } else {
+                        agent.delete(&url)
+                    };
+                    for (name, value) in &headers {
+                        req = req.header(*name, value);
+                    }
+                    req.call()
+                }
+                _ => {
+                    let mut req = if method == "PUT" {
+                        agent.put(&url)
+                    } else {
+                        agent.post(&url)
+                    };
+                    for (name, value) in &headers {
+                        req = req.header(*name, value);
+                    }
+                    req.send_json(body.unwrap_or(json!({})))
+                }
+            }
+            .unwrap();
+            Raw {
+                status: response.status().as_u16(),
+                headers: response
+                    .headers()
+                    .iter()
+                    .map(|(n, v)| (n.to_string(), v.to_str().unwrap_or("").to_owned()))
+                    .collect(),
+                body: response.body_mut().read_to_string().unwrap_or_default(),
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Creates a user and logs in; returns the session cookie.
+    async fn login(&self, username: &str, password: &str) -> String {
+        crate::auth::set_password(
+            &*self.state.store,
+            self.state.organization.id,
+            username,
+            password,
+        )
+        .await
+        .unwrap();
+        let response = self
+            .raw(
+                "POST",
+                "/api/session",
+                &[],
+                Some(json!({"username": username, "password": password})),
+            )
+            .await;
+        assert_eq!(response.status, 200, "{}", response.body);
+        response.cookie()
     }
 
     async fn admin(
@@ -820,4 +937,400 @@ async fn unanswered_activations_time_out() {
             .contains("did not finish activating"),
         "{failed:?}"
     );
+}
+
+#[tokio::test]
+async fn users_log_in_and_act_as_themselves() {
+    let server = start(Duration::from_secs(30)).await;
+    let state = &server.state;
+    crate::auth::set_password(
+        &*state.store,
+        state.organization.id,
+        "alice",
+        "correct horse",
+    )
+    .await
+    .unwrap();
+    let login = |username: &'static str, password: &'static str| {
+        server.raw(
+            "POST",
+            "/api/session",
+            &[],
+            Some(json!({"username": username, "password": password})),
+        )
+    };
+    for (username, password) in [("alice", "wrong horse"), ("bob", "correct horse")] {
+        let response = login(username, password).await;
+        assert_eq!(response.status, 401, "{}", response.body);
+        assert!(response.header("set-cookie").is_none());
+    }
+    let response = login("alice", "correct horse").await;
+    assert_eq!(response.status, 200, "{}", response.body);
+    assert_eq!(response.json()["username"], "alice");
+    let set_cookie = response.header("set-cookie").unwrap();
+    for attribute in ["HttpOnly", "SameSite=Strict", "Secure", "Path=/"] {
+        assert!(set_cookie.contains(attribute), "{set_cookie}");
+    }
+    let cookie = response.cookie();
+    assert!(cookie.starts_with("mnix_session=mnix_session_"), "{cookie}");
+
+    let response = server
+        .raw("GET", "/api/session", &[("cookie", &cookie)], None)
+        .await;
+    assert_eq!(response.json()["username"], "alice");
+    let response = server
+        .raw("GET", "/api/machines", &[("cookie", &cookie)], None)
+        .await;
+    assert_eq!(response.status, 200);
+
+    // Changes need the CSRF header.
+    let add = json!({"name": "web-1"});
+    let response = server
+        .raw(
+            "POST",
+            "/api/machines",
+            &[("cookie", &cookie)],
+            Some(add.clone()),
+        )
+        .await;
+    assert_eq!(response.status, 403, "{}", response.body);
+    let with_csrf = [("cookie", cookie.as_str()), ("x-mnix-csrf", "1")];
+    let response = server
+        .raw("POST", "/api/machines", &with_csrf, Some(add))
+        .await;
+    assert_eq!(response.status, 201, "{}", response.body);
+    let created: CreatedMachine = serde_json::from_str(&response.body).unwrap();
+    server.enroll(&created.enrollment_token.token).await;
+
+    // Deployments record who asked, whatever the request says.
+    let response = server
+        .raw(
+            "POST",
+            "/api/machines/web-1/rollback",
+            &with_csrf,
+            Some(json!({"requested_by": "mallory"})),
+        )
+        .await;
+    assert_eq!(response.status, 201, "{}", response.body);
+    assert_eq!(response.json()["requested_by"], "alice");
+
+    // Changing the password needs the current one and ends other sessions.
+    let other = login("alice", "correct horse").await.cookie();
+    let change = |current: &'static str| {
+        server.raw(
+            "PUT",
+            "/api/session/password",
+            &with_csrf,
+            Some(json!({"current_password": current, "new_password": "battery staple"})),
+        )
+    };
+    assert_eq!(change("wrong horse").await.status, 403);
+    assert_eq!(change("correct horse").await.status, 204);
+    assert_eq!(login("alice", "correct horse").await.status, 401);
+    assert_eq!(login("alice", "battery staple").await.status, 200);
+    let response = server
+        .raw("GET", "/api/session", &[("cookie", &other)], None)
+        .await;
+    assert_eq!(response.status, 401);
+
+    // Logging out ends the session.
+    let response = server.raw("DELETE", "/api/session", &with_csrf, None).await;
+    assert_eq!(response.status, 204);
+    assert!(response.header("set-cookie").unwrap().contains("Max-Age=0"));
+    let response = server
+        .raw("GET", "/api/session", &[("cookie", &cookie)], None)
+        .await;
+    assert_eq!(response.status, 401);
+
+    // The admin token still works, and a wrong one is not a fallback to
+    // the cookie.
+    let (status, _) = server.admin("GET", "/api/session", None).await;
+    assert_eq!(status, 200);
+    let fresh = server.login("alice", "battery staple").await;
+    let response = server
+        .raw(
+            "GET",
+            "/api/machines",
+            &[("cookie", &fresh), ("authorization", "Bearer wrong")],
+            None,
+        )
+        .await;
+    assert_eq!(response.status, 401);
+}
+
+#[tokio::test]
+async fn the_first_user_is_created_once() {
+    let server = start(Duration::from_secs(30)).await;
+    let state = &server.state;
+    let dir = tempfile::tempdir().unwrap();
+    let generated = dir.path().join("initial-admin-password");
+    crate::auth::ensure_initial_user(&*state.store, state.organization.id, None, &generated)
+        .await
+        .unwrap();
+    let password = std::fs::read_to_string(&generated).unwrap();
+    let password = password.trim();
+    std::fs::remove_file(&generated).unwrap();
+    crate::auth::ensure_initial_user(&*state.store, state.organization.id, None, &generated)
+        .await
+        .unwrap();
+    assert!(!generated.exists());
+    let response = server
+        .raw(
+            "POST",
+            "/api/session",
+            &[],
+            Some(json!({"username": "admin", "password": password})),
+        )
+        .await;
+    assert_eq!(response.status, 200, "{}", response.body);
+}
+
+#[tokio::test]
+async fn machines_show_revisions_history_and_generations() {
+    let server = start(Duration::from_secs(30)).await;
+    let credential = server.enrolled("web-1").await;
+    let mut ws = server.session(&credential, "web-1").await;
+    let old = "/nix/store/11111111111111111111111111111111-nixos-system-old";
+    let new = "/nix/store/22222222222222222222222222222222-nixos-system-new";
+    let generation = |number, store_path: &str, current| mnix_protocol::Generation {
+        number,
+        store_path: store_path.to_owned(),
+        created_at: "2026-10-22T08:00:00Z".to_owned(),
+        current,
+    };
+    ws.send(text(&AgentMessage::Facts {
+        facts: Facts {
+            current_system: new.to_owned(),
+            booted_system: Some(old.to_owned()),
+            generations: vec![generation(1, old, false), generation(2, new, true)],
+            ..facts("web-1")
+        },
+    }))
+    .await
+    .unwrap();
+
+    // A deployment built `new` from commit c0ffee.
+    let state = &server.state;
+    let machine = server.machine("web-1").await;
+    let machine_id = machine.id.parse().unwrap();
+    let repository = state
+        .store
+        .create_repository(
+            state.organization.id,
+            "infra",
+            "/srv/git/infra",
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+    let deployment_id = uuid::Uuid::new_v4();
+    state
+        .store
+        .create_deployment(&mnix_store::NewDeployment {
+            id: deployment_id,
+            organization_id: state.organization.id,
+            kind: mnix_protocol::api::DeploymentKind::Deploy,
+            status: DeploymentStatus::Building,
+            repository_id: Some(repository.id),
+            rev: Some("main".to_owned()),
+            mode: ActivationMode::Switch,
+            requested_by: "alice".to_owned(),
+            created_at: OffsetDateTime::now_utc(),
+            machines: vec![mnix_store::NewDeploymentMachine {
+                machine_id,
+                configuration: Some("web-1".to_owned()),
+                status: MachineDeploymentStatus::Building,
+            }],
+        })
+        .await
+        .unwrap();
+    state
+        .store
+        .set_deployment_commit(deployment_id, "c0ffee")
+        .await
+        .unwrap();
+    state
+        .store
+        .release_activation(
+            deployment_id,
+            machine_id,
+            new,
+            &[],
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+
+    let mut machine = server.machine("web-1").await;
+    for _ in 0..50 {
+        if machine.current_system.as_deref() == Some(new) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        machine = server.machine("web-1").await;
+    }
+    let revision = machine.revision.expect("the running system's revision");
+    assert_eq!(revision.commit, "c0ffee");
+    assert_eq!(revision.rev.as_deref(), Some("main"));
+    assert_eq!(revision.repository.as_deref(), Some("infra"));
+    let last = machine.last_deployment.expect("the last deployment");
+    assert_eq!(last.deployment_id, deployment_id.to_string());
+    assert_eq!(last.status, MachineDeploymentStatus::Activating);
+    let (_, listed) = server.admin("GET", "/api/machines", None).await;
+    assert_eq!(listed[0]["revision"]["commit"], "c0ffee");
+    assert_eq!(
+        listed[0]["last_deployment"]["deployment_id"],
+        deployment_id.to_string()
+    );
+
+    let (status, history) = server
+        .admin("GET", "/api/machines/web-1/deployments", None)
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(history.as_array().unwrap().len(), 1);
+    assert_eq!(history[0]["requested_by"], "alice");
+
+    let (status, generations) = server
+        .admin("GET", "/api/machines/web-1/generations", None)
+        .await;
+    assert_eq!(status, 200);
+    let generations: Vec<mnix_protocol::api::GenerationView> =
+        serde_json::from_value(generations).unwrap();
+    assert_eq!(
+        generations
+            .iter()
+            .map(|g| (g.number, g.current, g.running, g.booted))
+            .collect::<Vec<_>>(),
+        [(2, true, true, false), (1, false, false, true)]
+    );
+    assert_eq!(generations[0].revision.as_ref().unwrap().commit, "c0ffee");
+    assert!(generations[1].revision.is_none());
+
+    // Neither system exists on this host, so there is nothing to compare.
+    let (status, body) = server
+        .admin("GET", "/api/machines/web-1/diff?from=1&to=2", None)
+        .await;
+    assert_eq!(status, 422, "{body}");
+    let (status, _) = server
+        .admin("GET", "/api/machines/web-1/diff?from=1&to=9", None)
+        .await;
+    assert_eq!(status, 404);
+}
+
+#[tokio::test]
+async fn deployment_events_stream_until_the_end() {
+    let server = start(Duration::from_secs(30)).await;
+    let credential = server.enrolled("web-1").await;
+    let mut ws = server.session(&credential, "web-1").await;
+    let (_, body) = server
+        .admin("POST", "/api/machines/web-1/rollback", Some(json!({})))
+        .await;
+    let deployment: Deployment = serde_json::from_value(body).unwrap();
+    let Some(ServerMessage::Activate(_)) = receive_within(&mut ws, Duration::from_secs(5)).await
+    else {
+        panic!("expected activate");
+    };
+    for (offset, chunk) in [(0, "one\n"), (4, "two\n")] {
+        ws.send(text(&AgentMessage::ActivationLog {
+            deployment_id: deployment.id.clone(),
+            offset,
+            text: chunk.to_owned(),
+        }))
+        .await
+        .unwrap();
+    }
+    let previous = "/nix/store/11111111111111111111111111111111-nixos-system-old";
+    ws.send(text(&AgentMessage::ActivationResult {
+        deployment_id: deployment.id.clone(),
+        report: succeeded(previous),
+    }))
+    .await
+    .unwrap();
+    server
+        .wait_for_deployment(&deployment.id, DeploymentStatus::Succeeded)
+        .await;
+
+    // The stream ends by itself once the deployment has finished.
+    let path = format!("/api/deployments/{}/events", deployment.id);
+    let auth = format!("Bearer {ADMIN_TOKEN}");
+    let response = server
+        .raw("GET", &path, &[("authorization", &auth)], None)
+        .await;
+    assert_eq!(response.status, 200);
+    assert!(response
+        .header("content-type")
+        .unwrap()
+        .starts_with("text/event-stream"));
+    let events: Vec<(String, Option<String>, String)> = response
+        .body
+        .split("\n\n")
+        .filter(|block| !block.trim().is_empty() && !block.starts_with(':'))
+        .map(|block| {
+            let field = |name: &str| {
+                block
+                    .lines()
+                    .find_map(|l| l.strip_prefix(&format!("{name}:")))
+                    .map(|v| v.trim_start().to_owned())
+            };
+            (
+                field("event").unwrap(),
+                field("id"),
+                field("data").unwrap_or_default(),
+            )
+        })
+        .collect();
+    let kinds: Vec<_> = events.iter().map(|(kind, _, _)| kind.as_str()).collect();
+    assert_eq!(kinds, ["deployment", "log", "log", "end"], "{events:?}");
+    let first: Deployment = serde_json::from_str(&events[0].2).unwrap();
+    assert_eq!(first.status, DeploymentStatus::Succeeded);
+    let log: LogEntry = serde_json::from_str(&events[2].2).unwrap();
+    assert_eq!(log.text, "two\n");
+    assert_eq!(events[2].1, Some(log.id.to_string()));
+
+    // Resuming after the first entry skips it.
+    let first_id = events[1].1.clone().unwrap();
+    let response = server
+        .raw(
+            "GET",
+            &path,
+            &[("authorization", &auth), ("last-event-id", &first_id)],
+            None,
+        )
+        .await;
+    assert_eq!(response.body.matches("event: log").count(), 1);
+    assert!(response.body.contains("two"));
+}
+
+#[tokio::test]
+async fn the_web_ui_is_served_with_a_fallback_to_index() {
+    let web = tempfile::tempdir().unwrap();
+    std::fs::write(web.path().join("index.html"), "<!doctype html>app").unwrap();
+    std::fs::create_dir_all(web.path().join("_app/immutable")).unwrap();
+    std::fs::write(web.path().join("_app/immutable/start.js"), "js").unwrap();
+    let server = launch(
+        Duration::from_secs(30),
+        Duration::from_secs(600),
+        Some(web.path().to_owned()),
+    )
+    .await;
+    for path in ["/", "/machines/web-1", "/deploys"] {
+        let response = server.raw("GET", path, &[], None).await;
+        assert_eq!(response.status, 200, "{path}");
+        assert_eq!(response.body, "<!doctype html>app", "{path}");
+        assert_eq!(response.header("cache-control"), Some("no-cache"));
+    }
+    let response = server
+        .raw("GET", "/_app/immutable/start.js", &[], None)
+        .await;
+    assert_eq!(response.body, "js");
+    assert!(response
+        .header("cache-control")
+        .unwrap()
+        .contains("immutable"));
+    let response = server.raw("GET", "/api/nothing-here", &[], None).await;
+    assert_eq!(response.status, 404);
+    assert!(response.json()["error"].is_string());
+    // The API still requires authentication.
+    let response = server.raw("GET", "/api/machines", &[], None).await;
+    assert_eq!(response.status, 401);
 }
