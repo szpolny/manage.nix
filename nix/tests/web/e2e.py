@@ -88,7 +88,10 @@ def deploy(page: Page, machine: str, rev: str) -> None:
 def verify(page: Page, machine: str, rev: str) -> None:
     # The machines list shows the revision the machine runs.
     row = page.locator(f"tr[data-machine='{machine}']")
-    expect(row.get_by_test_id("revision")).to_have_text(re.compile(rf"^{rev} @ [0-9a-f]{{8}}$"))
+    # A newer commit on the tracked ref adds "N behind <ref>" after it.
+    expect(row.get_by_test_id("revision")).to_have_text(
+        re.compile(rf"^{rev} @ [0-9a-f]{{8}}( \d+ behind \S+)?$")
+    )
     expect(row.locator("[data-status]").first).to_have_attribute("data-status", "online")
 
     row.get_by_role("link", name=machine).click()
