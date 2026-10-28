@@ -1,0 +1,45 @@
+# Releases with release-please: every push to main updates a release PR
+# from the Conventional Commits since the last release. Merging it tags
+# `vX.Y.Z` and publishes a GitHub release.
+#
+# release-please bumps the version in Cargo.toml, web/package.json, and
+# web/package-lock.json (release-please-config.json); this workflow then
+# brings the workspace's entries in Cargo.lock in line, which release-please
+# cannot do itself.
+#
+# Pull requests opened with the default GITHUB_TOKEN do not start other
+# workflows. Set the RELEASE_PLEASE_TOKEN secret (a token with contents and
+# pull-request write access) to have `check` run on the release PR too.
+name: release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
+      - if: ${{ steps.release.outputs.pr }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
+      - if: ${{ steps.release.outputs.pr }}
+        name: Update Cargo.lock
+        run: |
+          cargo update --workspace
+          if ! git diff --quiet Cargo.lock; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git commit -m 'chore: update Cargo.lock for the release' Cargo.lock
+            git push
+          fi
