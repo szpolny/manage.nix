@@ -2,15 +2,18 @@
 //!
 //! The service writes the server's request into
 //! `<state dir>/activations/<deployment id>/` and starts
-//! `mnix-agent activation-job <dir>` in a transient systemd unit. The
-//! activation, its health checks, the wait for confirmation, and any
-//! rollback then carry on when the switch restarts the agent service or
-//! cuts the machine off the network. The job and the service talk through
-//! files in that directory:
+//! `mnix-agent activation-job <dir>` in a transient systemd unit (NixOS) or
+//! its own launchd daemon (macOS). The activation, its health checks, the
+//! wait for confirmation, and any rollback then carry on when the switch
+//! restarts the agent service or cuts the machine off the network. Jobs
+//! wait for each other: one machine activates one system at a time, even
+//! when several servers ask. The job and the service talk through files in
+//! that directory:
 //!
 //! | File | Written by | Contents |
 //! |---|---|---|
 //! | `request.json` | service | the server's [`Activate`] message |
+//! | `server` | service | the name of the server that asked |
 //! | `log` | the job's stdout and stderr | everything the activation printed |
 //! | `status.json` | job | the current [`ActivationPhase`] and when it began |
 //! | `confirmed` | service | exists once the server confirmed over a connection opened after the switch |
@@ -31,11 +34,13 @@ use mnix_protocol::{
 use serde::{Deserialize, Serialize};
 
 use crate::activate::{self, Observer, Request};
-use crate::host::NixosHost;
+use crate::config::AgentConfig;
+use crate::host::LocalHost;
 
 /// Job directories, relative to the state directory.
 const JOBS_DIR: &str = "activations";
 const REQUEST: &str = "request.json";
+const SERVER: &str = "server";
 const STATUS: &str = "status.json";
 const CONFIRMED: &str = "confirmed";
 const REPORT: &str = "report.json";
@@ -57,6 +62,9 @@ struct Status {
 #[derive(Debug, Clone)]
 pub struct Job {
     pub deployment_id: String,
+    /// The server that asked for it; `None` for jobs from agents before
+    /// 0.2, which had one server.
+    pub server: Option<String>,
     pub dir: PathBuf,
     pub phase: Option<ActivationPhase>,
     /// When the current phase began.
@@ -99,10 +107,10 @@ impl Jobs {
         Ok(self.root.join(deployment_id))
     }
 
-    /// Starts a job for `request` unless one exists for its deployment
-    /// (the server repeats requests it has no answer to). Returns whether
-    /// a job was started.
-    pub fn start(&self, request: &Activate) -> anyhow::Result<bool> {
+    /// Starts a job for `request` from `server` unless one exists for its
+    /// deployment (the server repeats requests it has no answer to).
+    /// Returns whether a job was started.
+    pub fn start(&self, request: &Activate, server: &str) -> anyhow::Result<bool> {
         let dir = self.dir(&request.deployment_id)?;
         std::fs::DirBuilder::new()
             .recursive(true)
@@ -114,6 +122,7 @@ impl Jobs {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
             Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
         }
+        write_atomically(&dir.join(SERVER), server.as_bytes())?;
         write_atomically(&dir.join(REQUEST), &serde_json::to_vec_pretty(request)?)?;
         if let Err(e) = spawn(&dir, &request.deployment_id) {
             tracing::error!("starting the activation: {e:#}");
@@ -179,10 +188,12 @@ impl Jobs {
         let since = status
             .as_ref()
             .and_then(|s| humantime::parse_rfc3339(&s.since).ok());
+        let server = std::fs::read_to_string(dir.join(SERVER)).ok();
         Ok(Some((
             created,
             Job {
                 deployment_id: id.to_owned(),
+                server,
                 dir,
                 phase: status.map(|s| s.phase),
                 since,
@@ -200,6 +211,7 @@ impl Jobs {
     /// Forgets a finished job.
     pub fn remove(&self, deployment_id: &str) -> anyhow::Result<()> {
         let dir = self.dir(deployment_id)?;
+        unload(deployment_id);
         match std::fs::remove_dir_all(&dir) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
                 Err(e).with_context(|| format!("removing {}", dir.display()))
@@ -209,12 +221,14 @@ impl Jobs {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn unit_name(deployment_id: &str) -> String {
     format!("mnix-activation-{deployment_id}.service")
 }
 
 /// Starts `mnix-agent activation-job <dir>` in its own transient unit, so
 /// that it is not part of (and not stopped with) the agent service.
+#[cfg(not(target_os = "macos"))]
 fn spawn(dir: &Path, deployment_id: &str) -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("finding the agent executable")?;
     let log = dir.join(LOG);
@@ -249,6 +263,7 @@ fn spawn(dir: &Path, deployment_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 fn unit_is_active(deployment_id: &str) -> bool {
     Command::new("systemctl")
         .args(["is-active", "--quiet", &unit_name(deployment_id)])
@@ -257,15 +272,111 @@ fn unit_is_active(deployment_id: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Transient units are collected when they finish.
+#[cfg(not(target_os = "macos"))]
+fn unload(_deployment_id: &str) {}
+
+#[cfg(target_os = "macos")]
+fn label(deployment_id: &str) -> String {
+    format!("org.manage-nix.activation.{deployment_id}")
+}
+
+/// Starts `mnix-agent activation-job <dir>` as its own launchd daemon,
+/// from a property list in the job directory, so that it is not stopped
+/// when activating a system reloads the agent's daemon.
+#[cfg(target_os = "macos")]
+fn spawn(dir: &Path, deployment_id: &str) -> anyhow::Result<()> {
+    let exe = std::env::current_exe().context("finding the agent executable")?;
+    let plist = dir.join("job.plist");
+    write_atomically(&plist, launchd_plist(&exe, dir, deployment_id)?.as_bytes())?;
+    let status = Command::new("launchctl")
+        .arg("bootstrap")
+        .arg("system")
+        .arg(&plist)
+        .stdin(Stdio::null())
+        .status()
+        .context("running launchctl")?;
+    anyhow::ensure!(status.success(), "launchctl bootstrap failed ({status})");
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn launchd_plist(exe: &Path, dir: &Path, deployment_id: &str) -> anyhow::Result<String> {
+    fn escape(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    }
+    let string = |path: &Path| -> anyhow::Result<String> {
+        Ok(format!(
+            "<string>{}</string>",
+            escape(path.to_str().context("non-UTF-8 path")?)
+        ))
+    };
+    let log = string(&dir.join(LOG))?;
+    let mut env = String::new();
+    for name in ["PATH", "RUST_LOG"] {
+        if let Ok(value) = std::env::var(name) {
+            env.push_str(&format!(
+                "<key>{name}</key><string>{}</string>",
+                escape(&value)
+            ));
+        }
+    }
+    Ok(format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+<key>Label</key><string>org.manage-nix.activation.{deployment_id}</string>
+<key>ProgramArguments</key><array>{}<string>activation-job</string>{}</array>
+<key>RunAtLoad</key><true/>
+<key>KeepAlive</key><false/>
+<key>LaunchOnlyOnce</key><true/>
+<key>StandardOutPath</key>{log}
+<key>StandardErrorPath</key>{log}
+<key>EnvironmentVariables</key><dict>{env}</dict>
+</dict>
+</plist>
+"#,
+        string(exe)?,
+        string(dir)?,
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn unit_is_active(deployment_id: &str) -> bool {
+    Command::new("launchctl")
+        .arg("print")
+        .arg(format!("system/{}", label(deployment_id)))
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|out| {
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("state = running")
+        })
+}
+
+/// Removes the job's finished launchd daemon.
+#[cfg(target_os = "macos")]
+fn unload(deployment_id: &str) {
+    let _ = Command::new("launchctl")
+        .arg("bootout")
+        .arg(format!("system/{}", label(deployment_id)))
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 fn age(t: SystemTime) -> Duration {
     SystemTime::now().duration_since(t).unwrap_or_default()
 }
 
-fn failed_report(request: &Activate, message: String) -> ActivationReport {
+pub fn failed_report(request: &Activate, message: String) -> ActivationReport {
     ActivationReport {
         store_path: match &request.target {
             ActivationTarget::System { store_path } => store_path.clone(),
-            ActivationTarget::PreviousGeneration => String::new(),
+            ActivationTarget::Build { .. } | ActivationTarget::PreviousGeneration => String::new(),
         },
         mode: request.mode,
         status: ActivationStatus::Failed,
@@ -282,26 +393,71 @@ pub fn run(dir: &Path) -> anyhow::Result<ActivationReport> {
     let request: Activate = read_json(&dir.join(REQUEST))?
         .with_context(|| format!("no {REQUEST} in {}", dir.display()))?;
     let _ = std::fs::remove_file(dir.join(CONFIRMED));
-    let report = match crate::lock() {
-        Ok(_lock) => {
-            let observer = JobObserver {
-                dir,
-                confirm_timeout: Duration::from_secs(request.confirm_timeout_secs),
-            };
-            activate::activate(
-                &NixosHost,
+    let observer = JobObserver {
+        dir,
+        confirm_timeout: Duration::from_secs(request.confirm_timeout_secs),
+    };
+    let report = match crate::wait_for_lock() {
+        Ok(_lock) => match prepare(dir, &request, &observer) {
+            Ok(source) => activate::activate(
+                &LocalHost,
                 &Request {
                     target: request.target.clone(),
                     mode: request.mode,
                     signatures: request.signatures.clone(),
+                    source,
                 },
                 &observer,
-            )
-        }
+            ),
+            Err(e) => {
+                tracing::error!("{e:#}");
+                failed_report(&request, format!("{e:#}"))
+            }
+        },
         Err(e) => failed_report(&request, format!("{e:#}")),
     };
     write_atomically(&dir.join(REPORT), &serde_json::to_vec_pretty(&report)?)?;
     Ok(report)
+}
+
+/// Fetches the source of a build from the server that asked for it.
+fn prepare(
+    dir: &Path,
+    request: &Activate,
+    observer: &JobObserver,
+) -> anyhow::Result<Option<PathBuf>> {
+    let ActivationTarget::Build { commit, .. } = &request.target else {
+        return Ok(None);
+    };
+    observer.phase(ActivationPhase::Building);
+    // <state dir>/activations/<id>
+    let state_dir = dir
+        .parent()
+        .and_then(Path::parent)
+        .context("unexpected job directory")?;
+    let name = std::fs::read_to_string(dir.join(SERVER))
+        .context("the job does not say which server asked for it")?;
+    let config = AgentConfig::load_from(Path::new("/"))?.unwrap_or_default();
+    let server = config
+        .servers
+        .iter()
+        .find(|s| s.name == name)
+        .with_context(|| format!("the server {name:?} is no longer configured"))?;
+    anyhow::ensure!(
+        server.allow_builds,
+        "the server {name:?} may not make this machine build"
+    );
+    let credential = crate::credential::load(&crate::daemon::server_dir(state_dir, &name))?
+        .with_context(|| format!("not enrolled with {name:?}"))?;
+    let repo = crate::source::fetch(
+        state_dir,
+        server,
+        &credential,
+        &request.deployment_id,
+        commit,
+        dir,
+    )?;
+    Ok(Some(repo))
 }
 
 struct JobObserver<'a> {
@@ -417,7 +573,9 @@ mod tests {
             assert!(!is_uuid(bad), "{bad}");
         }
         let dir = tempfile::tempdir().unwrap();
-        assert!(Jobs::new(dir.path()).start(&request("../escape")).is_err());
+        assert!(Jobs::new(dir.path())
+            .start(&request("../escape"), "s")
+            .is_err());
     }
 
     #[test]
@@ -427,10 +585,11 @@ mod tests {
         assert!(jobs.list().is_empty());
         // `systemd-run` is missing here, so the job fails to start and is
         // listed with a report saying so.
-        assert!(jobs.start(&request(ID)).unwrap());
-        assert!(!jobs.start(&request(ID)).unwrap(), "started twice");
+        assert!(jobs.start(&request(ID), "s").unwrap());
+        assert!(!jobs.start(&request(ID), "s").unwrap(), "started twice");
         let listed = jobs.list();
         assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].server.as_deref(), Some("s"));
         let report = listed[0].report.as_ref().unwrap();
         assert_eq!(report.status, ActivationStatus::Failed);
         assert!(report.message.as_ref().unwrap().contains("could not start"));
@@ -452,5 +611,18 @@ mod tests {
         jobs.remove(ID).unwrap();
         jobs.remove(ID).unwrap();
         assert!(jobs.list().is_empty());
+    }
+
+    #[test]
+    fn launchd_jobs_run_once_and_log_to_the_job() {
+        let plist = launchd_plist(
+            Path::new("/nix/store/x-mnix-agent/bin/mnix-agent"),
+            Path::new("/var/lib/manage-nix/activations/a&b"),
+            ID,
+        )
+        .unwrap();
+        assert!(plist.contains(&format!("<string>org.manage-nix.activation.{ID}</string>")));
+        assert!(plist.contains("<key>KeepAlive</key><false/>"));
+        assert!(plist.contains("<string>/var/lib/manage-nix/activations/a&amp;b/log</string>"));
     }
 }

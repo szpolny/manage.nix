@@ -10,6 +10,7 @@ mod deploy;
 #[cfg(test)]
 mod e2e_tests;
 mod events;
+mod provision;
 mod secret;
 mod web;
 
@@ -68,10 +69,17 @@ struct ServeArgs {
     #[command(flatten)]
     database: DatabaseArgs,
 
-    /// Address to listen on. Serve plain HTTP on a private address and put
-    /// a TLS-terminating reverse proxy in front of it.
-    #[arg(long, env = "MNIX_LISTEN", default_value = "127.0.0.1:8080")]
-    listen: SocketAddr,
+    /// Address to listen on; repeatable. Serve plain HTTP on private
+    /// addresses (loopback, a VPN) or put a TLS-terminating reverse proxy in
+    /// front. Only the first must be available at start: the server keeps
+    /// trying the others, such as a VPN address that appears later.
+    #[arg(
+        long,
+        env = "MNIX_LISTEN",
+        value_delimiter = ',',
+        default_value = "127.0.0.1:8080"
+    )]
+    listen: Vec<SocketAddr>,
 
     /// File containing the admin API token.
     #[arg(long, env = "MNIX_ADMIN_TOKEN_FILE")]
@@ -140,6 +148,17 @@ struct ServeArgs {
     /// How long fetching and building a deployment may take.
     #[arg(long, value_parser = humantime::parse_duration, default_value = "1h")]
     build_timeout: Duration,
+
+    /// Where deployments build systems: on the server (signed, and pushed to
+    /// the Attic cache if there is one), or on each machine from source the
+    /// server sends.
+    #[arg(long, value_enum, env = "MNIX_BUILD_ON", default_value = "server")]
+    build_on: build::BuildOn,
+
+    /// JSON file declaring repositories and machines to set up at start
+    /// (written by the NixOS and nix-darwin modules).
+    #[arg(long, env = "MNIX_PROVISION_FILE")]
+    provision: Option<PathBuf>,
 
     /// The built web UI to serve at `/`.
     #[arg(long, env = "MNIX_WEB_DIR")]
@@ -253,6 +272,20 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let organization = store
         .ensure_organization(DEFAULT_ORGANIZATION, OffsetDateTime::now_utc())
         .await?;
+    let ssh_keys = match &args.provision {
+        Some(path) => {
+            let provision = provision::Provision::load(path)?;
+            provision::apply(
+                &*store,
+                &organization,
+                &provision,
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .context("applying the declared repositories and machines")?
+        }
+        None => Default::default(),
+    };
     auth::ensure_initial_user(
         &*store,
         organization.id,
@@ -288,6 +321,9 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             state_dir: args.state_dir.clone(),
             signing_key,
             attic,
+            build_on: args.build_on,
+            ssh_keys,
+            git_lock: tokio::sync::Mutex::new(()),
         },
         queue: tokio::sync::Notify::new(),
         activations: tokio::sync::watch::channel(0).0,
@@ -301,23 +337,65 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     tokio::spawn(deploy::run_sweeper(state.clone()));
     tokio::spawn(auth::delete_expired_sessions(state.clone()));
 
-    let listener = tokio::net::TcpListener::bind(args.listen)
+    let (first, others) = args
+        .listen
+        .split_first()
+        .context("--listen needs an address")?;
+    let listener = tokio::net::TcpListener::bind(first)
         .await
-        .with_context(|| format!("listening on {}", args.listen))?;
+        .with_context(|| format!("listening on {first}"))?;
     tracing::info!(
-        "mnix-server {} listening on {} ({:?} database)",
+        "mnix-server {} listening on {first} ({:?} database)",
         env!("CARGO_PKG_VERSION"),
-        args.listen,
         state.store.backend()
     );
-    axum::serve(listener, app::router(state))
+    let router = app::router(state.clone());
+    let mut servers = tokio::task::JoinSet::new();
+    for &address in others {
+        let router = router.clone();
+        let mut stopping = state.shutdown.clone();
+        servers.spawn(async move {
+            let listener = tokio::select! {
+                listener = bind_eventually(address) => listener,
+                _ = stopping.wait_for(|s| *s) => return Ok(()),
+            };
+            tracing::info!("listening on {address}");
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    let _ = stopping.wait_for(|s| *s).await;
+                })
+                .await
+        });
+    }
+    axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
             tracing::info!("shutting down");
             let _ = shutdown_tx.send(true);
         })
         .await?;
+    while let Some(result) = servers.join_next().await {
+        result??;
+    }
     Ok(())
+}
+
+/// Binds `address`, retrying while it does not exist yet (a VPN that is not
+/// up) or is taken.
+async fn bind_eventually(address: SocketAddr) -> tokio::net::TcpListener {
+    let mut warned = false;
+    loop {
+        match tokio::net::TcpListener::bind(address).await {
+            Ok(listener) => return listener,
+            Err(e) => {
+                if !warned {
+                    tracing::warn!("cannot listen on {address} yet ({e}); retrying");
+                    warned = true;
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
 }
 
 async fn shutdown_signal() {

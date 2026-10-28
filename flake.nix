@@ -123,6 +123,11 @@
         server = import ./nix/modules/server.nix self;
       };
 
+      darwinModules = {
+        agent = import ./nix/modules/darwin/agent.nix self;
+        server = import ./nix/modules/darwin/server.nix self;
+      };
+
       checks = forAllSystems (
         system: pkgs:
         let
@@ -131,7 +136,14 @@
         in
         rust.packages
         // {
-          cargo-test = craneLib.cargoTest (commonArgs // { inherit cargoArtifacts; });
+          cargo-test = craneLib.cargoTest (
+            commonArgs
+            // {
+              inherit cargoArtifacts;
+              # Source mirrors and bundles (agent and server tests).
+              nativeCheckInputs = [ pkgs.git ];
+            }
+          );
 
           cargo-clippy = craneLib.cargoClippy (
             commonArgs
@@ -142,6 +154,37 @@
           );
 
           cargo-fmt = craneLib.cargoFmt { inherit (commonArgs) src pname version; };
+
+          # release-please bumps these together (release-please-config.json).
+          versions =
+            let
+              found = {
+                "Cargo.toml" = (lib.importTOML ./Cargo.toml).workspace.package.version;
+                "version.txt" = lib.trim (builtins.readFile ./version.txt);
+                ".release-please-manifest.json" = (lib.importJSON ./.release-please-manifest.json).".";
+                "web/package.json" = (lib.importJSON ./web/package.json).version;
+                "web/package-lock.json" = (lib.importJSON ./web/package-lock.json).version;
+                "web/package-lock.json (packages.\"\")" =
+                  (lib.importJSON ./web/package-lock.json).packages."".version;
+              }
+              // lib.listToAttrs (
+                map (p: lib.nameValuePair "Cargo.lock (${p.name})" p.version) (
+                  lib.filter (p: lib.hasPrefix "mnix-" p.name) (lib.importTOML ./Cargo.lock).package
+                )
+              );
+              expected = found."Cargo.toml";
+              wrong = lib.filterAttrs (_: v: v != expected) found;
+            in
+            pkgs.runCommand "manage-nix-versions" { } (
+              if wrong == { } then
+                "touch $out"
+              else
+                ''
+                  echo "versions differ from Cargo.toml (${expected}):" >&2
+                  ${lib.concatMapStrings (name: "echo '  ${name}: ${wrong.${name}}' >&2\n") (lib.attrNames wrong)}
+                  exit 1
+                ''
+            );
 
           # The store suite against a throwaway Postgres server. SQLite runs in
           # `cargo-test`.
@@ -191,6 +234,7 @@
             inherit self pkgs;
             backend = "postgres";
           };
+          vm-fleet = import ./nix/tests/fleet.nix { inherit self pkgs; };
           vm-web = import ./nix/tests/deploy.nix {
             inherit self pkgs;
             backend = "sqlite";

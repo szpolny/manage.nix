@@ -1,4 +1,5 @@
-//! The agent-facing endpoints: enrollment and the WebSocket session.
+//! The agent-facing endpoints: enrollment, the WebSocket session, and the
+//! source of systems machines build themselves.
 //!
 //! Besides heartbeats and facts, a session hands the machine's released
 //! activations to its agent (again on every new session, until the agent
@@ -9,11 +10,11 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{Path, RawQuery, State};
 use axum::http::{header, HeaderMap};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
-use mnix_protocol::api::{DeploymentKind, EnrollRequest, EnrollResponse};
+use mnix_protocol::api::{DeploymentKind, EnrollRequest, EnrollResponse, MachineDeploymentStatus};
 use mnix_protocol::{
     Activate, ActivationPhase, ActivationReport, ActivationTarget, AgentMessage, Hello,
     ServerMessage, PROTOCOL_VERSION,
@@ -74,23 +75,78 @@ pub async fn enroll(
     ))
 }
 
+/// The machine whose credential the request carries.
+async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<Machine, ApiError> {
+    let credential = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(secret::bearer)
+        .ok_or_else(|| ApiError::unauthorized("missing machine credential"))?;
+    state
+        .store
+        .machine_by_credential(&secret::hash(credential))
+        .await?
+        .filter(|m| m.organization_id == state.organization.id)
+        .ok_or_else(|| ApiError::unauthorized("unknown machine credential"))
+}
+
+/// `GET /api/agent/deployments/:id/source?have=<commit>...`: a Git bundle
+/// of the deployment's commit, for a machine that is to build it.
+pub async fn source(
+    State(state): State<AppStateRef>,
+    headers: HeaderMap,
+    Path(deployment_id): Path<Uuid>,
+    RawQuery(query): RawQuery,
+) -> Result<Response, ApiError> {
+    let machine = authenticate(&state, &headers).await?;
+    let deployment = state
+        .store
+        .deployment(deployment_id)
+        .await?
+        .filter(|d| {
+            d.machines.iter().any(|m| {
+                m.machine_id == machine.id && m.status == MachineDeploymentStatus::Activating
+            })
+        })
+        .ok_or_else(|| ApiError::not_found("activation"))?;
+    let (Some(repository_id), Some(commit)) = (deployment.repository_id, &deployment.commit_id)
+    else {
+        return Err(ApiError::not_found("source"));
+    };
+    let haves: Vec<String> = query
+        .as_deref()
+        .unwrap_or_default()
+        .split('&')
+        .filter_map(|pair| pair.strip_prefix("have="))
+        .take(16)
+        .map(str::to_owned)
+        .collect();
+    let bundle = state
+        .builder
+        .bundle(repository_id, commit, &haves)
+        .await
+        .map_err(|e| {
+            tracing::error!("deployment {deployment_id}: bundling {commit}: {e:#}");
+            ApiError::new(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "could not bundle the source",
+            )
+        })?;
+    tracing::info!(
+        "{}: deployment {deployment_id}: sending {} KiB of source",
+        machine.name,
+        bundle.len() / 1024
+    );
+    Ok(([(header::CONTENT_TYPE, "application/x-git-bundle")], bundle).into_response())
+}
+
 /// `GET /api/agent/ws`: authenticate the machine, then run its session.
 pub async fn connect(
     State(state): State<AppStateRef>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    let credential = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(secret::bearer)
-        .ok_or_else(|| ApiError::unauthorized("missing machine credential"))?;
-    let machine = state
-        .store
-        .machine_by_credential(&secret::hash(credential))
-        .await?
-        .filter(|m| m.organization_id == state.organization.id)
-        .ok_or_else(|| ApiError::unauthorized("unknown machine credential"))?;
+    let machine = authenticate(&state, &headers).await?;
     Ok(ws
         .max_message_size(MAX_MESSAGE_SIZE)
         .on_upgrade(move |socket| async move {
@@ -311,12 +367,20 @@ impl Session<'_> {
             if !self.sent.insert(activation.deployment_id) {
                 continue;
             }
-            let target = match (activation.kind, activation.store_path) {
-                (DeploymentKind::Rollback, _) => ActivationTarget::PreviousGeneration,
-                (DeploymentKind::Deploy, Some(store_path)) => {
+            let target = match (
+                activation.kind,
+                activation.store_path,
+                activation.attribute,
+                activation.commit_id,
+            ) {
+                (DeploymentKind::Rollback, ..) => ActivationTarget::PreviousGeneration,
+                (DeploymentKind::Deploy, Some(store_path), ..) => {
                     ActivationTarget::System { store_path }
                 }
-                (DeploymentKind::Deploy, None) => continue,
+                (DeploymentKind::Deploy, None, Some(attribute), Some(commit)) => {
+                    ActivationTarget::Build { commit, attribute }
+                }
+                (DeploymentKind::Deploy, ..) => continue,
             };
             tracing::info!(
                 "{}: sending deployment {}",

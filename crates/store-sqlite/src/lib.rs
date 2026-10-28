@@ -14,7 +14,7 @@ use mnix_store_core::{
     disconnect_reason, group_columns, log_source, new_log_text, parse_enum, truncate_to_micros,
     Backend, ClosedSession, Deployment, DeploymentMachine, Error, Event, Finished, LogEntry,
     Machine, MachineDeploymentRecord, MachineOutcome, NewDeployment, NewEnrollmentToken,
-    NewLogEntry, NewSession, NewUserSession, Organization, PendingActivation, Redemption,
+    NewLogEntry, NewSession, NewUserSession, Organization, PendingActivation, Redemption, Release,
     Repository, Result, Store, SystemRevision, Table, User, MIGRATIONS_TABLE,
 };
 use sqlx::migrate::Migrator;
@@ -658,6 +658,18 @@ impl Store for SqliteStore {
         })
     }
 
+    async fn set_repository_url(&self, repository_id: Uuid, url: &str) -> Result<()> {
+        let repository_id = id(repository_id);
+        sqlx::query!(
+            "UPDATE repositories SET url = ? WHERE id = ?",
+            url,
+            repository_id
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn repositories(&self, organization_id: Uuid) -> Result<Vec<Repository>> {
         let org = id(organization_id);
         sqlx::query_as!(
@@ -900,18 +912,26 @@ impl Store for SqliteStore {
         &self,
         deployment_id: Uuid,
         machine_id: Uuid,
-        store_path: &str,
-        signatures: &[String],
+        release: &Release,
         now: OffsetDateTime,
     ) -> Result<()> {
         let (deployment_id, machine_id, now) = (id(deployment_id), id(machine_id), ts(now));
+        let (store_path, signatures, attribute) = match release {
+            Release::System {
+                store_path,
+                signatures,
+            } => (Some(store_path.as_str()), signatures.as_slice(), None),
+            Release::Build { attribute } => (None, &[][..], Some(attribute.as_str())),
+        };
         let signatures = serde_json::to_string(signatures)?;
         sqlx::query!(
             "UPDATE deployment_machines
-             SET status = 'activating', store_path = ?, signatures = ?, released_at = ?
+             SET status = 'activating', store_path = ?, signatures = ?, attribute = ?,
+                 released_at = ?
              WHERE deployment_id = ? AND machine_id = ? AND finished_at IS NULL",
             store_path,
             signatures,
+            attribute,
             now,
             deployment_id,
             machine_id
@@ -924,7 +944,8 @@ impl Store for SqliteStore {
     async fn pending_activations(&self, machine_id: Uuid) -> Result<Vec<PendingActivation>> {
         let machine_id = id(machine_id);
         sqlx::query!(
-            "SELECT dm.deployment_id, d.kind, d.mode, dm.store_path, dm.signatures
+            "SELECT dm.deployment_id, d.kind, d.mode, dm.store_path, dm.signatures, dm.attribute,
+                    d.commit_id
              FROM deployment_machines AS dm JOIN deployments AS d ON d.id = dm.deployment_id
              WHERE dm.machine_id = ? AND dm.status = 'activating' AND dm.accepted_at IS NULL
              ORDER BY dm.released_at",
@@ -940,6 +961,8 @@ impl Store for SqliteStore {
                 mode: parse_enum(&row.mode, ActivationMode::parse)?,
                 store_path: row.store_path,
                 signatures: serde_json::from_str(&row.signatures)?,
+                attribute: row.attribute,
+                commit_id: row.commit_id,
             })
         })
         .collect()

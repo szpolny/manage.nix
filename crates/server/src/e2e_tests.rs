@@ -44,6 +44,21 @@ async fn launch(
     activation_timeout: Duration,
     web_dir: Option<std::path::PathBuf>,
 ) -> Server {
+    launch_building_on(
+        heartbeat_timeout,
+        activation_timeout,
+        web_dir,
+        crate::build::BuildOn::Server,
+    )
+    .await
+}
+
+async fn launch_building_on(
+    heartbeat_timeout: Duration,
+    activation_timeout: Duration,
+    web_dir: Option<std::path::PathBuf>,
+    build_on: crate::build::BuildOn,
+) -> Server {
     let dir = tempfile::tempdir().unwrap();
     let url = format!("sqlite://{}", dir.path().join("db.sqlite").display());
     let store = mnix_store::connect(&url).await.unwrap();
@@ -72,6 +87,9 @@ async fn launch(
             state_dir: dir.path().to_owned(),
             signing_key: mnix_nix::SecretKey::generate("mnix-test-1").unwrap(),
             attic: None,
+            build_on,
+            ssh_keys: Default::default(),
+            git_lock: tokio::sync::Mutex::new(()),
         },
         queue: tokio::sync::Notify::new(),
         activations: tokio::sync::watch::channel(0).0,
@@ -375,7 +393,9 @@ fn facts(hostname: &str) -> Facts {
         hostname: hostname.to_owned(),
         current_system: "/nix/store/00000000000000000000000000000000-nixos-system-a".to_owned(),
         booted_system: None,
-        nixos_version: Some("26.11".to_owned()),
+        os: mnix_protocol::Os::Nixos,
+        os_version: Some("26.11".to_owned()),
+        configuration_revision: None,
         kernel: "6.12.0".to_owned(),
         reboot_required: false,
         generations: Vec::new(),
@@ -1154,8 +1174,10 @@ async fn machines_show_revisions_history_and_generations() {
         .release_activation(
             deployment_id,
             machine_id,
-            new,
-            &[],
+            &mnix_store::Release::System {
+                store_path: new.to_owned(),
+                signatures: Vec::new(),
+            },
             OffsetDateTime::now_utc(),
         )
         .await
@@ -1333,4 +1355,184 @@ async fn the_web_ui_is_served_with_a_fallback_to_index() {
     // The API still requires authentication.
     let response = server.raw("GET", "/api/machines", &[], None).await;
     assert_eq!(response.status, 401);
+}
+
+/// Runs git in `dir`, returning its trimmed output.
+fn git(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+}
+
+impl Server {
+    /// GETs `path` with a machine credential; returns the status and body.
+    async fn download(&self, path: &str, credential: Option<&str>) -> (u16, Vec<u8>) {
+        let url = format!("http://{}{path}", self.base);
+        let auth = credential.map(|c| format!("Bearer {c}"));
+        tokio::task::spawn_blocking(move || {
+            let agent: ureq::Agent = ureq::Agent::config_builder()
+                .http_status_as_error(false)
+                .build()
+                .into();
+            let mut request = agent.get(&url);
+            if let Some(auth) = &auth {
+                request = request.header("Authorization", auth);
+            }
+            let mut response = request.call().unwrap();
+            let status = response.status().as_u16();
+            (status, response.body_mut().read_to_vec().unwrap())
+        })
+        .await
+        .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn machines_build_from_source_the_server_sends() {
+    let server = launch_building_on(
+        Duration::from_secs(30),
+        Duration::from_secs(600),
+        None,
+        crate::build::BuildOn::Machine,
+    )
+    .await;
+    let work = server._dir.path().join("infra");
+    std::fs::create_dir(&work).unwrap();
+    git(&work, &["init", "--quiet"]);
+    std::fs::write(work.join("flake.nix"), "{ outputs = _: { }; }\n").unwrap();
+    git(&work, &["add", "flake.nix"]);
+    git(&work, &["commit", "--quiet", "-m", "one"]);
+    let first = git(&work, &["rev-parse", "HEAD"]);
+    std::fs::write(work.join("README"), "two\n").unwrap();
+    git(&work, &["add", "README"]);
+    git(&work, &["commit", "--quiet", "-m", "two"]);
+    let second = git(&work, &["rev-parse", "HEAD"]);
+
+    let credential = server.enrolled("web-1").await;
+    let other = server.enrolled("db-1").await;
+    let (status, body) = server
+        .admin(
+            "POST",
+            "/api/repositories",
+            Some(json!({ "name": "infra", "url": work.to_str().unwrap() })),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    let (status, body) = server
+        .admin(
+            "PUT",
+            "/api/machines/web-1/configuration",
+            Some(json!({ "repository": "infra" })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let mut ws = server.session(&credential, "web-1").await;
+    let (status, body) = server
+        .admin(
+            "POST",
+            "/api/deployments",
+            Some(json!({ "targets": ["web-1"], "rev": second })),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    let deployment_id = body["id"].as_str().unwrap().to_owned();
+
+    let activate = loop {
+        match receive(&mut ws).await {
+            Some(ServerMessage::Activate(activate)) => break activate,
+            Some(_) => {}
+            None => panic!("the session closed"),
+        }
+    };
+    assert_eq!(activate.deployment_id, deployment_id);
+    assert!(activate.signatures.is_empty());
+    let ActivationTarget::Build { commit, attribute } = &activate.target else {
+        panic!("expected a build, got {:?}", activate.target);
+    };
+    assert_eq!(*commit, second);
+    assert_eq!(
+        attribute,
+        "nixosConfigurations.\"web-1\".config.system.build.toplevel"
+    );
+
+    // Only the machine the deployment is building on may download it.
+    let path = mnix_protocol::agent_source_path(&deployment_id);
+    assert_eq!(server.download(&path, None).await.0, 401);
+    assert_eq!(server.download(&path, Some(&other)).await.0, 404);
+    let (status, full) = server.download(&path, Some(&credential)).await;
+    assert_eq!(status, 200);
+    let (status, partial) = server
+        .download(
+            &format!("{path}?have={first}&have=nonsense"),
+            Some(&credential),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert!(partial.len() < full.len());
+
+    // The agent's side: fetch the full bundle, then check that the partial
+    // one applies on top of the first commit alone.
+    let agent = server._dir.path().join("agent.git");
+    std::fs::create_dir(&agent).unwrap();
+    git(&agent, &["init", "--quiet", "--bare"]);
+    let bundle = server._dir.path().join("source.bundle");
+    std::fs::write(&bundle, &full).unwrap();
+    let refspec = format!("{}:refs/heads/built", mnix_protocol::SOURCE_BUNDLE_REF);
+    git(
+        &agent,
+        &["fetch", "--quiet", bundle.to_str().unwrap(), &refspec],
+    );
+    assert_eq!(git(&agent, &["rev-parse", "built"]), second);
+    let older = server._dir.path().join("older.git");
+    git(
+        server._dir.path(),
+        &[
+            "clone",
+            "--quiet",
+            "--bare",
+            work.to_str().unwrap(),
+            "older.git",
+        ],
+    );
+    git(&older, &["update-ref", "-d", "HEAD"]);
+    for branch in git(&older, &["for-each-ref", "--format=%(refname)"]).lines() {
+        git(&older, &["update-ref", "-d", branch]);
+    }
+    git(&older, &["update-ref", "refs/heads/old", &first]);
+    std::fs::write(&bundle, &partial).unwrap();
+    git(
+        &older,
+        &["fetch", "--quiet", bundle.to_str().unwrap(), &refspec],
+    );
+    assert_eq!(git(&older, &["rev-parse", "built"]), second);
+
+    ws.send(text(&AgentMessage::ActivationStatus {
+        deployment_id: deployment_id.clone(),
+        phase: ActivationPhase::Building,
+    }))
+    .await
+    .unwrap();
+    let built = "/nix/store/11111111111111111111111111111111-nixos-system-web-1";
+    ws.send(text(&AgentMessage::ActivationResult {
+        deployment_id: deployment_id.clone(),
+        report: succeeded(built),
+    }))
+    .await
+    .unwrap();
+    let deployment = server
+        .wait_for_deployment(&deployment_id, DeploymentStatus::Succeeded)
+        .await;
+    assert_eq!(deployment.machines[0].store_path.as_deref(), Some(built));
+    // Once it finished, the source is not served any more.
+    assert_eq!(server.download(&path, Some(&credential)).await.0, 404);
 }

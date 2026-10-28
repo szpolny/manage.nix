@@ -1,6 +1,7 @@
-//! [`Host`] for a real NixOS machine, using the Nix and systemd command-line
-//! tools. Only fixed commands with validated store paths as arguments are
-//! run; nothing goes through a shell.
+//! [`Host`] for the machine the agent runs on, NixOS or nix-darwin, using
+//! the Nix, systemd, and launchd command-line tools. Only fixed commands
+//! with validated store paths as arguments are run; nothing goes through a
+//! shell.
 
 use std::ffi::OsStr;
 use std::os::fd::AsFd;
@@ -9,6 +10,7 @@ use std::process::{Command, Stdio};
 
 use anyhow::Context;
 use mnix_nix::{PathInfo, StorePath};
+use mnix_protocol::{ActivationMode, Os};
 
 use crate::activate::{Host, ProfileGeneration};
 use crate::config::{AgentConfig, HealthChecks};
@@ -16,11 +18,23 @@ use crate::health;
 
 pub const SYSTEM_PROFILE: &str = "/nix/var/nix/profiles/system";
 pub const CURRENT_SYSTEM: &str = "/run/current-system";
+/// NixOS only; nix-darwin has no booted system apart from the current one.
 pub const BOOTED_SYSTEM: &str = "/run/booted-system";
 
-pub struct NixosHost;
+/// The system this agent was built for.
+pub const OS: Os = if cfg!(target_os = "macos") {
+    Os::Darwin
+} else {
+    Os::Nixos
+};
 
-impl Host for NixosHost {
+pub struct LocalHost;
+
+impl Host for LocalHost {
+    fn os(&self) -> Os {
+        OS
+    }
+
     fn realise(&self, path: &StorePath) -> anyhow::Result<()> {
         run(Command::new("nix-store")
             .arg("--realise")
@@ -28,12 +42,53 @@ impl Host for NixosHost {
         .map(drop)
     }
 
+    fn build(&self, installable: &str) -> anyhow::Result<StorePath> {
+        tracing::info!("building {installable}");
+        // The build log goes to our stderr (the activation log); stdout is
+        // the result.
+        let stderr = std::io::stderr().as_fd().try_clone_to_owned()?;
+        let output = Command::new("nix")
+            .args([
+                "--extra-experimental-features",
+                "nix-command flakes",
+                "build",
+                "--print-build-logs",
+                "--print-out-paths",
+                "--no-link",
+                "--no-write-lock-file",
+                "--",
+            ])
+            .arg(installable)
+            .stdin(Stdio::null())
+            .stderr(stderr)
+            .output()
+            .context("running nix build")?;
+        anyhow::ensure!(
+            output.status.success(),
+            "nix build failed ({})",
+            output.status
+        );
+        let out = String::from_utf8_lossy(&output.stdout);
+        let path = out
+            .lines()
+            .last()
+            .map(str::trim)
+            .context("nix build printed no store path")?;
+        StorePath::parse(path)
+    }
+
     fn path_info(&self, path: &StorePath) -> anyhow::Result<PathInfo> {
         mnix_nix::query_path_info(path)
     }
 
-    fn is_nixos_system(&self, path: &StorePath) -> bool {
-        switch_to_configuration_path(path).is_file()
+    fn is_system(&self, path: &StorePath) -> bool {
+        match OS {
+            Os::Nixos => switch_to_configuration_path(path).is_file(),
+            Os::Darwin => {
+                path.as_path().join("activate").is_file()
+                    && path.as_path().join("darwin-version").is_file()
+            }
+        }
     }
 
     fn agent_config(&self, root: &Path) -> anyhow::Result<Option<AgentConfig>> {
@@ -80,39 +135,75 @@ impl Host for NixosHost {
     }
 
     fn switch_to_configuration(&self, system: &StorePath, action: &str) -> anyhow::Result<()> {
-        tracing::info!(
-            "{} {action}",
-            switch_to_configuration_path(system).display()
-        );
-        // Like nixos-rebuild, run it in its own transient unit so that it
-        // finishes even if the agent is stopped or restarted by the switch.
-        // Its output goes to our stderr; stdout is reserved for the report.
-        let stderr = std::io::stderr().as_fd().try_clone_to_owned()?;
-        let status = Command::new("systemd-run")
-            .args(["-E", "LOCALE_ARCHIVE", "-E", "NIXOS_INSTALL_BOOTLOADER"])
-            .args(["--collect", "--no-ask-password", "--pipe", "--quiet"])
-            .args([
-                "--service-type=exec",
-                "--unit=mnix-switch-to-configuration",
-                "--",
-            ])
-            .arg(switch_to_configuration_path(system))
-            .arg(action)
-            .stdin(Stdio::null())
-            .stdout(stderr)
-            .status()
-            .context("running systemd-run")?;
-        anyhow::ensure!(
-            status.success(),
-            "switch-to-configuration {action} of {system} failed ({status})"
-        );
-        Ok(())
+        match OS {
+            Os::Nixos => nixos_switch(system, action),
+            Os::Darwin => darwin_activate(system, action),
+        }
     }
 
     fn wait_until_healthy(&self, checks: &HealthChecks) -> Result<(), Vec<String>> {
         health::wait_until_healthy(checks.timeout(), checks.interval(), || {
             health::run_round(checks)
         })
+    }
+}
+
+/// Whether `mode` can be done on this kind of system.
+pub fn supports(os: Os, mode: ActivationMode) -> bool {
+    os == Os::Nixos || mode != ActivationMode::Boot
+}
+
+fn nixos_switch(system: &StorePath, action: &str) -> anyhow::Result<()> {
+    tracing::info!(
+        "{} {action}",
+        switch_to_configuration_path(system).display()
+    );
+    // Like nixos-rebuild, run it in its own transient unit so that it
+    // finishes even if the agent is stopped or restarted by the switch.
+    // Its output goes to our stderr; stdout is reserved for the report.
+    let stderr = std::io::stderr().as_fd().try_clone_to_owned()?;
+    let status = Command::new("systemd-run")
+        .args(["-E", "LOCALE_ARCHIVE", "-E", "NIXOS_INSTALL_BOOTLOADER"])
+        .args(["--collect", "--no-ask-password", "--pipe", "--quiet"])
+        .args([
+            "--service-type=exec",
+            "--unit=mnix-switch-to-configuration",
+            "--",
+        ])
+        .arg(switch_to_configuration_path(system))
+        .arg(action)
+        .stdin(Stdio::null())
+        .stdout(stderr)
+        .status()
+        .context("running systemd-run")?;
+    anyhow::ensure!(
+        status.success(),
+        "switch-to-configuration {action} of {system} failed ({status})"
+    );
+    Ok(())
+}
+
+/// nix-darwin's equivalent of `switch-to-configuration`: `<system>/activate`
+/// makes it the running system (`switch` and `test`, which differ only in
+/// the profile, set beforehand). There is no boot default to install, so
+/// `boot` does nothing; it is used only to restore a profile generation.
+fn darwin_activate(system: &StorePath, action: &str) -> anyhow::Result<()> {
+    match action {
+        "boot" => Ok(()),
+        "switch" | "test" => {
+            let activate = system.as_path().join("activate");
+            tracing::info!("{}", activate.display());
+            // Already outside the agent's launchd job (see `crate::job`).
+            let stderr = std::io::stderr().as_fd().try_clone_to_owned()?;
+            let status = Command::new(&activate)
+                .stdin(Stdio::null())
+                .stdout(stderr)
+                .status()
+                .with_context(|| format!("running {}", activate.display()))?;
+            anyhow::ensure!(status.success(), "activating {system} failed ({status})");
+            Ok(())
+        }
+        other => anyhow::bail!("nix-darwin cannot {other} a system"),
     }
 }
 

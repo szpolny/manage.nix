@@ -149,7 +149,7 @@ pkgs.testers.runNixOSTest {
             node.systemctl("restart mnix-agent.service")
         for node in [machine1, machine2]:
             wait_for_status(node.name, "online")
-            node.succeed("test $(stat -c %a /var/lib/manage-nix/credential.json) = 600")
+            node.succeed("test $(stat -c %a /var/lib/manage-nix/servers/default/credential.json) = 600")
 
     with subtest("online machines report correct facts"):
         listed = listed_machines()

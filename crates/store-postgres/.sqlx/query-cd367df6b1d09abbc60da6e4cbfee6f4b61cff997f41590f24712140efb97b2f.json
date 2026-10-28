@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT dm.deployment_id, d.kind, d.mode, dm.store_path, dm.signatures, dm.attribute,\n                    d.commit_id\n             FROM deployment_machines AS dm JOIN deployments AS d ON d.id = dm.deployment_id\n             WHERE dm.machine_id = $1 AND dm.status = 'activating' AND dm.accepted_at IS NULL\n             ORDER BY dm.released_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "deployment_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "mode",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "store_path",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "signatures",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 5,
+        "name": "attribute",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "commit_id",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "cd367df6b1d09abbc60da6e4cbfee6f4b61cff997f41590f24712140efb97b2f"
+}

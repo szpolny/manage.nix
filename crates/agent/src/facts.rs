@@ -1,20 +1,31 @@
 //! Collecting [`Facts`] about the running machine.
 
 use std::path::Path;
+use std::process::{Command, Stdio};
+use std::sync::Mutex;
 
 use anyhow::Context;
-use mnix_protocol::{Facts, Generation};
+use mnix_protocol::{Facts, Generation, Os};
 
-use crate::host::{generation_number, BOOTED_SYSTEM, CURRENT_SYSTEM, SYSTEM_PROFILE};
+use crate::host::{generation_number, BOOTED_SYSTEM, CURRENT_SYSTEM, OS, SYSTEM_PROFILE};
 use mnix_nix::StorePath;
 
 pub fn collect() -> anyhow::Result<Facts> {
     let current = StorePath::resolve(Path::new(CURRENT_SYSTEM))?;
-    let booted = StorePath::resolve(Path::new(BOOTED_SYSTEM)).ok();
+    let booted = match OS {
+        Os::Nixos => StorePath::resolve(Path::new(BOOTED_SYSTEM)).ok(),
+        Os::Darwin => None,
+    };
+    let version_file = match OS {
+        Os::Nixos => "nixos-version",
+        Os::Darwin => "darwin-version",
+    };
     Ok(Facts {
-        hostname: read_trimmed("/proc/sys/kernel/hostname")?,
-        kernel: read_trimmed("/proc/sys/kernel/osrelease")?,
-        nixos_version: read_trimmed(current.as_path().join("nixos-version")).ok(),
+        hostname: hostname()?,
+        os: OS,
+        kernel: kernel()?,
+        os_version: read_trimmed(current.as_path().join(version_file)).ok(),
+        configuration_revision: configuration_revision(&current),
         reboot_required: booted
             .as_ref()
             .is_some_and(|booted| reboot_required(booted.as_path(), current.as_path())),
@@ -22,6 +33,66 @@ pub fn collect() -> anyhow::Result<Facts> {
         booted_system: booted.map(|b| b.to_string()),
         generations: generations(Path::new(SYSTEM_PROFILE))?,
     })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn hostname() -> anyhow::Result<String> {
+    read_trimmed("/proc/sys/kernel/hostname")
+}
+
+#[cfg(target_os = "macos")]
+fn hostname() -> anyhow::Result<String> {
+    output(Command::new("/bin/hostname").arg("-s"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn kernel() -> anyhow::Result<String> {
+    read_trimmed("/proc/sys/kernel/osrelease")
+}
+
+#[cfg(target_os = "macos")]
+fn kernel() -> anyhow::Result<String> {
+    output(Command::new("/usr/bin/uname").arg("-r"))
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn output(command: &mut Command) -> anyhow::Result<String> {
+    let out = command.stdin(Stdio::null()).output()?;
+    anyhow::ensure!(out.status.success(), "{:?} failed", command.get_program());
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+/// The system's `configurationRevision`, from `nixos-version --json` or
+/// `darwin-version --json`. Asked once per system: facts are collected at
+/// every heartbeat.
+fn configuration_revision(system: &StorePath) -> Option<String> {
+    static CACHE: Mutex<Option<(String, Option<String>)>> = Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((path, revision)) = cache.as_ref() {
+        if path == system.as_str() {
+            return revision.clone();
+        }
+    }
+    let program = system.as_path().join("sw/bin").join(match OS {
+        Os::Nixos => "nixos-version",
+        Os::Darwin => "darwin-version",
+    });
+    let revision = Command::new(program)
+        .arg("--json")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| parse_revision(&out.stdout));
+    *cache = Some((system.to_string(), revision.clone()));
+    revision
+}
+
+fn parse_revision(json: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(json).ok()?;
+    let revision = value.get("configurationRevision")?.as_str()?.trim();
+    (!revision.is_empty()).then(|| revision.to_owned())
 }
 
 fn read_trimmed(path: impl AsRef<Path>) -> anyhow::Result<String> {
@@ -77,4 +148,19 @@ pub fn generations(profile: &Path) -> anyhow::Result<Vec<Generation>> {
     }
     generations.sort_by_key(|g| g.number);
     Ok(generations)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn revisions_come_from_the_version_json() {
+        use super::parse_revision;
+        assert_eq!(
+            parse_revision(br#"{"nixosVersion":"26.11","configurationRevision":"abc"}"#),
+            Some("abc".to_owned())
+        );
+        assert_eq!(parse_revision(br#"{"darwinLabel":"x"}"#), None);
+        assert_eq!(parse_revision(br#"{"configurationRevision":""}"#), None);
+        assert_eq!(parse_revision(b"not json"), None);
+    }
 }

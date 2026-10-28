@@ -1,13 +1,13 @@
-//! The agent's configuration file, written by the NixOS module to
-//! `/etc/manage-nix/agent.json`.
+//! The agent's configuration file, written by the NixOS and nix-darwin
+//! modules to `/etc/manage-nix/agent.json`.
 //!
-//! The agent reads two copies. Trusted keys always come from the *running*
-//! system, so a new configuration cannot vouch for itself. Health checks come
-//! from the *target* system, because the new configuration defines what
-//! healthy means for it.
+//! The agent reads two copies. Trusted keys and servers always come from the
+//! *running* system, so a new configuration cannot vouch for itself. Health
+//! checks come from the *target* system, because the new configuration
+//! defines what healthy means for it.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -28,6 +28,56 @@ pub struct AgentConfig {
     pub trusted_public_keys: Vec<String>,
     #[serde(default)]
     pub health_checks: HealthChecks,
+    /// The control planes `mnix-agent run` connects to, all at once.
+    #[serde(default)]
+    pub servers: Vec<ServerConfig>,
+}
+
+/// One control plane the agent connects to.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerConfig {
+    /// Names the server's credential and activations in the state
+    /// directory: letters, digits, `-`, and `_`.
+    pub name: String,
+    /// The base URL, `https://...` or `http://...`.
+    pub url: String,
+    /// The one-time (or pre-shared) enrollment token, read only until the
+    /// machine has enrolled with this server.
+    #[serde(default)]
+    pub enrollment_token_file: Option<PathBuf>,
+    /// Whether this server may have the machine build a system from source
+    /// it sends ([`mnix_protocol::ActivationTarget::Build`]). Building and
+    /// activating a configuration runs its code as root, so this trusts the
+    /// server as much as root.
+    #[serde(default)]
+    pub allow_builds: bool,
+}
+
+impl ServerConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            is_valid_name(&self.name),
+            "invalid server name {:?}: use letters, digits, '-', and '_'",
+            self.name
+        );
+        anyhow::ensure!(
+            self.url.starts_with("https://") || self.url.starts_with("http://"),
+            "server {}: URL {:?} must start with https:// or http://",
+            self.name,
+            self.url
+        );
+        Ok(())
+    }
+}
+
+/// A server name, safe as a file name.
+pub fn is_valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -126,6 +176,38 @@ mod tests {
         assert_eq!(config.health_checks.timeout(), Duration::from_secs(30));
         assert_eq!(config.health_checks.commands["db"], "/nix/store/x-db");
         assert!(!config.health_checks.is_empty());
+        assert!(config.servers.is_empty());
+    }
+
+    #[test]
+    fn parses_servers() {
+        let config = AgentConfig::parse(
+            r#"{
+              "version": 1,
+              "servers": [
+                {"name": "obsidian", "url": "http://100.64.0.1:8080", "allow_builds": true,
+                 "enrollment_token_file": "/run/agenix/token"},
+                {"name": "quartz", "url": "https://quartz.example"}
+              ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.servers.len(), 2);
+        assert!(config.servers[0].allow_builds);
+        assert!(!config.servers[1].allow_builds);
+        assert_eq!(config.servers[1].enrollment_token_file, None);
+        for server in &config.servers {
+            server.validate().unwrap();
+        }
+        let bad = |name: &str, url: &str| ServerConfig {
+            name: name.to_owned(),
+            url: url.to_owned(),
+            enrollment_token_file: None,
+            allow_builds: false,
+        };
+        assert!(bad("../x", "https://x").validate().is_err());
+        assert!(bad("", "https://x").validate().is_err());
+        assert!(bad("x", "x.example").validate().is_err());
     }
 
     #[test]

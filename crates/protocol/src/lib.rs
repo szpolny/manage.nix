@@ -34,6 +34,18 @@ pub const ENROLL_PATH: &str = "/api/agent/enroll";
 /// credential as `Authorization: Bearer <credential>`.
 pub const AGENT_WS_PATH: &str = "/api/agent/ws";
 
+/// Where an agent downloads the source of a [`ActivationTarget::Build`]: a
+/// Git bundle (`application/x-git-bundle`) whose one ref,
+/// [`SOURCE_BUNDLE_REF`], points at the deployment's commit. Authenticated
+/// like the WebSocket. Each `have=<commit>` query parameter names a commit
+/// the agent already has, so the bundle can leave out its history.
+pub fn agent_source_path(deployment_id: &str) -> String {
+    format!("/api/agent/deployments/{deployment_id}/source")
+}
+
+/// The ref in a source bundle.
+pub const SOURCE_BUNDLE_REF: &str = "refs/mnix/source";
+
 /// A message from the agent to the server.
 ///
 /// Receivers ignore (and log) messages whose `type` they do not know, so
@@ -126,8 +138,19 @@ pub struct Activate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ActivationTarget {
-    /// A NixOS system's top-level store path, signed by a trusted key.
+    /// A system's top-level store path, signed by a trusted key.
     System { store_path: String },
+    /// Build `attribute` of the flake at `commit` on the machine, then
+    /// activate the result. The agent downloads the source from the server
+    /// that asked ([`agent_source_path`]) and accepts this only from servers
+    /// it allows to make it build.
+    Build {
+        /// The full commit hash.
+        commit: String,
+        /// The flake output, for example
+        /// `nixosConfigurations."web-1".config.system.build.toplevel`.
+        attribute: String,
+    },
     /// The newest earlier generation of the system profile that differs
     /// from the running system (`mnix rollback`). Profile generations need
     /// no signature: root installed them.
@@ -140,6 +163,8 @@ pub enum ActivationTarget {
 pub enum ActivationPhase {
     /// The agent has the request and will start it.
     Accepted,
+    /// Fetching the source and building the system on the machine.
+    Building,
     /// Fetching and checking the system, then switching to it.
     Activating,
     /// Running the new system's health checks.
@@ -154,6 +179,7 @@ impl ActivationPhase {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Accepted => "accepted",
+            Self::Building => "building",
             Self::Activating => "activating",
             Self::CheckingHealth => "checking_health",
             Self::AwaitingConfirmation => "awaiting_confirmation",
@@ -164,6 +190,7 @@ impl ActivationPhase {
     pub fn parse(s: &str) -> Option<Self> {
         [
             Self::Accepted,
+            Self::Building,
             Self::Activating,
             Self::CheckingHealth,
             Self::AwaitingConfirmation,
@@ -178,12 +205,21 @@ impl ActivationPhase {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Facts {
     pub hostname: String,
+    /// What kind of system the machine runs; agents before 0.2 only ran on
+    /// NixOS.
+    #[serde(default)]
+    pub os: Os,
     /// The running system (`/run/current-system`).
     pub current_system: String,
-    /// The system the machine booted into (`/run/booted-system`).
+    /// The system the machine booted into (`/run/booted-system`), on NixOS.
     pub booted_system: Option<String>,
-    /// `nixos-version` of the running system.
-    pub nixos_version: Option<String>,
+    /// `nixos-version` or `darwin-version` of the running system.
+    #[serde(alias = "nixos_version")]
+    pub os_version: Option<String>,
+    /// The running configuration's `system.configurationRevision`: the
+    /// commit it was built from, when the flake sets it.
+    #[serde(default)]
+    pub configuration_revision: Option<String>,
     /// Release of the running kernel (`uname -r`).
     pub kernel: String,
     /// True when the running system's kernel, initrd, or kernel modules
@@ -191,6 +227,29 @@ pub struct Facts {
     pub reboot_required: bool,
     /// Generations of the system profile, oldest first.
     pub generations: Vec<Generation>,
+}
+
+/// The kind of system a machine runs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Os {
+    /// NixOS, built from `nixosConfigurations`.
+    #[default]
+    Nixos,
+    /// macOS with nix-darwin, built from `darwinConfigurations`.
+    Darwin,
+}
+
+impl Os {
+    /// The flake output that builds the system of `configuration`.
+    pub fn flake_attribute(self, configuration: &str) -> String {
+        match self {
+            Self::Nixos => {
+                format!("nixosConfigurations.\"{configuration}\".config.system.build.toplevel")
+            }
+            Self::Darwin => format!("darwinConfigurations.\"{configuration}\".system"),
+        }
+    }
 }
 
 /// One generation of the system profile.
@@ -204,7 +263,9 @@ pub struct Generation {
     pub current: bool,
 }
 
-/// How to activate a system, matching `switch-to-configuration`.
+/// How to activate a system, matching `switch-to-configuration`. nix-darwin
+/// has no boot default apart from the running system, so on macOS `boot`
+/// is refused and `test` activates without adding a profile generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActivationMode {
@@ -305,14 +366,18 @@ mod tests {
                 "hostname": "web-1",
                 "current_system": "/nix/store/x-nixos-system",
                 "booted_system": null,
-                "nixos_version": null,
+                "nixos_version": "26.11",
                 "kernel": "6.12.0",
                 "reboot_required": false,
                 "generations": []
             }
         }))
         .unwrap();
-        assert!(matches!(hello, AgentMessage::Hello(h) if h.facts.hostname == "web-1"));
+        // Facts from agents before 0.2: NixOS, `nixos_version`.
+        assert!(matches!(hello, AgentMessage::Hello(ref h)
+            if h.facts.hostname == "web-1"
+                && h.facts.os == Os::Nixos
+                && h.facts.os_version.as_deref() == Some("26.11")));
         let welcome = ServerMessage::Welcome {
             protocol_version: PROTOCOL_VERSION,
             machine_id: "m".to_owned(),
@@ -358,9 +423,29 @@ mod tests {
     }
 
     #[test]
+    fn build_targets_name_a_commit_and_an_attribute() {
+        let target: ActivationTarget = serde_json::from_value(serde_json::json!({
+            "type": "build",
+            "commit": "0123456789abcdef0123456789abcdef01234567",
+            "attribute": Os::Darwin.flake_attribute("mac"),
+        }))
+        .unwrap();
+        assert!(
+            matches!(target, ActivationTarget::Build { ref attribute, .. }
+            if attribute == "darwinConfigurations.\"mac\".system")
+        );
+        assert_eq!(
+            Os::Nixos.flake_attribute("web-1"),
+            "nixosConfigurations.\"web-1\".config.system.build.toplevel"
+        );
+        assert_eq!(agent_source_path("d"), "/api/agent/deployments/d/source");
+    }
+
+    #[test]
     fn phases_and_modes_round_trip_as_strings() {
         for phase in [
             ActivationPhase::Accepted,
+            ActivationPhase::Building,
             ActivationPhase::AwaitingConfirmation,
             ActivationPhase::RollingBack,
         ] {
