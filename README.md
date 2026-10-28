@@ -77,6 +77,30 @@ Each machine activates its system in its own systemd unit, checks its
 health, and then must reach the server over a **new** connection within
 `confirmTimeout` (60 s); otherwise it rolls back on its own.
 
+## Updates and reboots
+
+```sh
+mnix updates web-1                   # commits the running system was not built from
+mnix updates web-1 --rev main --preview  # also build it on the server and diff the packages
+mnix reboot web-1                    # restart; follows it until the agent is back
+```
+
+An update check fetches the machine's repository (at most once a minute)
+and compares the commit the running system was built from (its deployment,
+or else its `system.configurationRevision`) with the branch it was deployed
+from, or the default branch. The machine page shows the commits, and the
+machine list shows how far behind each machine is. A preview builds the
+new system on the server, without signing or pushing it, and shows `nix
+store diff-closures` against the running system; previews live in the
+server's memory. A server with `buildOn = "machine"` can only preview what
+it can build itself.
+
+A reboot is a deployment of kind `reboot`, so it shows up in the history. It
+is refused while the machine is offline. The agent waits for any activation
+to finish, notes the boot ID, and runs `systemctl reboot` (`shutdown -r now`
+on macOS); the reboot succeeds when the agent reports from a new boot, and
+fails if the machine is still up five minutes later.
+
 ## Several servers, machine builds, and macOS
 
 An agent can connect to several independent servers at once

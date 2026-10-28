@@ -105,7 +105,9 @@ pub fn activate(host: &dyn Host, request: &Request, observer: &dyn Observer) -> 
     let mut report = ActivationReport {
         store_path: match &request.target {
             ActivationTarget::System { store_path } => store_path.clone(),
-            ActivationTarget::Build { .. } | ActivationTarget::PreviousGeneration => String::new(),
+            ActivationTarget::Build { .. }
+            | ActivationTarget::PreviousGeneration
+            | ActivationTarget::Reboot => String::new(),
         },
         mode,
         status: ActivationStatus::Failed,
@@ -160,6 +162,7 @@ fn describe(target: &ActivationTarget) -> String {
         ActivationTarget::System { store_path } => store_path.clone(),
         ActivationTarget::Build { commit, attribute } => format!("{attribute} at {commit}"),
         ActivationTarget::PreviousGeneration => "the previous generation".to_owned(),
+        ActivationTarget::Reboot => "a reboot".to_owned(),
     }
 }
 
@@ -242,6 +245,8 @@ fn plan(host: &dyn Host, request: &Request, observer: &dyn Observer) -> anyhow::
             tracing::info!("rolling back to generation {number}: {target}");
             target
         }
+        // Jobs restart the machine themselves (`crate::job`).
+        ActivationTarget::Reboot => anyhow::bail!("a reboot activates no system"),
     };
 
     anyhow::ensure!(

@@ -12,8 +12,11 @@ import type {
 	GenerationView,
 	Machine,
 	MachineDeployment,
+	Preview,
 	Repository,
-	Session
+	Session,
+	UpdateSummary,
+	Updates
 } from './types.ts';
 
 export class ApiError extends Error {
@@ -83,6 +86,16 @@ export const api = {
 		request<ClosureDiff>('GET', `/api/machines/${enc(name)}/diff?from=${from}&to=${to}`),
 	rollback: (name: string, mode: ActivationMode = 'switch') =>
 		request<Deployment>('POST', `/api/machines/${enc(name)}/rollback`, { mode }),
+	reboot: (name: string) => request<Deployment>('POST', `/api/machines/${enc(name)}/reboot`, {}),
+	updates: (name: string, rev?: string) =>
+		request<Updates>(
+			'GET',
+			`/api/machines/${enc(name)}/updates${rev ? `?rev=${enc(rev)}` : ''}`
+		),
+	allUpdates: () => request<UpdateSummary[]>('GET', '/api/updates'),
+	preview: (name: string) => request<Preview>('GET', `/api/machines/${enc(name)}/updates/preview`),
+	startPreview: (name: string, rev?: string) =>
+		request<Preview>('POST', `/api/machines/${enc(name)}/updates/preview`, { rev }),
 
 	repositories: () => request<Repository[]>('GET', '/api/repositories'),
 	addRepository: (name: string, url: string) =>

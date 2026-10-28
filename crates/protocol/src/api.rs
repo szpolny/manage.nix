@@ -206,6 +206,93 @@ pub struct CreateRollback {
     pub requested_by: Option<String>,
 }
 
+/// `POST /api/machines/:machine/reboot`: restart the machine. Refused while
+/// the machine is offline, so a reboot never waits for it to come back.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateReboot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_by: Option<String>,
+}
+
+/// `GET /api/machines/:machine/updates?rev=<rev>`: what the machine's
+/// repository has that its running system was not built from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Updates {
+    pub repository: String,
+    /// The revision compared with: `rev` if given, otherwise the branch the
+    /// running system was deployed from, otherwise `HEAD`.
+    pub rev: String,
+    /// The commit `rev` names now.
+    pub commit: String,
+    /// The commit the running system was built from, if known: from its
+    /// deployment, or its `system.configurationRevision`.
+    pub current_commit: Option<String>,
+    /// Commits in `rev` that the running system lacks; `None` if the
+    /// running commit is unknown (or not in the repository).
+    pub behind: Option<u64>,
+    /// Commits in the running system that `rev` lacks.
+    pub ahead: Option<u64>,
+    /// The newest of the commits behind, newest first (at most 50).
+    pub commits: Vec<Commit>,
+    /// When the repository was last fetched.
+    pub fetched_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Commit {
+    pub commit: String,
+    pub summary: String,
+    pub author: String,
+    pub date: String,
+}
+
+/// `GET /api/updates` returns one of these for every machine with a
+/// configuration: [`Updates`] in short, compared with the default revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateSummary {
+    pub machine: String,
+    pub rev: Option<String>,
+    pub commit: Option<String>,
+    pub behind: Option<u64>,
+    /// Why there is no answer for this machine.
+    pub error: Option<String>,
+}
+
+/// `POST /api/machines/:machine/updates/preview`: build what `rev` would
+/// give the machine, on the server, and compare it with the running
+/// system. `GET` on the same path returns the latest preview.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatePreview {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewStatus {
+    Building,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Preview {
+    pub status: PreviewStatus,
+    pub rev: String,
+    /// The commit `rev` resolved to, once fetched.
+    pub commit: Option<String>,
+    /// The running system it is compared with.
+    pub from: String,
+    /// The system `rev` builds, once built.
+    pub to: Option<String>,
+    /// `nix store diff-closures` from the running system to the new one.
+    pub diff: Option<String>,
+    /// Why it failed.
+    pub message: Option<String>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+}
+
 fn default_mode() -> ActivationMode {
     ActivationMode::Switch
 }
@@ -217,6 +304,8 @@ pub enum DeploymentKind {
     Deploy,
     /// Activate each machine's previous system profile generation.
     Rollback,
+    /// Restart each machine.
+    Reboot,
 }
 
 /// The state of a deployment as a whole.
@@ -276,6 +365,7 @@ macro_rules! string_enum {
 string_enum!(DeploymentKind {
     Deploy = "deploy",
     Rollback = "rollback",
+    Reboot = "reboot",
 });
 string_enum!(DeploymentStatus {
     Queued = "queued",

@@ -12,6 +12,7 @@ mod e2e_tests;
 mod events;
 mod provision;
 mod secret;
+mod updates;
 mod web;
 
 use std::fs::File;
@@ -328,6 +329,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         queue: tokio::sync::Notify::new(),
         activations: tokio::sync::watch::channel(0).0,
         web_dir: args.web_dir.clone(),
+        updates: Default::default(),
     });
     if backend == Backend::Sqlite {
         deploy::fail_interrupted_builds(&state).await?;

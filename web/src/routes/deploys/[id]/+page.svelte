@@ -82,7 +82,9 @@
 			{#if deployment}
 				{deployment.kind === 'rollback'
 					? 'Rollback'
-					: revisionLabel(deployment.rev, deployment.commit)}
+					: deployment.kind === 'reboot'
+						? 'Reboot'
+						: revisionLabel(deployment.rev, deployment.commit)}
 			{:else}
 				{id.slice(0, 8)}
 			{/if}
@@ -108,8 +110,10 @@
 				<dt>Repository</dt>
 				<dd>{deployment.repository ?? '—'}</dd>
 			{/if}
-			<dt>Mode</dt>
-			<dd>{deployment.mode}</dd>
+			{#if deployment.kind !== 'reboot'}
+				<dt>Mode</dt>
+				<dd>{deployment.mode}</dd>
+			{/if}
 			<dt>Requested by</dt>
 			<dd>{deployment.requested_by}</dd>
 			<dt>Created</dt>

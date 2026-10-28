@@ -17,8 +17,9 @@
 
 	let deployable = $derived(machines.filter((m) => m.repository && m.enrolled_at));
 
-	export function open(preselected: string[] = []) {
+	export function open(preselected: string[] = [], presetRev?: string) {
 		selected = preselected.filter((name) => deployable.some((m) => m.name === name));
+		if (presetRev !== undefined) rev = presetRev;
 		error = '';
 		dialog.show();
 	}

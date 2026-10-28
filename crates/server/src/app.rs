@@ -54,6 +54,8 @@ pub struct AppState {
     pub activations: watch::Sender<u64>,
     /// The built web UI, served at `/` if set.
     pub web_dir: Option<PathBuf>,
+    /// Update checks and previews.
+    pub updates: crate::updates::Tracker,
 }
 
 pub type State = Arc<AppState>;

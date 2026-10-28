@@ -62,14 +62,16 @@
 						<td><a href="/deploys/{d.id}"><Badge status={d.status} /></a></td>
 						<td>
 							<a href="/deploys/{d.id}">
-								{#if d.kind === 'rollback'}
-									rollback
+								{#if d.kind !== 'deploy'}
+									{d.kind}
 								{:else}
 									<span class="mono">{revisionLabel(d.rev, d.commit)}</span>
 								{/if}
 							</a>
 							{#if d.repository}<span class="muted">from {d.repository}</span>{/if}
-							{#if d.mode !== 'switch'}<span class="muted">({d.mode})</span>{/if}
+							{#if d.kind !== 'reboot' && d.mode !== 'switch'}<span class="muted"
+									>({d.mode})</span
+								>{/if}
 						</td>
 						<td>
 							{#each d.machines as m, i (m.machine_id)}{i ? ', ' : ''}<a

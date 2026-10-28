@@ -7,7 +7,8 @@
 //! - [`api`] holds the HTTP API's request and response bodies.
 //! - [`Facts`] and [`ActivationReport`] are what the agent reports about
 //!   itself; `mnix-agent facts` and `mnix-agent activate` print them too.
-//! - [`Activate`] is the one command the server can give an agent.
+//! - [`Activate`] is the one command the server can give an agent: it
+//!   activates a system, or restarts the machine.
 
 pub mod api;
 
@@ -155,6 +156,9 @@ pub enum ActivationTarget {
     /// from the running system (`mnix rollback`). Profile generations need
     /// no signature: root installed them.
     PreviousGeneration,
+    /// Restart the machine (`mnix reboot`). The agent reports success once
+    /// it runs again in a new boot; `mode` is ignored.
+    Reboot,
 }
 
 /// How far an activation has got.
@@ -173,6 +177,8 @@ pub enum ActivationPhase {
     AwaitingConfirmation,
     /// Something failed; restoring the previous system.
     RollingBack,
+    /// The machine is restarting.
+    Rebooting,
 }
 
 impl ActivationPhase {
@@ -184,6 +190,7 @@ impl ActivationPhase {
             Self::CheckingHealth => "checking_health",
             Self::AwaitingConfirmation => "awaiting_confirmation",
             Self::RollingBack => "rolling_back",
+            Self::Rebooting => "rebooting",
         }
     }
 
@@ -195,6 +202,7 @@ impl ActivationPhase {
             Self::CheckingHealth,
             Self::AwaitingConfirmation,
             Self::RollingBack,
+            Self::Rebooting,
         ]
         .into_iter()
         .find(|p| p.as_str() == s)
@@ -448,6 +456,7 @@ mod tests {
             ActivationPhase::Building,
             ActivationPhase::AwaitingConfirmation,
             ActivationPhase::RollingBack,
+            ActivationPhase::Rebooting,
         ] {
             assert_eq!(ActivationPhase::parse(phase.as_str()), Some(phase));
             assert_eq!(

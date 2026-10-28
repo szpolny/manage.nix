@@ -211,6 +211,30 @@ fn switch_to_configuration_path(system: &StorePath) -> PathBuf {
     system.as_path().join("bin/switch-to-configuration")
 }
 
+/// Identifies the current boot: it changes when the machine restarts.
+pub fn boot_id() -> anyhow::Result<String> {
+    let id = if cfg!(target_os = "macos") {
+        run(Command::new("sysctl").args(["-n", "kern.bootsessionuuid"]))?
+    } else {
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .context("reading /proc/sys/kernel/random/boot_id")?
+    };
+    let id = id.trim();
+    anyhow::ensure!(!id.is_empty(), "the boot ID is empty");
+    Ok(id.to_owned())
+}
+
+/// Asks the init system to restart the machine. Returns once the request
+/// is accepted; the restart itself stops this process.
+pub fn reboot() -> anyhow::Result<()> {
+    if cfg!(target_os = "macos") {
+        run(Command::new("shutdown").args(["-r", "now"]))?;
+    } else {
+        run(Command::new("systemctl").args(["reboot", "--no-ask-password"]))?;
+    }
+    Ok(())
+}
+
 /// Parses a generation link name such as `system-42-link` (for the profile
 /// `system`) into 42.
 pub fn generation_number(profile_name: &str, link_name: &str) -> Option<u64> {

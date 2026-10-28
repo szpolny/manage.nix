@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use mnix_protocol::api::{
-    CreatedMachine, Deployment, DeploymentStatus, EnrollResponse, EnrollmentToken, LogEntry,
-    Machine, MachineDeploymentStatus, MachineStatus,
+    CreatedMachine, Deployment, DeploymentKind, DeploymentStatus, EnrollResponse, EnrollmentToken,
+    LogEntry, Machine, MachineDeploymentStatus, MachineStatus, Preview, PreviewStatus,
+    UpdateSummary, Updates,
 };
 use mnix_protocol::{
     Activate, ActivationMode, ActivationPhase, ActivationReport, ActivationStatus,
@@ -94,6 +95,7 @@ async fn launch_building_on(
         queue: tokio::sync::Notify::new(),
         activations: tokio::sync::watch::channel(0).0,
         web_dir,
+        updates: Default::default(),
     });
     tokio::spawn(crate::agent::reap_stale_sessions(state.clone()));
     tokio::spawn(crate::deploy::run_worker(state.clone()));
@@ -1535,4 +1537,225 @@ async fn machines_build_from_source_the_server_sends() {
     assert_eq!(deployment.machines[0].store_path.as_deref(), Some(built));
     // Once it finished, the source is not served any more.
     assert_eq!(server.download(&path, Some(&credential)).await.0, 404);
+}
+
+#[tokio::test]
+async fn reboots_reach_online_machines_and_finish_in_the_new_boot() {
+    let server = start(Duration::from_secs(30)).await;
+    let credential = server.enrolled("web-1").await;
+
+    // Offline machines are not restarted when they come back.
+    let (status, body) = server
+        .admin("POST", "/api/machines/web-1/reboot", Some(json!({})))
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("offline"));
+
+    let mut ws = server.session(&credential, "web-1").await;
+    server.wait_for_status("web-1", MachineStatus::Online).await;
+    let (status, body) = server
+        .admin(
+            "POST",
+            "/api/machines/web-1/reboot",
+            Some(json!({"requested_by": "alice"})),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    let deployment: Deployment = serde_json::from_value(body).unwrap();
+    assert_eq!(deployment.kind, DeploymentKind::Reboot);
+    assert_eq!(deployment.status, DeploymentStatus::Activating);
+    assert_eq!(deployment.requested_by, "alice");
+
+    let Some(ServerMessage::Activate(activate)) =
+        receive_within(&mut ws, Duration::from_secs(5)).await
+    else {
+        panic!("expected activate");
+    };
+    assert_eq!(activate.deployment_id, deployment.id);
+    assert_eq!(activate.target, ActivationTarget::Reboot);
+    ws.send(text(&AgentMessage::ActivationStatus {
+        deployment_id: deployment.id.clone(),
+        phase: ActivationPhase::Rebooting,
+    }))
+    .await
+    .unwrap();
+    // The machine goes down and reports from its new boot.
+    drop(ws);
+    let mut ws = server.session(&credential, "web-1").await;
+    assert_eq!(
+        server.deployment(&deployment.id).await.machines[0].phase,
+        Some(ActivationPhase::Rebooting)
+    );
+    ws.send(text(&AgentMessage::ActivationResult {
+        deployment_id: deployment.id.clone(),
+        report: ActivationReport {
+            store_path: String::new(),
+            system_changed: false,
+            previous_system: None,
+            ..succeeded("")
+        },
+    }))
+    .await
+    .unwrap();
+    let done = server
+        .wait_for_deployment(&deployment.id, DeploymentStatus::Succeeded)
+        .await;
+    assert_eq!(done.machines[0].status, MachineDeploymentStatus::Succeeded);
+    assert_eq!(done.machines[0].store_path, None);
+    let (status, body) = server
+        .admin("GET", "/api/machines/web-1/deployments", None)
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(body[0]["kind"], "reboot");
+}
+
+#[tokio::test]
+async fn updates_list_the_commits_a_machine_lacks() {
+    let server = start(Duration::from_secs(30)).await;
+    let work = server._dir.path().join("infra");
+    std::fs::create_dir(&work).unwrap();
+    git(&work, &["init", "--quiet"]);
+    let mut commits = Vec::new();
+    for n in 1..=3 {
+        std::fs::write(
+            work.join("flake.nix"),
+            format!("# {n}\n{{ outputs = _: {{ }}; }}\n"),
+        )
+        .unwrap();
+        git(&work, &["add", "flake.nix"]);
+        git(&work, &["commit", "--quiet", "-m", &format!("change {n}")]);
+        commits.push(git(&work, &["rev-parse", "HEAD"]));
+    }
+    let credential = server.enrolled("web-1").await;
+    server.enrolled("db-1").await;
+    let (status, body) = server
+        .admin("GET", "/api/machines/web-1/updates", None)
+        .await;
+    assert_eq!(status, 409, "{body}");
+
+    let (status, body) = server
+        .admin(
+            "POST",
+            "/api/repositories",
+            Some(json!({ "name": "infra", "url": work.to_str().unwrap() })),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    for machine in ["web-1", "db-1"] {
+        let (status, body) = server
+            .admin(
+                "PUT",
+                &format!("/api/machines/{machine}/configuration"),
+                Some(json!({ "repository": "infra" })),
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+    }
+
+    // The running system was built from the first commit.
+    let mut ws = server.session(&credential, "web-1").await;
+    ws.send(text(&AgentMessage::Facts {
+        facts: Facts {
+            configuration_revision: Some(commits[0].clone()),
+            ..facts("web-1")
+        },
+    }))
+    .await
+    .unwrap();
+    for _ in 0..50 {
+        let machine = server.machine("web-1").await;
+        if machine
+            .facts
+            .and_then(|f| f.configuration_revision)
+            .is_some()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let updates = |query: String| {
+        let server = &server;
+        async move {
+            let (status, body) = server
+                .admin("GET", &format!("/api/machines/web-1/updates{query}"), None)
+                .await;
+            assert_eq!(status, 200, "{body}");
+            serde_json::from_value::<Updates>(body).unwrap()
+        }
+    };
+    let found = updates(String::new()).await;
+    assert_eq!(found.repository, "infra");
+    assert_eq!(found.rev, "HEAD");
+    assert_eq!(found.commit, commits[2]);
+    assert_eq!(found.current_commit.as_deref(), Some(commits[0].as_str()));
+    assert_eq!((found.behind, found.ahead), (Some(2), Some(0)));
+    let summaries: Vec<_> = found.commits.iter().map(|c| c.summary.as_str()).collect();
+    assert_eq!(summaries, ["change 3", "change 2"]);
+    assert_eq!(found.commits[0].commit, commits[2]);
+    assert_eq!(found.commits[0].author, "t");
+
+    let found = updates(format!("?rev={}", commits[1])).await;
+    assert_eq!(found.behind, Some(1));
+
+    for (query, expected) in [("?rev=-x", 400), ("?rev=nope", 422)] {
+        let (status, body) = server
+            .admin("GET", &format!("/api/machines/web-1/updates{query}"), None)
+            .await;
+        assert_eq!(status, expected, "{query}: {body}");
+    }
+
+    // db-1 never reported a commit: its place is unknown.
+    let (status, body) = server.admin("GET", "/api/updates", None).await;
+    assert_eq!(status, 200, "{body}");
+    let mut all: Vec<UpdateSummary> = serde_json::from_value(body).unwrap();
+    all.sort_by(|a, b| a.machine.cmp(&b.machine));
+    assert_eq!(
+        all.iter()
+            .map(|u| (u.machine.as_str(), u.behind))
+            .collect::<Vec<_>>(),
+        [("db-1", None), ("web-1", Some(2))]
+    );
+
+    // New commits show up once the repository is fetched again.
+    std::fs::write(work.join("README"), "four\n").unwrap();
+    git(&work, &["add", "README"]);
+    git(&work, &["commit", "--quiet", "-m", "change 4"]);
+    assert_eq!(updates(String::new()).await.behind, Some(2));
+    server.state.updates.forget_fetches().await;
+    assert_eq!(updates(String::new()).await.behind, Some(3));
+
+    // There is no system to build in the repository, so the preview fails
+    // and says why.
+    let (status, body) = server
+        .admin("GET", "/api/machines/web-1/updates/preview", None)
+        .await;
+    assert_eq!(status, 404, "{body}");
+    let (status, body) = server
+        .admin(
+            "POST",
+            "/api/machines/web-1/updates/preview",
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, 202, "{body}");
+    let preview: Preview = serde_json::from_value(body).unwrap();
+    assert_eq!(preview.status, PreviewStatus::Building);
+    assert_eq!(preview.from, facts("web-1").current_system);
+    let preview = loop {
+        let (status, body) = server
+            .admin("GET", "/api/machines/web-1/updates/preview", None)
+            .await;
+        assert_eq!(status, 200, "{body}");
+        let preview: Preview = serde_json::from_value(body).unwrap();
+        if preview.status != PreviewStatus::Building {
+            break preview;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(preview.status, PreviewStatus::Failed);
+    assert_eq!(preview.rev, "HEAD");
+    assert!(preview.commit.is_some());
+    assert!(preview.message.is_some());
+    assert!(preview.finished_at.is_some());
 }

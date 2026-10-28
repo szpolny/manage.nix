@@ -17,7 +17,12 @@
 //! | `log` | the job's stdout and stderr | everything the activation printed |
 //! | `status.json` | job | the current [`ActivationPhase`] and when it began |
 //! | `confirmed` | service | exists once the server confirmed over a connection opened after the switch |
+//! | `boot_id` | job | for a reboot, the boot it was requested in |
 //! | `report.json` | job | the final [`ActivationReport`] |
+//!
+//! A reboot ([`ActivationTarget::Reboot`]) is a job too, so it waits for
+//! activations and they wait for it. It has no report until the service
+//! finds it again in a new boot and writes one.
 //!
 //! The service deletes the directory when the server has stored the report.
 
@@ -45,11 +50,15 @@ const STATUS: &str = "status.json";
 const CONFIRMED: &str = "confirmed";
 const REPORT: &str = "report.json";
 const LOG: &str = "log";
+const BOOT_ID: &str = "boot_id";
 /// How often a job waiting for confirmation looks for it.
 const CONFIRM_POLL: Duration = Duration::from_millis(250);
 /// A job without a report whose unit is gone this long after it was
 /// requested was interrupted (the machine rebooted, or the job crashed).
 const START_GRACE: Duration = Duration::from_secs(15);
+/// How long a reboot job waits for the machine to go down before it
+/// reports that it did not.
+const REBOOT_WAIT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Status {
@@ -170,10 +179,17 @@ impl Jobs {
         };
         let mut report = read_json::<ActivationReport>(&dir.join(REPORT))?;
         let status = read_json::<Status>(&dir.join(STATUS))?;
+        if report.is_none() {
+            if let Some(rebooted) = rebooted(&dir)? {
+                tracing::info!("reboot {id}: the machine restarted");
+                write_atomically(&dir.join(REPORT), &serde_json::to_vec_pretty(&rebooted)?)?;
+                report = Some(rebooted);
+            }
+        }
         if report.is_none() && !unit_is_active(id) && age(created) > START_GRACE {
             let request: Activate = read_json(&request_path)?.context("missing request")?;
             let interrupted = ActivationReport {
-                system_changed: true,
+                system_changed: request.target != ActivationTarget::Reboot,
                 ..failed_report(
                     &request,
                     "the activation was interrupted (the machine restarted or the job \
@@ -376,7 +392,9 @@ pub fn failed_report(request: &Activate, message: String) -> ActivationReport {
     ActivationReport {
         store_path: match &request.target {
             ActivationTarget::System { store_path } => store_path.clone(),
-            ActivationTarget::Build { .. } | ActivationTarget::PreviousGeneration => String::new(),
+            ActivationTarget::Build { .. }
+            | ActivationTarget::PreviousGeneration
+            | ActivationTarget::Reboot => String::new(),
         },
         mode: request.mode,
         status: ActivationStatus::Failed,
@@ -398,6 +416,7 @@ pub fn run(dir: &Path) -> anyhow::Result<ActivationReport> {
         confirm_timeout: Duration::from_secs(request.confirm_timeout_secs),
     };
     let report = match crate::wait_for_lock() {
+        Ok(_lock) if request.target == ActivationTarget::Reboot => reboot(dir, &request, &observer),
         Ok(_lock) => match prepare(dir, &request, &observer) {
             Ok(source) => activate::activate(
                 &LocalHost,
@@ -418,6 +437,50 @@ pub fn run(dir: &Path) -> anyhow::Result<ActivationReport> {
     };
     write_atomically(&dir.join(REPORT), &serde_json::to_vec_pretty(&report)?)?;
     Ok(report)
+}
+
+/// Restarts the machine, noting the boot it was asked in. Returns only if
+/// the restart failed, or the machine did not go down within
+/// [`REBOOT_WAIT`].
+fn reboot(dir: &Path, request: &Activate, observer: &JobObserver) -> ActivationReport {
+    let result = (|| {
+        write_atomically(&dir.join(BOOT_ID), crate::host::boot_id()?.as_bytes())?;
+        observer.phase(ActivationPhase::Rebooting);
+        tracing::info!("restarting the machine");
+        crate::host::reboot()
+    })();
+    if let Err(e) = result {
+        tracing::error!("{e:#}");
+        return failed_report(request, format!("could not restart the machine: {e:#}"));
+    }
+    std::thread::sleep(REBOOT_WAIT);
+    let _ = std::fs::remove_file(dir.join(BOOT_ID));
+    failed_report(
+        request,
+        format!(
+            "the machine did not restart within {} of being asked to",
+            humantime::format_duration(REBOOT_WAIT)
+        ),
+    )
+}
+
+/// The report of a reboot job found in a later boot than the one it was
+/// requested in; `None` for other jobs and unfinished reboots.
+fn rebooted(dir: &Path) -> anyhow::Result<Option<ActivationReport>> {
+    let requested_in = match std::fs::read_to_string(dir.join(BOOT_ID)) {
+        Ok(id) => id,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).context("reading the boot ID of a reboot"),
+    };
+    if requested_in.trim() == crate::host::boot_id()? {
+        return Ok(None);
+    }
+    let request: Activate = read_json(&dir.join(REQUEST))?.context("missing request")?;
+    Ok(Some(ActivationReport {
+        status: ActivationStatus::Succeeded,
+        message: None,
+        ..failed_report(&request, String::new())
+    }))
 }
 
 /// Fetches the source of a build from the server that asked for it.
@@ -611,6 +674,32 @@ mod tests {
         jobs.remove(ID).unwrap();
         jobs.remove(ID).unwrap();
         assert!(jobs.list().is_empty());
+    }
+
+    #[test]
+    fn reboots_succeed_in_a_later_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let reboot = Activate {
+            target: ActivationTarget::Reboot,
+            ..request(ID)
+        };
+        write_atomically(
+            &dir.path().join(REQUEST),
+            &serde_json::to_vec(&reboot).unwrap(),
+        )
+        .unwrap();
+        // Not asked to restart yet, or still in the same boot.
+        assert_eq!(rebooted(dir.path()).unwrap(), None);
+        let current = crate::host::boot_id().unwrap();
+        write_atomically(&dir.path().join(BOOT_ID), current.as_bytes()).unwrap();
+        assert_eq!(rebooted(dir.path()).unwrap(), None);
+
+        write_atomically(&dir.path().join(BOOT_ID), b"an-earlier-boot").unwrap();
+        let report = rebooted(dir.path()).unwrap().unwrap();
+        assert_eq!(report.status, ActivationStatus::Succeeded);
+        assert!(!report.system_changed);
+        assert_eq!(report.store_path, "");
+        assert_eq!(report.message, None);
     }
 
     #[test]

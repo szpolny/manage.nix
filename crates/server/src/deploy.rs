@@ -5,15 +5,17 @@
 //! the cache, and releases it to the machines. Agent sessions (on any
 //! server) hand released activations to their agents and record what the
 //! agents report. A sweeper fails activations and builds that take too
-//! long. Rollbacks skip the build: they are released at once.
+//! long. Rollbacks and reboots skip the build: they are released at once.
 
 use std::collections::HashSet;
 use std::time::Duration;
 
 use axum::http::StatusCode;
 use mnix_protocol::api::{
-    CreateDeployment, CreateRollback, DeploymentKind, DeploymentStatus, MachineDeploymentStatus,
+    CreateDeployment, CreateReboot, CreateRollback, DeploymentKind, DeploymentStatus,
+    MachineDeploymentStatus, MachineStatus,
 };
+use mnix_protocol::ActivationMode;
 use mnix_protocol::{ActivationReport, ActivationStatus};
 use mnix_store::{Machine, MachineOutcome, NewDeployment, NewDeploymentMachine, Release};
 use time::OffsetDateTime;
@@ -74,7 +76,7 @@ fn requested_by(value: Option<String>) -> Result<String, ApiError> {
 
 /// Branches, tags, commits, and expressions like `main~1`; nothing that
 /// could be taken for an option.
-fn validate_rev(rev: &str) -> Result<(), ApiError> {
+pub fn validate_rev(rev: &str) -> Result<(), ApiError> {
     let valid = !rev.is_empty()
         && rev.len() <= MAX_TEXT
         && !rev.starts_with('-')
@@ -198,6 +200,60 @@ pub async fn create_rollback(
         )
         .await;
     tracing::info!("deployment {id}: roll back {}", machine.name);
+    state.activations_changed();
+    Ok(id)
+}
+
+/// `POST /api/machines/:machine/reboot`
+pub async fn create_reboot(
+    state: &AppState,
+    machine: &Machine,
+    request: CreateReboot,
+) -> Result<Uuid, ApiError> {
+    let requested_by = requested_by(request.requested_by)?;
+    let status = crate::api::status(
+        machine,
+        OffsetDateTime::now_utc(),
+        state.settings.heartbeat_timeout,
+    );
+    if status != MachineStatus::Online {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            format!(
+                "{} is {status}; it can only be restarted while online",
+                machine.name
+            ),
+        ));
+    }
+    let id = Uuid::new_v4();
+    state
+        .store
+        .create_deployment(&NewDeployment {
+            id,
+            organization_id: state.organization.id,
+            kind: DeploymentKind::Reboot,
+            status: DeploymentStatus::Activating,
+            repository_id: None,
+            rev: None,
+            // Agents ignore the mode of a reboot.
+            mode: ActivationMode::Switch,
+            requested_by: requested_by.clone(),
+            created_at: OffsetDateTime::now_utc(),
+            machines: vec![NewDeploymentMachine {
+                machine_id: machine.id,
+                configuration: None,
+                status: MachineDeploymentStatus::Activating,
+            }],
+        })
+        .await?;
+    state
+        .event(
+            Some(machine.id),
+            "reboot_created",
+            serde_json::json!({ "deployment_id": id, "requested_by": requested_by }),
+        )
+        .await;
+    tracing::info!("deployment {id}: reboot {}", machine.name);
     state.activations_changed();
     Ok(id)
 }

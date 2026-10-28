@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use mnix_nix::{SecretKey, StorePath};
+use mnix_protocol::Os;
 use mnix_store::{log_source, NewLogEntry, Store};
 use time::OffsetDateTime;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -100,7 +101,7 @@ pub struct Built {
 }
 
 impl Builder {
-    fn mirror(&self, repository_id: Uuid) -> PathBuf {
+    pub fn mirror(&self, repository_id: Uuid) -> PathBuf {
         self.state_dir
             .join("repositories")
             .join(format!("{repository_id}.git"))
@@ -204,43 +205,11 @@ impl Builder {
         configuration: &str,
         log: &mut Log,
     ) -> anyhow::Result<Built> {
-        let mirror = mirror.to_str().context("non-UTF-8 state directory")?;
-        let installable = format!(
-            "git+file://{mirror}?rev={commit}#nixosConfigurations.\"{configuration}\".config.system.build.toplevel"
-        );
-        let gcroots = self.state_dir.join("gcroots");
-        tokio::fs::create_dir_all(&gcroots).await?;
-        log.line(format!("building {installable}")).await;
-        let started = Instant::now();
-        let out = run(
-            Command::new("nix")
-                .args([
-                    "--extra-experimental-features",
-                    "nix-command flakes",
-                    "build",
-                    "--print-build-logs",
-                    "--print-out-paths",
-                    "--no-write-lock-file",
-                    "--out-link",
-                ])
-                // Keeps the latest system of each machine from being
-                // garbage collected.
-                .arg(gcroots.join(machine_id.to_string()))
-                .arg(&installable),
-            log,
-        )
-        .await?;
-        let store_path = out
-            .lines()
-            .last()
-            .map(str::trim)
-            .context("nix build printed no store path")?;
-        let store_path = StorePath::parse(store_path)?;
-        log.line(format!(
-            "built {store_path} in {}",
-            humantime::format_duration(Duration::from_secs(started.elapsed().as_secs()))
-        ))
-        .await;
+        let installable = installable(mirror, commit, &Os::Nixos.flake_attribute(configuration))?;
+        // Keeps the latest system of each machine from being garbage
+        // collected.
+        let out_link = self.state_dir.join("gcroots").join(machine_id.to_string());
+        let store_path = self.nix_build(&installable, &out_link, log).await?;
 
         let info = {
             let path = store_path.clone();
@@ -271,6 +240,48 @@ impl Builder {
 }
 
 impl Builder {
+    /// `nix build`s `installable`, linking the result from `out_link`.
+    pub async fn nix_build(
+        &self,
+        installable: &str,
+        out_link: &Path,
+        log: &mut Log,
+    ) -> anyhow::Result<StorePath> {
+        if let Some(dir) = out_link.parent() {
+            tokio::fs::create_dir_all(dir).await?;
+        }
+        log.line(format!("building {installable}")).await;
+        let started = Instant::now();
+        let out = run(
+            Command::new("nix")
+                .args([
+                    "--extra-experimental-features",
+                    "nix-command flakes",
+                    "build",
+                    "--print-build-logs",
+                    "--print-out-paths",
+                    "--no-write-lock-file",
+                    "--out-link",
+                ])
+                .arg(out_link)
+                .arg(installable),
+            log,
+        )
+        .await?;
+        let store_path = out
+            .lines()
+            .last()
+            .map(str::trim)
+            .context("nix build printed no store path")?;
+        let store_path = StorePath::parse(store_path)?;
+        log.line(format!(
+            "built {store_path} in {}",
+            humantime::format_duration(Duration::from_secs(started.elapsed().as_secs()))
+        ))
+        .await;
+        Ok(store_path)
+    }
+
     /// A Git bundle of `commit` from the repository's mirror, without the
     /// history of the `haves` it knows: what an agent needs to build the
     /// commit ([`mnix_protocol::agent_source_path`]).
@@ -349,7 +360,13 @@ impl Builder {
     }
 }
 
-fn git() -> Command {
+/// The flake output `attribute` at `commit` of a mirror.
+pub fn installable(mirror: &Path, commit: &str, attribute: &str) -> anyhow::Result<String> {
+    let mirror = mirror.to_str().context("non-UTF-8 state directory")?;
+    Ok(format!("git+file://{mirror}?rev={commit}#{attribute}"))
+}
+
+pub fn git() -> Command {
     let mut command = Command::new("git");
     // Never wait for a password prompt.
     command.env("GIT_TERMINAL_PROMPT", "0");
@@ -397,7 +414,8 @@ async fn run(command: &mut Command, log: &mut Log) -> anyhow::Result<String> {
 
 /// Buffers output for a deployment's log and writes it in batches.
 pub struct Log {
-    store: std::sync::Arc<dyn Store>,
+    /// `None` for output that only goes to the server's own log.
+    store: Option<std::sync::Arc<dyn Store>>,
     deployment_id: Uuid,
     machine_id: Option<Uuid>,
     buffer: String,
@@ -411,9 +429,20 @@ impl Log {
         machine_id: Option<Uuid>,
     ) -> Self {
         Self {
-            store,
+            store: Some(store),
             deployment_id,
             machine_id,
+            buffer: String::new(),
+            flushed: Instant::now(),
+        }
+    }
+
+    /// Output that belongs to no deployment: it is only traced.
+    pub fn discard() -> Self {
+        Self {
+            store: None,
+            deployment_id: Uuid::nil(),
+            machine_id: None,
             buffer: String::new(),
             flushed: Instant::now(),
         }
@@ -431,6 +460,10 @@ impl Log {
 
     pub async fn flush(&mut self) {
         self.flushed = Instant::now();
+        let Some(store) = &self.store else {
+            self.buffer.clear();
+            return;
+        };
         if self.buffer.is_empty() {
             return;
         }
@@ -442,7 +475,7 @@ impl Log {
             created_at: OffsetDateTime::now_utc(),
         };
         // Losing log output must not fail the deployment.
-        if let Err(e) = self.store.append_log(&entry).await {
+        if let Err(e) = store.append_log(&entry).await {
             tracing::error!("writing the log of deployment {}: {e}", self.deployment_id);
         }
     }

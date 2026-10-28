@@ -1,7 +1,7 @@
 // The HTTP API's bodies, mirroring `crates/protocol/src/api.rs`.
 
 export type MachineStatus = 'pending' | 'online' | 'offline';
-export type DeploymentKind = 'deploy' | 'rollback';
+export type DeploymentKind = 'deploy' | 'rollback' | 'reboot';
 export type DeploymentStatus = 'queued' | 'building' | 'activating' | 'succeeded' | 'failed';
 export type MachineDeploymentStatus =
 	| 'queued'
@@ -17,7 +17,8 @@ export type ActivationPhase =
 	| 'activating'
 	| 'checking_health'
 	| 'awaiting_confirmation'
-	| 'rolling_back';
+	| 'rolling_back'
+	| 'rebooting';
 
 export interface Generation {
 	number: number;
@@ -157,6 +158,51 @@ export interface LogEntry {
 	source: string;
 	text: string;
 	created_at: string;
+}
+
+export interface Commit {
+	commit: string;
+	summary: string;
+	author: string;
+	date: string;
+}
+
+export interface Updates {
+	repository: string;
+	/** The revision compared with. */
+	rev: string;
+	/** The commit `rev` names now. */
+	commit: string;
+	/** The commit the running system was built from, if known. */
+	current_commit: string | null;
+	/** Commits in `rev` the running system lacks; null if that is unknown. */
+	behind: number | null;
+	ahead: number | null;
+	/** The newest of the commits behind, newest first. */
+	commits: Commit[];
+	fetched_at: string;
+}
+
+export interface UpdateSummary {
+	machine: string;
+	rev: string | null;
+	commit: string | null;
+	behind: number | null;
+	error: string | null;
+}
+
+export type PreviewStatus = 'building' | 'succeeded' | 'failed';
+
+export interface Preview {
+	status: PreviewStatus;
+	rev: string;
+	commit: string | null;
+	from: string;
+	to: string | null;
+	diff: string | null;
+	message: string | null;
+	started_at: string;
+	finished_at: string | null;
 }
 
 export interface Session {

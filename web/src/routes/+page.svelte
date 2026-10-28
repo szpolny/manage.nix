@@ -6,13 +6,14 @@
 	import Dialog from '#lib/Dialog.svelte';
 	import EnrollmentInstructions from '#lib/EnrollmentInstructions.svelte';
 	import { ago, exact, revisionLabel, shortPath } from '#lib/format.ts';
-	import type { CreatedMachine, Machine } from '#lib/types.ts';
+	import type { CreatedMachine, Machine, UpdateSummary } from '#lib/types.ts';
 
 	let machines: Machine[] = $state([]);
 	let loaded = $state(false);
 	let error = $state('');
 	let selected: string[] = $state([]);
 	let now = $state(Date.now());
+	let updates: Record<string, UpdateSummary> = $state({});
 
 	let deployDialog: DeployDialog;
 	let addDialog: Dialog;
@@ -32,10 +33,25 @@
 		}
 	}
 
+	// Update checks fetch repositories, so they run less often.
+	async function refreshUpdates() {
+		try {
+			const list = await api.allUpdates();
+			updates = Object.fromEntries(list.map((u) => [u.machine, u]));
+		} catch {
+			// The machines are still worth showing.
+		}
+	}
+
 	onMount(() => {
 		refresh();
+		refreshUpdates();
 		const timer = setInterval(refresh, 5000);
-		return () => clearInterval(timer);
+		const updatesTimer = setInterval(refreshUpdates, 60_000);
+		return () => {
+			clearInterval(timer);
+			clearInterval(updatesTimer);
+		};
 	});
 
 	function openAdd() {
@@ -131,6 +147,14 @@
 							{:else if machine.current_system}
 								<span class="muted" title="Not built by manage.nix">unmanaged</span>
 							{:else}—{/if}
+							{#if updates[machine.name]?.behind}
+								{@const u = updates[machine.name]}
+								<a
+									class="behind"
+									href="/machines/{encodeURIComponent(machine.name)}"
+									title="{u.rev} is at {u.commit?.slice(0, 12)}">{u.behind} behind {u.rev}</a
+								>
+							{/if}
 						</td>
 						<td>
 							{#if machine.last_deployment}
@@ -209,6 +233,12 @@
 		background: var(--idle-bg);
 		color: var(--muted);
 		font-size: 0.75rem;
+	}
+	.behind {
+		display: block;
+		color: var(--warn);
+		font-size: 0.8rem;
+		font-family: inherit;
 	}
 	.reboot {
 		display: block;

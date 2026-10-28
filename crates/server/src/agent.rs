@@ -374,6 +374,7 @@ impl Session<'_> {
                 activation.commit_id,
             ) {
                 (DeploymentKind::Rollback, ..) => ActivationTarget::PreviousGeneration,
+                (DeploymentKind::Reboot, ..) => ActivationTarget::Reboot,
                 (DeploymentKind::Deploy, Some(store_path), ..) => {
                     ActivationTarget::System { store_path }
                 }

@@ -103,6 +103,7 @@ pub fn list(deployments: &[Deployment], now: OffsetDateTime) -> String {
         .map(|d| {
             let what = match d.kind {
                 DeploymentKind::Rollback => "rollback".to_owned(),
+                DeploymentKind::Reboot => "reboot".to_owned(),
                 DeploymentKind::Deploy => match (&d.rev, &d.commit) {
                     (Some(rev), Some(commit)) => {
                         format!("{rev} ({})", &commit[..commit.len().min(12)])

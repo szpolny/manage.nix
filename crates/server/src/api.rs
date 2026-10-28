@@ -11,10 +11,10 @@ use axum::routing::{get, post, put};
 use axum::{Extension, Json, Router};
 use mnix_nix::StorePath;
 use mnix_protocol::api::{
-    ClosureDiff, CreateDeployment, CreateEnrollmentToken, CreateMachine, CreateRepository,
-    CreateRollback, CreatedMachine, Deployment, DeploymentMachine, EnrollmentToken, GenerationView,
-    LogEntry, Machine, MachineDeployment, MachineStatus, Repository, Revision, SetConfiguration,
-    SetTags, SigningKey,
+    ClosureDiff, CreateDeployment, CreateEnrollmentToken, CreateMachine, CreateReboot,
+    CreateRepository, CreateRollback, CreatedMachine, Deployment, DeploymentMachine,
+    EnrollmentToken, GenerationView, LogEntry, Machine, MachineDeployment, MachineStatus,
+    Repository, Revision, SetConfiguration, SetTags, SigningKey,
 };
 use mnix_store::{MachineDeploymentRecord, NewEnrollmentToken, SystemRevision};
 use serde::Deserialize;
@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::app::{rfc3339, ApiError, State as AppState};
 use crate::auth::{self, Principal};
-use crate::{closure, deploy, events, secret};
+use crate::{closure, deploy, events, secret, updates};
 
 /// The longest an enrollment token may be valid.
 const MAX_TOKEN_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -45,12 +45,22 @@ pub fn routes(state: AppState) -> axum::Router<AppState> {
         )
         .route("/api/machines/{machine}/tags", put(set_tags))
         .route("/api/machines/{machine}/rollback", post(create_rollback))
+        .route("/api/machines/{machine}/reboot", post(create_reboot))
         .route(
             "/api/machines/{machine}/deployments",
             get(list_machine_deployments),
         )
         .route("/api/machines/{machine}/generations", get(list_generations))
         .route("/api/machines/{machine}/diff", get(diff_generations))
+        .route(
+            "/api/machines/{machine}/updates",
+            get(updates::machine_updates),
+        )
+        .route(
+            "/api/machines/{machine}/updates/preview",
+            get(updates::get_preview).post(updates::create_preview),
+        )
+        .route("/api/updates", get(updates::all_updates))
         .route(
             "/api/repositories",
             get(list_repositories).post(create_repository),
@@ -309,6 +319,23 @@ async fn create_rollback(
     ))
 }
 
+async fn create_reboot(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(machine): Path<String>,
+    Json(mut request): Json<CreateReboot>,
+) -> Result<(StatusCode, Json<Deployment>), ApiError> {
+    if let Some(username) = principal.username() {
+        request.requested_by = Some(username.to_owned());
+    }
+    let machine = find_machine(&state, &machine).await?;
+    let id = deploy::create_reboot(&state, &machine, request).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(deployment_view(&state, id).await?),
+    ))
+}
+
 async fn list_repositories(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<Repository>>, ApiError> {
@@ -521,7 +548,7 @@ async fn create_enrollment_token(
 }
 
 /// Looks a machine up by ID or, failing that, by name.
-async fn find_machine(state: &AppState, key: &str) -> Result<mnix_store::Machine, ApiError> {
+pub async fn find_machine(state: &AppState, key: &str) -> Result<mnix_store::Machine, ApiError> {
     if let Ok(id) = Uuid::parse_str(key) {
         let found = state.store.machine(id).await?;
         if let Some(machine) = found.filter(|m| m.organization_id == state.organization.id) {

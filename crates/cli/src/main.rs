@@ -11,9 +11,10 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use mnix_protocol::api::{
-    CreateDeployment, CreateEnrollmentToken, CreateMachine, CreateRepository, CreateRollback,
-    CreatedMachine, Deployment, DeploymentStatus, EnrollmentToken, Machine, Repository,
-    SetConfiguration, SetTags, SigningKey,
+    CreateDeployment, CreateEnrollmentToken, CreateMachine, CreatePreview, CreateReboot,
+    CreateRepository, CreateRollback, CreatedMachine, Deployment, DeploymentStatus,
+    EnrollmentToken, Machine, Preview, PreviewStatus, Repository, SetConfiguration, SetTags,
+    SigningKey, Updates,
 };
 use mnix_protocol::ActivationMode;
 use time::format_description::well_known::Rfc3339;
@@ -92,6 +93,30 @@ enum Command {
         #[command(flatten)]
         options: DeployOptions,
     },
+    /// Restart a machine. It must be online; the reboot finishes when its
+    /// agent reports from the new boot.
+    Reboot {
+        /// The machine's name or ID.
+        machine: String,
+        #[command(flatten)]
+        options: FollowOptions,
+    },
+    /// Show the commits a machine's repository has that its running system
+    /// was not built from.
+    Updates {
+        /// The machine's name or ID.
+        machine: String,
+        /// The branch, tag, or commit to compare with (default: the branch
+        /// the running system was deployed from, or the default branch).
+        #[arg(long)]
+        rev: Option<String>,
+        /// Also build the new system on the server and print how its
+        /// packages differ from the running system's.
+        #[arg(long)]
+        preview: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// List recent deployments, or show one.
     Deploys {
         #[command(subcommand)]
@@ -111,7 +136,13 @@ enum Command {
 struct DeployOptions {
     #[arg(long, value_enum, default_value_t = Mode::Switch)]
     mode: Mode,
-    /// Who is deploying, for the history (default: $USER).
+    #[command(flatten)]
+    follow: FollowOptions,
+}
+
+#[derive(Debug, Args)]
+struct FollowOptions {
+    /// Who is asking, for the history (default: $USER).
     #[arg(long = "as", value_name = "NAME")]
     requested_by: Option<String>,
     /// Print the deployment and return instead of following it.
@@ -351,20 +382,58 @@ fn main() -> anyhow::Result<ExitCode> {
                     targets,
                     rev,
                     mode: options.mode.into(),
-                    requested_by: requested_by(&options),
+                    requested_by: requested_by(&options.follow),
                 },
             )?;
-            return finish(&client, deployment, &options);
+            return finish(&client, deployment, &options.follow);
         }
         Command::Rollback { machine, options } => {
             let deployment: Deployment = client.post(
                 &format!("/api/machines/{}/rollback", client::escape(&machine)),
                 &CreateRollback {
                     mode: options.mode.into(),
+                    requested_by: requested_by(&options.follow),
+                },
+            )?;
+            return finish(&client, deployment, &options.follow);
+        }
+        Command::Reboot { machine, options } => {
+            let deployment: Deployment = client.post(
+                &format!("/api/machines/{}/reboot", client::escape(&machine)),
+                &CreateReboot {
                     requested_by: requested_by(&options),
                 },
             )?;
             return finish(&client, deployment, &options);
+        }
+        Command::Updates {
+            machine,
+            rev,
+            preview,
+            json,
+        } => {
+            let path = format!("/api/machines/{}/updates", client::escape(&machine));
+            let query = rev
+                .as_deref()
+                .map(|r| format!("?rev={}", client::escape(r)))
+                .unwrap_or_default();
+            let updates: Updates = client.get(&format!("{path}{query}"))?;
+            let preview = if preview {
+                Some(build_preview(&client, &path, rev)?)
+            } else {
+                None
+            };
+            if json {
+                print_json(&serde_json::json!({ "updates": updates, "preview": preview }))?;
+            } else {
+                print!("{}", updates_text(&updates));
+                if let Some(preview) = &preview {
+                    print!("{}", preview_text(preview));
+                }
+            }
+            if preview.is_some_and(|p| p.status != PreviewStatus::Succeeded) {
+                return Ok(ExitCode::FAILURE);
+            }
         }
         Command::Deploys {
             command: None,
@@ -412,7 +481,7 @@ fn main() -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn requested_by(options: &DeployOptions) -> Option<String> {
+fn requested_by(options: &FollowOptions) -> Option<String> {
     options
         .requested_by
         .clone()
@@ -425,7 +494,7 @@ fn requested_by(options: &DeployOptions) -> Option<String> {
 fn finish(
     client: &Client,
     deployment: Deployment,
-    options: &DeployOptions,
+    options: &FollowOptions,
 ) -> anyhow::Result<ExitCode> {
     if options.no_wait {
         if options.json {
@@ -444,6 +513,75 @@ fn finish(
         DeploymentStatus::Succeeded => ExitCode::SUCCESS,
         _ => ExitCode::FAILURE,
     })
+}
+
+/// Starts a preview of `rev` and waits for it to finish.
+fn build_preview(client: &Client, path: &str, rev: Option<String>) -> anyhow::Result<Preview> {
+    let path = format!("{path}/preview");
+    let mut preview: Preview = client.post(&path, &CreatePreview { rev })?;
+    eprintln!("Building the new system on the server…");
+    while preview.status == PreviewStatus::Building {
+        std::thread::sleep(Duration::from_secs(2));
+        preview = client.get(&path)?;
+    }
+    Ok(preview)
+}
+
+fn updates_text(updates: &Updates) -> String {
+    let short = |c: &str| c[..c.len().min(12)].to_owned();
+    let target = format!(
+        "{} {} ({})",
+        updates.repository,
+        updates.rev,
+        short(&updates.commit)
+    );
+    let mut out = match (updates.behind, &updates.current_commit) {
+        (Some(0), _) => format!("Up to date with {target}.\n"),
+        (Some(behind), _) => format!(
+            "{behind} commit{} behind {target}:\n",
+            if behind == 1 { "" } else { "s" }
+        ),
+        (None, Some(current)) => format!(
+            "The running commit {} is not in {}; cannot compare with {target}.\n",
+            short(current),
+            updates.repository
+        ),
+        (None, None) => format!(
+            "The running system's commit is unknown (not deployed by manage.nix, and \
+             no system.configurationRevision); {target} is the latest.\n"
+        ),
+    };
+    for commit in &updates.commits {
+        out.push_str(&format!(
+            "  {}  {}  ({}, {})\n",
+            short(&commit.commit),
+            commit.summary,
+            commit.author,
+            commit.date
+        ));
+    }
+    if let Some(ahead) = updates.ahead.filter(|&n| n > 0) {
+        out.push_str(&format!(
+            "The running system has {ahead} commit{} that {} lacks.\n",
+            if ahead == 1 { "" } else { "s" },
+            updates.rev
+        ));
+    }
+    out
+}
+
+fn preview_text(preview: &Preview) -> String {
+    match preview.status {
+        PreviewStatus::Building => "The preview is still building.\n".to_owned(),
+        PreviewStatus::Failed => format!(
+            "The preview failed: {}\n",
+            preview.message.as_deref().unwrap_or("unknown error")
+        ),
+        PreviewStatus::Succeeded => match preview.diff.as_deref().map(str::trim) {
+            Some("") | None => "\nThe new system has the same packages.\n".to_owned(),
+            Some(diff) => format!("\nPackage changes:\n{diff}\n"),
+        },
+    }
 }
 
 fn update_tags(

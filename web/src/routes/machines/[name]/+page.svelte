@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { api, errorMessage } from '#lib/api.ts';
+	import { api, ApiError, errorMessage } from '#lib/api.ts';
 	import Badge from '#lib/Badge.svelte';
 	import DeployDialog from '#lib/DeployDialog.svelte';
 	import Dialog from '#lib/Dialog.svelte';
@@ -13,7 +13,9 @@
 		GenerationView,
 		Machine,
 		MachineDeployment,
-		Repository
+		Preview,
+		Repository,
+		Updates
 	} from '#lib/types.ts';
 
 	let name = $derived(page.params.name ?? '');
@@ -38,6 +40,13 @@
 	let diff: ClosureDiff | null = $state(null);
 	let diffError = $state('');
 	let diffing = $state(false);
+
+	// Updates and their preview.
+	let updates: Updates | null = $state(null);
+	let updatesError = $state('');
+	let checking = $state(false);
+	let preview: Preview | null = $state(null);
+	let previewError = $state('');
 
 	let deployDialog: DeployDialog | undefined = $state();
 	let tokenDialog: Dialog;
@@ -64,6 +73,10 @@
 				to = g[index]?.number ?? null;
 				from = g[index + 1]?.number ?? null;
 				repositories = await api.repositories();
+				if (m.repository) checkUpdates();
+				loadPreview();
+			} else if (preview?.status === 'building') {
+				loadPreview();
 			}
 			error = '';
 		} catch (e) {
@@ -76,6 +89,8 @@
 		void name;
 		machine = null;
 		diff = null;
+		updates = preview = null;
+		updatesError = previewError = '';
 		load(true);
 		const timer = setInterval(() => load(false), 5000);
 		return () => clearInterval(timer);
@@ -123,6 +138,46 @@
 		}
 	}
 
+	async function checkUpdates() {
+		checking = true;
+		try {
+			updates = await api.updates(name);
+			updatesError = '';
+		} catch (e) {
+			updatesError = errorMessage(e);
+		} finally {
+			checking = false;
+		}
+	}
+
+	async function loadPreview() {
+		try {
+			preview = await api.preview(name);
+		} catch (e) {
+			// None yet.
+			if (!(e instanceof ApiError && e.status === 404)) previewError = errorMessage(e);
+		}
+	}
+
+	async function startPreview() {
+		previewError = '';
+		try {
+			preview = await api.startPreview(name, updates?.rev);
+		} catch (e) {
+			previewError = errorMessage(e);
+		}
+	}
+
+	async function reboot() {
+		if (!confirm(`Restart ${name} now?`)) return;
+		try {
+			const deployment = await api.reboot(name);
+			await goto(`/deploys/${deployment.id}`);
+		} catch (e) {
+			error = errorMessage(e);
+		}
+	}
+
 	async function rollback() {
 		if (!confirm(`Roll ${name} back to its previous generation?`)) return;
 		try {
@@ -157,6 +212,14 @@
 			<button type="button" onclick={newToken}>
 				{machine.enrolled_at ? 'Re-enroll…' : 'New enrollment token'}
 			</button>
+			<button
+				type="button"
+				class:attention={machine.facts?.reboot_required}
+				onclick={reboot}
+				disabled={machine.status !== 'online'}
+				title={machine.status === 'online' ? '' : 'Only online machines can be restarted'}
+				>Reboot…</button
+			>
 			<button type="button" onclick={rollback} disabled={!machine.enrolled_at}>Roll back</button>
 			<button
 				type="button"
@@ -267,6 +330,110 @@
 		</section>
 	</div>
 
+	{#if machine.repository}
+		<section class="section" data-testid="updates">
+			<div class="section-header">
+				<h2>Updates</h2>
+				<button type="button" onclick={checkUpdates} disabled={checking}>
+					{checking ? 'Checking…' : 'Check again'}
+				</button>
+			</div>
+			{#if updatesError}<p class="error" role="alert">{updatesError}</p>{/if}
+			{#if updates}
+				{@const target = `${updates.rev} (${updates.commit.slice(0, 12)})`}
+				<p>
+					{#if updates.behind === 0}
+						Up to date with <span class="mono">{target}</span>.
+					{:else if updates.behind !== null}
+						<strong class="warn"
+							>{updates.behind} commit{updates.behind === 1 ? '' : 's'} behind</strong
+						>
+						<span class="mono">{target}</span>.
+					{:else if updates.current_commit}
+						The running commit
+						<span class="mono">{updates.current_commit.slice(0, 12)}</span>
+						is not in {updates.repository}; the latest is <span class="mono">{target}</span>.
+					{:else}
+						The running system's commit is unknown; the latest is
+						<span class="mono">{target}</span>.
+					{/if}
+					{#if updates.ahead}
+						<span class="muted">
+							It has {updates.ahead} commit{updates.ahead === 1 ? '' : 's'} that {updates.rev} lacks.
+						</span>
+					{/if}
+					<span class="muted small" title={exact(updates.fetched_at)}>
+						Fetched {ago(updates.fetched_at, now)}.
+					</span>
+				</p>
+				{#if updates.commits.length}
+					<div class="table-card">
+						<table>
+							<thead>
+								<tr><th>Commit</th><th>Summary</th><th>Author</th><th>When</th></tr>
+							</thead>
+							<tbody>
+								{#each updates.commits as c (c.commit)}
+									<tr>
+										<td class="mono" title={c.commit}>{c.commit.slice(0, 12)}</td>
+										<td>{c.summary}</td>
+										<td>{c.author}</td>
+										<td title={exact(c.date)}>{ago(c.date, now)}</td>
+									</tr>
+								{/each}
+							</tbody>
+						</table>
+					</div>
+					{#if updates.behind !== null && updates.behind > updates.commits.length}
+						<p class="muted small">
+							And {updates.behind - updates.commits.length} older.
+						</p>
+					{/if}
+				{/if}
+				<div class="diff-actions">
+					<button
+						type="button"
+						onclick={startPreview}
+						disabled={preview?.status === 'building' || !machine.current_system}
+					>
+						{preview?.status === 'building' ? 'Building preview…' : 'Preview package changes'}
+					</button>
+					{#if updates.behind !== 0}
+						<button
+							type="button"
+							class="primary"
+							onclick={() => deployDialog?.open([name], updates?.rev)}
+							disabled={!machine.enrolled_at}>Deploy {updates.rev}…</button
+						>
+					{/if}
+				</div>
+			{:else if checking}
+				<p class="muted">Fetching {machine.repository}…</p>
+			{/if}
+			{#if previewError}<p class="error" role="alert">{previewError}</p>{/if}
+			{#if preview}
+				<div data-testid="preview">
+					{#if preview.status === 'building'}
+						<p class="muted">
+							Building {preview.rev || 'the default revision'}{preview.commit
+								? ` (${preview.commit.slice(0, 12)})`
+								: ''} on the server, started {ago(preview.started_at, now)}…
+						</p>
+					{:else if preview.status === 'failed'}
+						<p class="error" role="alert">Preview failed: {preview.message}</p>
+					{:else}
+						<p class="muted small">
+							Package changes from the running system to {preview.rev}
+							{#if preview.commit}(<span class="mono">{preview.commit.slice(0, 12)}</span>){/if},
+							built {ago(preview.finished_at, now)}:
+						</p>
+						<pre class="log">{preview.diff?.trim() || 'The closures are identical.'}</pre>
+					{/if}
+				</div>
+			{/if}
+		</section>
+	{/if}
+
 	<section class="section">
 		<h2>Generations</h2>
 		{#if generations.length}
@@ -361,8 +528,11 @@
 						{#each history as d (d.deployment_id)}
 							<tr>
 								<td><a href="/deploys/{d.deployment_id}"><Badge status={d.status} /></a></td>
-								<td>{d.kind} <span class="muted">({d.mode})</span></td>
-								<td class="mono">{d.kind === 'rollback' ? '—' : revisionLabel(d.rev, d.commit)}</td>
+								<td>
+									{d.kind}
+									{#if d.kind !== 'reboot'}<span class="muted">({d.mode})</span>{/if}
+								</td>
+								<td class="mono">{d.kind === 'deploy' ? revisionLabel(d.rev, d.commit) : '—'}</td>
 								<td>{d.requested_by}</td>
 								<td title={exact(d.created_at)}>{ago(d.created_at, now)}</td>
 								<td class="muted">{d.message ?? ''}</td>
@@ -425,7 +595,18 @@
 		color: var(--ok);
 	}
 	.diff-actions {
+		display: flex;
+		gap: 0.5rem;
 		margin: 0.75rem 0;
+	}
+	.section-header {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+	}
+	.attention {
+		border-color: var(--warn);
+		color: var(--warn);
 	}
 	h2 :global(+ p) {
 		margin-top: 0;
