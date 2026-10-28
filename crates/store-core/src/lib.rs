@@ -166,15 +166,31 @@ pub struct DeploymentMachine {
     pub finished_at: Option<OffsetDateTime>,
 }
 
+/// What a deploy hands to a machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Release {
+    /// A system the server built and signed.
+    System {
+        store_path: String,
+        signatures: Vec<String>,
+    },
+    /// A flake output for the machine to build at the deployment's commit.
+    Build { attribute: String },
+}
+
 /// An activation the machine's agent has not acknowledged yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingActivation {
     pub deployment_id: Uuid,
     pub kind: DeploymentKind,
     pub mode: ActivationMode,
-    /// `None` for a rollback.
+    /// The system the server built; `None` for a rollback or a build.
     pub store_path: Option<String>,
     pub signatures: Vec<String>,
+    /// The flake output the machine builds, for a build.
+    pub attribute: Option<String>,
+    /// The deployment's commit.
+    pub commit_id: Option<String>,
 }
 
 /// How a machine's part of a deployment ended.
@@ -426,6 +442,9 @@ pub trait Store: Send + Sync + 'static {
         now: OffsetDateTime,
     ) -> Result<Repository>;
 
+    /// Changes where a repository is fetched from.
+    async fn set_repository_url(&self, id: Uuid, url: &str) -> Result<()>;
+
     /// The organization's repositories, sorted by name.
     async fn repositories(&self, organization_id: Uuid) -> Result<Vec<Repository>>;
 
@@ -472,13 +491,12 @@ pub trait Store: Send + Sync + 'static {
         status: MachineDeploymentStatus,
     ) -> Result<()>;
 
-    /// Hands a built system to the machine's agent: status `activating`.
+    /// Hands a system to the machine's agent: status `activating`.
     async fn release_activation(
         &self,
         deployment_id: Uuid,
         machine_id: Uuid,
-        store_path: &str,
-        signatures: &[String],
+        release: &Release,
         now: OffsetDateTime,
     ) -> Result<()>;
 

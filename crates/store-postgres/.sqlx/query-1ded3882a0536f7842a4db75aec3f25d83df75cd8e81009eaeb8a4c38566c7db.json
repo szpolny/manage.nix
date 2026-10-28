@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE deployment_machines\n             SET status = 'activating', store_path = $1, signatures = $2, attribute = $3,\n                 released_at = $4\n             WHERE deployment_id = $5 AND machine_id = $6 AND finished_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "TextArray",
+        "Text",
+        "Timestamptz",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1ded3882a0536f7842a4db75aec3f25d83df75cd8e81009eaeb8a4c38566c7db"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE deployment_machines\n             SET status = 'activating', store_path = ?, signatures = ?, attribute = ?,\n                 released_at = ?\n             WHERE deployment_id = ? AND machine_id = ? AND finished_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "f6586511b55bb38f01b1207621bc43ef05d2da259f71d9278eeccc1894dc17e1"
+}

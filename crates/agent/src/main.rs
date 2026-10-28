@@ -11,6 +11,7 @@ mod facts;
 mod health;
 mod host;
 mod job;
+mod source;
 
 use std::fs::File;
 use std::io::IsTerminal;
@@ -33,7 +34,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Activate a NixOS system, rolling back if it is not healthy.
+    /// Activate a NixOS or nix-darwin system, rolling back if it is not
+    /// healthy.
     ///
     /// Prints a JSON report on stdout. Exits 0 on success, 1 if the request
     /// was refused or failed before the system changed, 2 if the system was
@@ -53,19 +55,13 @@ enum Command {
     ActivationJob { dir: PathBuf },
     /// Print facts about this machine as JSON.
     Facts,
-    /// Connect to the control plane and stay connected.
+    /// Connect to every control plane in the configuration
+    /// (`/etc/manage-nix/agent.json`) and stay connected.
     ///
-    /// On first start, exchanges the enrollment token for a credential and
-    /// stores it in the state directory.
+    /// On first start with each server, exchanges its enrollment token for
+    /// a credential and stores it in the state directory.
     Run {
-        /// The control plane's URL, for example `https://mnix.example.com`.
-        #[arg(long, env = "MNIX_SERVER_URL")]
-        server_url: String,
-        /// File containing a one-time enrollment token from
-        /// `mnix machine add`. Only read while the machine is not enrolled.
-        #[arg(long, env = "MNIX_ENROLLMENT_TOKEN_FILE")]
-        enrollment_token_file: Option<PathBuf>,
-        /// Where the agent keeps its credential.
+        /// Where the agent keeps its credentials and activations.
         #[arg(long, default_value = "/var/lib/manage-nix")]
         state_dir: PathBuf,
     },
@@ -115,16 +111,10 @@ fn main() -> anyhow::Result<ExitCode> {
             println!("{}", serde_json::to_string_pretty(&facts::collect()?)?);
             Ok(ExitCode::SUCCESS)
         }
-        Some(Command::Run {
-            server_url,
-            enrollment_token_file,
-            state_dir,
-        }) => {
-            tokio::runtime::Runtime::new()?.block_on(daemon::run(daemon::Options {
-                server_url,
-                enrollment_token_file,
-                state_dir,
-            }))?;
+        Some(Command::Run { state_dir }) => {
+            let config = config::AgentConfig::load_from(std::path::Path::new("/"))?
+                .context("no /etc/manage-nix/agent.json")?;
+            tokio::runtime::Runtime::new()?.block_on(daemon::run(config.servers, state_dir))?;
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Activate {
@@ -137,8 +127,9 @@ fn main() -> anyhow::Result<ExitCode> {
                 target: ActivationTarget::System { store_path },
                 mode: mode.into(),
                 signatures,
+                source: None,
             };
-            let report = activate::activate(&host::NixosHost, &request, &activate::Unobserved);
+            let report = activate::activate(&host::LocalHost, &request, &activate::Unobserved);
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(exit_code(&report))
         }
@@ -147,13 +138,29 @@ fn main() -> anyhow::Result<ExitCode> {
     }
 }
 
-/// Takes the machine-wide activation lock, failing if it is held.
-pub(crate) fn lock() -> anyhow::Result<File> {
+fn lock_file() -> anyhow::Result<File> {
     let path = std::path::Path::new(LOCK_PATH);
     std::fs::create_dir_all(path.parent().unwrap_or(path))?;
-    let file = File::create(path).with_context(|| format!("creating {LOCK_PATH}"))?;
+    File::create(path).with_context(|| format!("creating {LOCK_PATH}"))
+}
+
+/// Takes the machine-wide activation lock, failing if it is held.
+pub(crate) fn lock() -> anyhow::Result<File> {
+    let file = lock_file()?;
     file.try_lock()
         .map_err(|_| anyhow::anyhow!("another activation is already running ({LOCK_PATH})"))?;
+    Ok(file)
+}
+
+/// Takes the machine-wide activation lock, waiting while another
+/// activation (perhaps from another server) holds it.
+pub(crate) fn wait_for_lock() -> anyhow::Result<File> {
+    let file = lock_file()?;
+    if file.try_lock().is_err() {
+        tracing::info!("waiting for another activation to finish");
+        file.lock()
+            .with_context(|| format!("locking {LOCK_PATH}"))?;
+    }
     Ok(file)
 }
 

@@ -1,0 +1,56 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT dm.deployment_id, d.kind, d.mode, dm.store_path, dm.signatures, dm.attribute,\n                    d.commit_id\n             FROM deployment_machines AS dm JOIN deployments AS d ON d.id = dm.deployment_id\n             WHERE dm.machine_id = ? AND dm.status = 'activating' AND dm.accepted_at IS NULL\n             ORDER BY dm.released_at",
+  "describe": {
+    "columns": [
+      {
+        "name": "deployment_id",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "kind",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "mode",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "store_path",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "signatures",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "attribute",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "commit_id",
+        "ordinal": 6,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "302261ab673bb575051bb498d3f5095351a6468b46220b84d74acd8ddd6759b1"
+}

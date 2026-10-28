@@ -144,7 +144,7 @@
 						</td>
 						<td>
 							<span class="mono" title={machine.current_system ?? ''}>
-								{machine.facts?.nixos_version ?? shortPath(machine.current_system)}
+								{machine.facts?.os_version ?? shortPath(machine.current_system)}
 							</span>
 							{#if machine.facts?.reboot_required}
 								<span class="reboot" title="The running kernel or initrd differs from the booted one"

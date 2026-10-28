@@ -37,7 +37,8 @@
 <div class="page-header"><h1>Repositories</h1></div>
 
 <p class="muted intro">
-	Git repositories with a flake whose <code>nixosConfigurations</code> the server builds machines from.
+	Git repositories with a flake whose <code>nixosConfigurations</code> and
+	<code>darwinConfigurations</code> machines are built from.
 </p>
 
 {#if repositories.length}

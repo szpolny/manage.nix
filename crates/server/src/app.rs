@@ -86,7 +86,11 @@ pub fn router(state: State) -> Router {
         .merge(api::routes(state.clone()))
         .route("/api/session", post(auth::login))
         .route(mnix_protocol::ENROLL_PATH, post(agent::enroll))
-        .route(mnix_protocol::AGENT_WS_PATH, get(agent::connect));
+        .route(mnix_protocol::AGENT_WS_PATH, get(agent::connect))
+        .route(
+            &mnix_protocol::agent_source_path("{deployment}"),
+            get(agent::source),
+        );
     let router = match &state.web_dir {
         Some(dir) => router.fallback_service(web::service(dir)),
         None => router.fallback(|| async { ApiError::not_found("page") }),

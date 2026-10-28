@@ -15,12 +15,12 @@ use mnix_protocol::api::{
     CreateDeployment, CreateRollback, DeploymentKind, DeploymentStatus, MachineDeploymentStatus,
 };
 use mnix_protocol::{ActivationReport, ActivationStatus};
-use mnix_store::{Machine, MachineOutcome, NewDeployment, NewDeploymentMachine};
+use mnix_store::{Machine, MachineOutcome, NewDeployment, NewDeploymentMachine, Release};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::app::{ApiError, AppState, State};
-use crate::build::Log;
+use crate::build::{BuildOn, Log};
 
 /// How often the worker looks for queued deployments without being told.
 const QUEUE_POLL: Duration = Duration::from_secs(5);
@@ -273,6 +273,10 @@ async fn build_machines(state: &AppState, id: Uuid, log: &mut Log) -> anyhow::Re
     store.set_deployment_commit(id, &commit).await?;
     log.flush().await;
 
+    if builder.build_on == BuildOn::Machine {
+        return release_builds(state, &deployment, log).await;
+    }
+
     let mut built = Vec::new();
     for machine in &deployment.machines {
         if machine.status != MachineDeploymentStatus::Queued {
@@ -326,8 +330,10 @@ async fn build_machines(state: &AppState, id: Uuid, log: &mut Log) -> anyhow::Re
             .release_activation(
                 id,
                 *machine_id,
-                system.store_path.as_str(),
-                std::slice::from_ref(&system.signature),
+                &Release::System {
+                    store_path: system.store_path.to_string(),
+                    signatures: vec![system.signature.clone()],
+                },
                 now,
             )
             .await?;
@@ -336,6 +342,51 @@ async fn build_machines(state: &AppState, id: Uuid, log: &mut Log) -> anyhow::Re
         log.line(format!("activating on {} machine(s)", built.len()))
             .await;
         store.start_activating(id).await?;
+        state.activations_changed();
+    }
+    Ok(())
+}
+
+/// Hands each machine the flake output to build at the deployment's commit,
+/// chosen by the kind of system it reported.
+async fn release_builds(
+    state: &AppState,
+    deployment: &mnix_store::Deployment,
+    log: &mut Log,
+) -> anyhow::Result<()> {
+    let store = &state.store;
+    let now = OffsetDateTime::now_utc();
+    let mut released = 0;
+    for machine in &deployment.machines {
+        if machine.status != MachineDeploymentStatus::Queued {
+            continue;
+        }
+        let Some(configuration) = &machine.configuration else {
+            continue;
+        };
+        let os = store
+            .machine(machine.machine_id)
+            .await?
+            .and_then(|m| m.facts)
+            .map(|f| f.os)
+            .unwrap_or_default();
+        let attribute = os.flake_attribute(configuration);
+        log.line(format!("{} builds {attribute}", machine.machine_name))
+            .await;
+        store
+            .release_activation(
+                deployment.id,
+                machine.machine_id,
+                &Release::Build { attribute },
+                now,
+            )
+            .await?;
+        released += 1;
+    }
+    if released > 0 {
+        log.line(format!("activating on {released} machine(s)"))
+            .await;
+        store.start_activating(deployment.id).await?;
         state.activations_changed();
     }
     Ok(())

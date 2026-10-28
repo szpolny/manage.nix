@@ -158,7 +158,7 @@ pkgs.testers.runNixOSTest {
         assert facts["booted_system"] == base, facts
         assert not facts["reboot_required"], facts
         assert facts["kernel"] == machine.succeed("uname -r").strip(), facts
-        assert facts["nixos_version"], facts
+        assert facts["os_version"], facts
         current = [g for g in facts["generations"] if g["current"]]
         assert len(current) == 1 and current[0]["store_path"] == good, facts
   '';

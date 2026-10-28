@@ -13,6 +13,7 @@ export type MachineDeploymentStatus =
 export type ActivationMode = 'switch' | 'boot' | 'test';
 export type ActivationPhase =
 	| 'accepted'
+	| 'building'
 	| 'activating'
 	| 'checking_health'
 	| 'awaiting_confirmation'
@@ -25,11 +26,17 @@ export interface Generation {
 	current: boolean;
 }
 
+export type Os = 'nixos' | 'darwin';
+
 export interface Facts {
 	hostname: string;
+	os: Os;
 	current_system: string;
 	booted_system: string | null;
-	nixos_version: string | null;
+	/** `nixos-version` or `darwin-version`. */
+	os_version: string | null;
+	/** The commit the running configuration was built from, if the flake sets it. */
+	configuration_revision: string | null;
 	kernel: string;
 	reboot_required: boolean;
 	generations: Generation[];

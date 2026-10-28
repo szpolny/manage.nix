@@ -14,7 +14,7 @@ use mnix_protocol::{ActivationMode, ActivationPhase, ActivationReport, Activatio
 use mnix_store::{
     disconnect_reason, log_source, Backend, Error, Event, MachineOutcome, NewDeployment,
     NewDeploymentMachine, NewEnrollmentToken, NewLogEntry, NewSession, NewUserSession,
-    PostgresStore, Redemption, SqliteStore, Store,
+    PostgresStore, Redemption, Release, SqliteStore, Store,
 };
 use sqlx::postgres::PgConnectOptions;
 use sqlx::{Connection, PgConnection};
@@ -140,7 +140,9 @@ fn facts(hostname: &str) -> Facts {
         hostname: hostname.to_owned(),
         current_system: "/nix/store/00000000000000000000000000000000-nixos-system".to_owned(),
         booted_system: None,
-        nixos_version: Some("26.11".to_owned()),
+        os: mnix_protocol::Os::Nixos,
+        os_version: Some("26.11".to_owned()),
+        configuration_revision: None,
         kernel: "6.12.0".to_owned(),
         reboot_required: false,
         generations: Vec::new(),
@@ -625,6 +627,13 @@ async fn queued_deployment(
     id
 }
 
+fn system(store_path: &str) -> Release {
+    Release::System {
+        store_path: store_path.to_owned(),
+        signatures: Vec::new(),
+    }
+}
+
 fn report(status: ActivationStatus, store_path: &str) -> ActivationReport {
     ActivationReport {
         store_path: store_path.to_owned(),
@@ -678,7 +687,15 @@ store_test!(deployments_go_from_queue_to_result, |store: Arc<
         .unwrap();
     let sigs = vec!["mnix-1:sig".to_owned()];
     store
-        .release_activation(first, web, "/nix/store/new-web", &sigs, started)
+        .release_activation(
+            first,
+            web,
+            &Release::System {
+                store_path: "/nix/store/new-web".to_owned(),
+                signatures: sigs.clone(),
+            },
+            started,
+        )
         .await
         .unwrap();
     store.start_activating(first).await.unwrap();
@@ -698,6 +715,8 @@ store_test!(deployments_go_from_queue_to_result, |store: Arc<
     assert_eq!(pending[0].kind, DeploymentKind::Deploy);
     assert_eq!(pending[0].store_path.as_deref(), Some("/nix/store/new-web"));
     assert_eq!(pending[0].signatures, sigs);
+    assert_eq!(pending[0].attribute, None);
+    assert_eq!(pending[0].commit_id.as_deref(), Some("abc123"));
     assert!(store.pending_activations(db).await.unwrap().is_empty());
 
     // A phase acknowledges the request.
@@ -764,6 +783,74 @@ store_test!(deployments_go_from_queue_to_result, |store: Arc<
         .await
         .unwrap();
     assert_eq!(finished.deployment, Some(DeploymentStatus::Succeeded));
+});
+
+store_test!(machines_build_and_report_their_systems, |store: Arc<
+    dyn Store,
+>| async move {
+    let (org, web) = enrolled_machine(&*store, "web").await;
+    let id = queued_deployment(&*store, org, &[web], T0).await;
+    assert_eq!(store.claim_deployment(T0).await.unwrap(), Some(id));
+    store.set_deployment_commit(id, "c0ffee").await.unwrap();
+    let attribute = "nixosConfigurations.\"conf\".config.system.build.toplevel";
+    store
+        .release_activation(
+            id,
+            web,
+            &Release::Build {
+                attribute: attribute.to_owned(),
+            },
+            T0,
+        )
+        .await
+        .unwrap();
+    store.start_activating(id).await.unwrap();
+    let pending = store.pending_activations(web).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].store_path, None);
+    assert!(pending[0].signatures.is_empty());
+    assert_eq!(pending[0].attribute.as_deref(), Some(attribute));
+    assert_eq!(pending[0].commit_id.as_deref(), Some("c0ffee"));
+
+    // What the machine built becomes the deployment's system.
+    store
+        .finish_deployment_machine(
+            id,
+            web,
+            &MachineOutcome {
+                status: MachineDeploymentStatus::Succeeded,
+                message: None,
+                report: Some(report(ActivationStatus::Succeeded, "/nix/store/built")),
+            },
+            T0,
+        )
+        .await
+        .unwrap();
+    let d = store.deployment(id).await.unwrap().unwrap();
+    assert_eq!(
+        d.machines[0].store_path.as_deref(),
+        Some("/nix/store/built")
+    );
+    let revisions = store
+        .system_revisions(org, &["/nix/store/built".to_owned()])
+        .await
+        .unwrap();
+    assert_eq!(revisions.len(), 1);
+    assert_eq!(revisions[0].commit_id, "c0ffee");
+});
+
+store_test!(repositories_can_move, |store: Arc<dyn Store>| async move {
+    let org = store.ensure_organization("default", T0).await.unwrap().id;
+    let repo = store
+        .create_repository(org, "infra", "/srv/git/infra", T0)
+        .await
+        .unwrap();
+    store
+        .set_repository_url(repo.id, "git@example.com:infra.git")
+        .await
+        .unwrap();
+    let repo = store.repository(repo.id).await.unwrap().unwrap();
+    assert_eq!(repo.url, "git@example.com:infra.git");
 });
 
 store_test!(
@@ -834,7 +921,7 @@ store_test!(stuck_deployments_are_found_and_failed, |store: Arc<
     store.claim_deployment(T0).await.unwrap();
     store.claim_deployment(T0).await.unwrap();
     store
-        .release_activation(activating, web, "/nix/store/x", &[], T0)
+        .release_activation(activating, web, &system("/nix/store/x"), T0)
         .await
         .unwrap();
     store.start_activating(activating).await.unwrap();
@@ -944,7 +1031,7 @@ store_test!(machine_history_and_system_revisions, |store: Arc<
         (second, web, "/nix/store/web-1"),
     ] {
         store
-            .release_activation(deployment, machine, path, &[], T0)
+            .release_activation(deployment, machine, &system(path), T0)
             .await
             .unwrap();
     }

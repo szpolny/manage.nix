@@ -1,7 +1,11 @@
-//! `mnix-agent run`: enroll if needed, then keep one outbound WebSocket to
-//! the server open, reconnecting with backoff.
+//! `mnix-agent run`: enroll with each configured server if needed, then
+//! keep one outbound WebSocket to each open, reconnecting with backoff.
 //!
-//! The server's `activate` requests become jobs ([`crate::job`]) that run
+//! The servers are independent: each has its own credential, sees the
+//! machine's facts, and follows only the activations it asked for. They
+//! never need to reach each other, and any of them can be offline.
+//!
+//! A server's `activate` requests become jobs ([`crate::job`]) that run
 //! outside this service. The session reports their progress, logs, and
 //! results, and passes the server's `confirm` on. A job waiting for
 //! confirmation must be confirmed over a connection opened *after* it
@@ -9,16 +13,17 @@
 //! breaks networking (the firewall still lets established connections
 //! through), so the session reconnects first.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
 use mnix_protocol::{
-    Activate, ActivationPhase, ActivationReport, ActivationStatus, ActivationTarget, AgentMessage,
-    Facts, Hello, ServerMessage, PROTOCOL_VERSION,
+    Activate, ActivationPhase, ActivationTarget, AgentMessage, Facts, Hello, ServerMessage,
+    PROTOCOL_VERSION,
 };
+use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::StatusCode;
@@ -26,9 +31,10 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
+use crate::config::ServerConfig;
 use crate::credential::{self, Credential, EnrollError};
 use crate::facts;
-use crate::job::{Job, Jobs};
+use crate::job::{self, Job, Jobs};
 
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
@@ -41,27 +47,114 @@ const WELCOME_TIMEOUT: Duration = Duration::from_secs(30);
 const JOB_POLL: Duration = Duration::from_secs(1);
 /// The largest piece of activation log sent in one message.
 const LOG_CHUNK: usize = 32 * 1024;
+/// The server of jobs and credentials from agents before 0.2, which had
+/// one server; the modules name the server of `server.url` this way.
+pub const LEGACY_SERVER: &str = "default";
 
-pub struct Options {
-    /// The server's base URL (`https://...`).
-    pub server_url: String,
-    pub enrollment_token_file: Option<PathBuf>,
-    pub state_dir: PathBuf,
+/// Where the agent keeps what belongs to one server (its credential).
+pub fn server_dir(state_dir: &Path, name: &str) -> PathBuf {
+    state_dir.join("servers").join(name)
 }
 
-pub async fn run(options: Options) -> anyhow::Result<()> {
-    let server_url = options.server_url.trim_end_matches('/').to_owned();
+pub async fn run(servers: Vec<ServerConfig>, state_dir: PathBuf) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !servers.is_empty(),
+        "no servers are configured (services.manage-nix.agent.servers)"
+    );
+    let mut names = HashSet::new();
+    for server in &servers {
+        server.validate()?;
+        anyhow::ensure!(
+            names.insert(&server.name),
+            "the server {} is configured twice",
+            server.name
+        );
+    }
+    migrate_legacy_credential(&state_dir, &servers)?;
+
+    let (stop, stopped) = watch::channel(false);
+    let jobs = Jobs::new(&state_dir);
+    let mut tasks = tokio::task::JoinSet::new();
+    for server in servers {
+        tasks.spawn(serve(
+            server,
+            state_dir.clone(),
+            jobs.clone(),
+            stopped.clone(),
+        ));
+    }
+    shutdown_signal().await;
+    let _ = stop.send(true);
+    while tasks.join_next().await.is_some() {}
+    Ok(())
+}
+
+/// Moves the credential of an agent before 0.2 to the server it belongs to.
+fn migrate_legacy_credential(state_dir: &Path, servers: &[ServerConfig]) -> anyhow::Result<()> {
+    let Some(legacy) = credential::load(state_dir)? else {
+        return Ok(());
+    };
+    let owner = servers
+        .iter()
+        .find(|s| s.url.trim_end_matches('/') == legacy.server_url.trim_end_matches('/'))
+        .or_else(|| servers.iter().find(|s| s.name == LEGACY_SERVER))
+        .or_else(|| servers.first().filter(|_| servers.len() == 1));
+    let Some(owner) = owner else {
+        tracing::warn!(
+            "{} belongs to {}, which is not configured; leaving it",
+            credential::path(state_dir).display(),
+            legacy.server_url
+        );
+        return Ok(());
+    };
+    let dir = server_dir(state_dir, &owner.name);
+    if credential::load(&dir)?.is_none() {
+        credential::store(&dir, &legacy)?;
+        tracing::info!(
+            "moved the credential for {} to {}",
+            owner.name,
+            dir.display()
+        );
+    }
+    std::fs::remove_file(credential::path(state_dir))?;
+    Ok(())
+}
+
+async fn stopped(mut stop: watch::Receiver<bool>) {
+    let _ = stop.wait_for(|stopping| *stopping).await;
+}
+
+/// Keeps a connection to one server until the agent stops.
+async fn serve(server: ServerConfig, state_dir: PathBuf, jobs: Jobs, stop: watch::Receiver<bool>) {
+    use tracing::Instrument;
+    let span = tracing::info_span!("server", name = %server.name);
+    let result = serve_server(server, &state_dir, &jobs, stop)
+        .instrument(span.clone())
+        .await;
+    if let Err(e) = result {
+        span.in_scope(|| tracing::error!("{e:#}"));
+    }
+}
+
+async fn serve_server(
+    server: ServerConfig,
+    state_dir: &Path,
+    jobs: &Jobs,
+    stop: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let server_url = server.url.trim_end_matches('/').to_owned();
     let ws_url = websocket_url(&server_url)?;
     if ws_url.starts_with("ws://") {
-        tracing::warn!("{server_url} is not HTTPS; the credential is sent unencrypted");
+        tracing::warn!("{server_url} is not HTTPS; use it only over a private network");
     }
+    let dir = server_dir(state_dir, &server.name);
 
-    let shutdown = shutdown_signal();
+    let shutdown = stopped(stop);
     tokio::pin!(shutdown);
     let mut backoff = Backoff::default();
 
     let credential = loop {
-        let attempt = enroll_or_load(&options, &server_url);
+        let attempt = enroll_or_load(&server, &dir, &server_url);
         tokio::select! {
             result = attempt => match result {
                 Ok(credential) => break credential,
@@ -74,7 +167,7 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
             _ = &mut shutdown => return Ok(()),
         }
     };
-    if credential.server_url != server_url {
+    if credential.server_url.trim_end_matches('/') != server_url {
         tracing::warn!(
             "enrolled with {}, now configured for {server_url}; using the stored credential",
             credential.server_url
@@ -82,10 +175,9 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
     }
     tracing::info!("machine {}: connecting to {ws_url}", credential.machine_id);
 
-    let jobs = Jobs::new(&options.state_dir);
     let mut backoff = Backoff::default();
     loop {
-        let mut session = Session::new(&ws_url, &credential, &options.state_dir, &jobs);
+        let mut session = Session::new(&ws_url, &credential, &dir, &server, jobs);
         tokio::select! {
             result = session.run() => {
                 let reconnect = match result {
@@ -119,7 +211,7 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
             }
         }
         let mut delay = backoff.next();
-        if list_jobs(&jobs)
+        if list_jobs(jobs, &server.name)
             .await
             .iter()
             .any(|job| job.report.is_none())
@@ -135,14 +227,18 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
 }
 
 /// The stored credential, or a new one from the enrollment token.
-async fn enroll_or_load(options: &Options, server_url: &str) -> anyhow::Result<Credential> {
-    if let Some(credential) = credential::load(&options.state_dir)? {
+async fn enroll_or_load(
+    server: &ServerConfig,
+    dir: &Path,
+    server_url: &str,
+) -> anyhow::Result<Credential> {
+    if let Some(credential) = credential::load(dir)? {
         return Ok(credential);
     }
-    let token_file = options.enrollment_token_file.as_deref().with_context(|| {
+    let token_file = server.enrollment_token_file.as_deref().with_context(|| {
         format!(
             "not enrolled: no {} and no enrollment token file configured",
-            credential::path(&options.state_dir).display()
+            credential::path(dir).display()
         )
     })?;
     let token = credential::read_token(token_file)?;
@@ -158,7 +254,7 @@ async fn enroll_or_load(options: &Options, server_url: &str) -> anyhow::Result<C
             ),
             EnrollError::Other(e) => e.context("enrollment failed"),
         })?;
-    credential::store(&options.state_dir, &credential)?;
+    credential::store(dir, &credential)?;
     tracing::info!("enrolled as machine {}", credential.machine_id);
     Ok(credential)
 }
@@ -178,6 +274,7 @@ struct Session<'a> {
     ws_url: &'a str,
     credential: &'a Credential,
     credential_path: PathBuf,
+    server: &'a ServerConfig,
     jobs: &'a Jobs,
     socket: Option<Socket>,
     /// Whether the server accepted the `hello`.
@@ -194,11 +291,18 @@ struct Reported {
 }
 
 impl<'a> Session<'a> {
-    fn new(ws_url: &'a str, credential: &'a Credential, state_dir: &Path, jobs: &'a Jobs) -> Self {
+    fn new(
+        ws_url: &'a str,
+        credential: &'a Credential,
+        dir: &Path,
+        server: &'a ServerConfig,
+        jobs: &'a Jobs,
+    ) -> Self {
         Self {
             ws_url,
             credential,
-            credential_path: credential::path(state_dir),
+            credential_path: credential::path(dir),
+            server,
             jobs,
             socket: None,
             welcomed: false,
@@ -268,7 +372,7 @@ impl<'a> Session<'a> {
         loop {
             tokio::select! {
                 _ = job_ticker.tick() => {
-                    let jobs = list_jobs(self.jobs).await;
+                    let jobs = list_jobs(self.jobs, &self.server.name).await;
                     if report_jobs(socket, &jobs, &mut reported, connected_at, &mut facts).await? {
                         return Ok(Ended::Reconnect);
                     }
@@ -298,18 +402,26 @@ impl<'a> Session<'a> {
                             tracing::error!("server: {message}");
                         }
                         Incoming::Message(ServerMessage::Activate(request)) => {
-                            start_job(socket, self.jobs, request).await?;
+                            start_job(socket, self.jobs, self.server, request).await?;
                             job_ticker.reset_immediately();
                         }
                         Incoming::Message(ServerMessage::Confirm { deployment_id }) => {
-                            let jobs = list_jobs(self.jobs).await;
+                            let jobs = list_jobs(self.jobs, &self.server.name).await;
                             confirm_job(self.jobs, &jobs, &deployment_id, connected_at);
                             job_ticker.reset_immediately();
                         }
                         Incoming::Message(ServerMessage::ResultReceived { deployment_id }) => {
+                            // Only this server's jobs: deployment IDs are
+                            // the servers' to choose.
+                            let ours = list_jobs(self.jobs, &self.server.name)
+                                .await
+                                .iter()
+                                .any(|job| job.deployment_id == deployment_id);
                             reported.remove(&deployment_id);
-                            if let Err(e) = self.jobs.remove(&deployment_id) {
-                                tracing::error!("{e:#}");
+                            if ours {
+                                if let Err(e) = self.jobs.remove(&deployment_id) {
+                                    tracing::error!("{e:#}");
+                                }
                             }
                         }
                         Incoming::Message(ServerMessage::Welcome { .. }) | Incoming::Alive => {}
@@ -333,20 +445,55 @@ impl<'a> Session<'a> {
     }
 }
 
-async fn list_jobs(jobs: &Jobs) -> Vec<Job> {
+/// The jobs `server` asked for.
+async fn list_jobs(jobs: &Jobs, server: &str) -> Vec<Job> {
     let jobs = jobs.clone();
-    tokio::task::spawn_blocking(move || jobs.list())
-        .await
-        .unwrap_or_default()
+    let server = server.to_owned();
+    tokio::task::spawn_blocking(move || {
+        jobs.list()
+            .into_iter()
+            .filter(|job| job.server.as_deref().unwrap_or(LEGACY_SERVER) == server)
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// Starts a job for the server's request (unless it is already known).
-async fn start_job(socket: &mut Socket, jobs: &Jobs, request: Activate) -> anyhow::Result<()> {
-    let jobs = jobs.clone();
+async fn start_job(
+    socket: &mut Socket,
+    jobs: &Jobs,
+    server: &ServerConfig,
+    request: Activate,
+) -> anyhow::Result<()> {
     let deployment_id = request.deployment_id.clone();
+    if matches!(request.target, ActivationTarget::Build { .. }) && !server.allow_builds {
+        tracing::warn!(
+            "deployment {deployment_id}: refusing to build for {}",
+            server.name
+        );
+        let report = job::failed_report(
+            &request,
+            format!(
+                "refused: this machine does not build for the server {:?} \
+                 (services.manage-nix.agent.servers.{}.allowBuilds)",
+                server.name, server.name
+            ),
+        );
+        return send(
+            socket,
+            &AgentMessage::ActivationResult {
+                deployment_id,
+                report,
+            },
+        )
+        .await;
+    }
     let started = tokio::task::spawn_blocking({
+        let jobs = jobs.clone();
         let request = request.clone();
-        move || jobs.start(&request)
+        let server = server.name.clone();
+        move || jobs.start(&request, &server)
     })
     .await?;
     match started {
@@ -355,18 +502,7 @@ async fn start_job(socket: &mut Socket, jobs: &Jobs, request: Activate) -> anyho
         // The request could not be stored (an invalid ID); answer at once.
         Err(e) => {
             tracing::error!("deployment {deployment_id}: {e:#}");
-            let report = ActivationReport {
-                store_path: match request.target {
-                    ActivationTarget::System { store_path } => store_path,
-                    ActivationTarget::PreviousGeneration => String::new(),
-                },
-                mode: request.mode,
-                status: ActivationStatus::Failed,
-                system_changed: false,
-                previous_system: None,
-                message: Some(format!("refused: {e:#}")),
-                failed_checks: Vec::new(),
-            };
+            let report = job::failed_report(&request, format!("refused: {e:#}"));
             send(
                 socket,
                 &AgentMessage::ActivationResult {

@@ -1,11 +1,14 @@
 //! Building a machine's system: fetch the repository into a mirror, build
 //! the machine's NixOS configuration, sign the result, and push it to the
-//! binary cache.
+//! binary cache. With [`BuildOn::Machine`], the server only fetches and
+//! resolves the revision, and serves the source to the machines as Git
+//! bundles ([`Builder::bundle`]); they build their systems themselves.
 //!
 //! Everything runs through the `git`, `nix`, and `attic` command-line tools
 //! with fixed arguments; nothing goes through a shell. Their output goes to
 //! the deployment's log.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -67,11 +70,26 @@ impl Attic {
     }
 }
 
+/// Where deployments build systems.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum BuildOn {
+    /// The server builds, signs, and pushes each system to the cache (or
+    /// keeps it, when the machine is the server's own).
+    Server,
+    /// Each machine builds its own system from source the server sends.
+    Machine,
+}
+
 pub struct Builder {
     /// Mirrors in `repositories/`, garbage collector roots in `gcroots/`.
     pub state_dir: PathBuf,
     pub signing_key: SecretKey,
     pub attic: Option<Attic>,
+    pub build_on: BuildOn,
+    /// SSH private keys to fetch repositories with, by repository.
+    pub ssh_keys: HashMap<Uuid, PathBuf>,
+    /// Serializes fetches and bundles, which share the mirrors' refs.
+    pub git_lock: tokio::sync::Mutex<()>,
 }
 
 /// A system built for one machine.
@@ -82,6 +100,30 @@ pub struct Built {
 }
 
 impl Builder {
+    fn mirror(&self, repository_id: Uuid) -> PathBuf {
+        self.state_dir
+            .join("repositories")
+            .join(format!("{repository_id}.git"))
+    }
+
+    /// `git`, with the repository's SSH key if it has one.
+    fn git_for(&self, repository_id: Uuid) -> Command {
+        let mut command = git();
+        if let Some(key) = self.ssh_keys.get(&repository_id) {
+            let quote = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
+            command.env(
+                "GIT_SSH_COMMAND",
+                format!(
+                    "ssh -i {} -o IdentitiesOnly=yes -o BatchMode=yes \
+                     -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile={}",
+                    quote(key),
+                    quote(&self.state_dir.join("known_hosts"))
+                ),
+            );
+        }
+        command
+    }
+
     /// Clones the repository on first use and fetches it afterwards.
     /// Returns the mirror's path.
     pub async fn fetch(
@@ -90,6 +132,7 @@ impl Builder {
         url: &str,
         log: &mut Log,
     ) -> anyhow::Result<PathBuf> {
+        let _git = self.git_lock.lock().await;
         let dir = self.state_dir.join("repositories");
         tokio::fs::create_dir_all(&dir)
             .await
@@ -98,7 +141,16 @@ impl Builder {
         if mirror.exists() {
             log.line(format!("fetching {url}")).await;
             run(
-                git()
+                self.git_for(repository_id)
+                    .arg("-C")
+                    .arg(&mirror)
+                    .args(["remote", "set-url", "origin", "--"])
+                    .arg(url),
+                log,
+            )
+            .await?;
+            run(
+                self.git_for(repository_id)
                     .arg("-C")
                     .arg(&mirror)
                     .args(["fetch", "--prune", "--quiet", "origin"]),
@@ -110,7 +162,7 @@ impl Builder {
             let partial = dir.join(format!("{repository_id}.git.partial"));
             let _ = tokio::fs::remove_dir_all(&partial).await;
             run(
-                git()
+                self.git_for(repository_id)
                     .args(["clone", "--mirror", "--quiet", "--"])
                     .arg(url)
                     .arg(&partial),
@@ -215,6 +267,85 @@ impl Builder {
             store_path,
             signature,
         })
+    }
+}
+
+impl Builder {
+    /// A Git bundle of `commit` from the repository's mirror, without the
+    /// history of the `haves` it knows: what an agent needs to build the
+    /// commit ([`mnix_protocol::agent_source_path`]).
+    pub async fn bundle(
+        &self,
+        repository_id: Uuid,
+        commit: &str,
+        haves: &[String],
+    ) -> anyhow::Result<Vec<u8>> {
+        let is_commit = |c: &str| c.len() == 40 && c.chars().all(|c| c.is_ascii_hexdigit());
+        anyhow::ensure!(is_commit(commit), "invalid commit {commit:?}");
+        let mirror = self.mirror(repository_id);
+        let _git = self.git_lock.lock().await;
+        let mut excluded = Vec::new();
+        for have in haves.iter().filter(|h| is_commit(h)) {
+            let known = git()
+                .arg("-C")
+                .arg(&mirror)
+                .args(["cat-file", "-e", &format!("{have}^{{commit}}")])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await?
+                .success();
+            // Leaving out an ancestor of a have the agent lacks would
+            // make the bundle unusable, so only exclude what is known.
+            if known && have != commit {
+                excluded.push(format!("^{have}"));
+            }
+        }
+        let quiet = |command: &mut Command| {
+            command
+                .arg("-C")
+                .arg(&mirror)
+                .stdin(Stdio::null())
+                .stderr(Stdio::piped());
+        };
+        let mut update = git();
+        quiet(&mut update);
+        let out = update
+            .args(["update-ref", mnix_protocol::SOURCE_BUNDLE_REF, commit])
+            .output()
+            .await?;
+        anyhow::ensure!(
+            out.status.success(),
+            "git update-ref: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        let mut bundle = git();
+        quiet(&mut bundle);
+        let out = bundle
+            .args([
+                "bundle",
+                "create",
+                "--quiet",
+                "-",
+                mnix_protocol::SOURCE_BUNDLE_REF,
+            ])
+            .args(&excluded)
+            .stdout(Stdio::piped())
+            .output()
+            .await;
+        let mut delete = git();
+        quiet(&mut delete);
+        let _ = delete
+            .args(["update-ref", "-d", mnix_protocol::SOURCE_BUNDLE_REF])
+            .status()
+            .await;
+        let out = out?;
+        anyhow::ensure!(
+            out.status.success(),
+            "git bundle: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        Ok(out.stdout)
     }
 }
 

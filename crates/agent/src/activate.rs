@@ -3,16 +3,16 @@
 //!
 //! The steps talk to the machine only through [`Host`], so the decisions
 //! (what to refuse, when to roll back, and how) are unit tested against a
-//! fake machine. [`crate::host::NixosHost`] is the real implementation.
+//! fake machine. [`crate::host::LocalHost`] is the real implementation.
 //! Progress and the final confirmation go through an [`Observer`]: the
 //! command line has none, and an activation for the server waits for the
 //! server's `confirm` (see [`crate::job`]).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use mnix_protocol::{
-    ActivationMode, ActivationPhase, ActivationReport, ActivationStatus, ActivationTarget,
+    ActivationMode, ActivationPhase, ActivationReport, ActivationStatus, ActivationTarget, Os,
 };
 
 use crate::config::{AgentConfig, HealthChecks};
@@ -23,11 +23,15 @@ pub type ProfileGeneration = (u64, StorePath);
 
 /// Everything activation needs to do to the machine.
 pub trait Host {
+    fn os(&self) -> Os;
     /// Makes sure `path` is in the local store, substituting it if needed.
     fn realise(&self, path: &StorePath) -> anyhow::Result<()>;
+    /// Builds a flake installable and returns its output.
+    fn build(&self, installable: &str) -> anyhow::Result<StorePath>;
     fn path_info(&self, path: &StorePath) -> anyhow::Result<PathInfo>;
-    /// Whether `path` is a NixOS system that can be activated.
-    fn is_nixos_system(&self, path: &StorePath) -> bool;
+    /// Whether `path` is a system of this machine's kind ([`Host::os`])
+    /// that can be activated.
+    fn is_system(&self, path: &StorePath) -> bool;
     /// The agent configuration installed under `root` (`/` or a system).
     fn agent_config(&self, root: &Path) -> anyhow::Result<Option<AgentConfig>>;
     fn current_system(&self) -> anyhow::Result<StorePath>;
@@ -50,6 +54,9 @@ pub struct Request {
     /// Signatures on the target obtained some other way than from Nix (the
     /// server sends them with the request).
     pub signatures: Vec<String>,
+    /// The Git repository holding the commit of a
+    /// [`ActivationTarget::Build`] target.
+    pub source: Option<PathBuf>,
 }
 
 /// Follows an activation.
@@ -98,7 +105,7 @@ pub fn activate(host: &dyn Host, request: &Request, observer: &dyn Observer) -> 
     let mut report = ActivationReport {
         store_path: match &request.target {
             ActivationTarget::System { store_path } => store_path.clone(),
-            ActivationTarget::PreviousGeneration => String::new(),
+            ActivationTarget::Build { .. } | ActivationTarget::PreviousGeneration => String::new(),
         },
         mode,
         status: ActivationStatus::Failed,
@@ -108,8 +115,11 @@ pub fn activate(host: &dyn Host, request: &Request, observer: &dyn Observer) -> 
         failed_checks: Vec::new(),
     };
 
-    observer.phase(ActivationPhase::Activating);
-    let plan = match plan(host, request) {
+    observer.phase(match request.target {
+        ActivationTarget::Build { .. } => ActivationPhase::Building,
+        _ => ActivationPhase::Activating,
+    });
+    let plan = match plan(host, request, observer) {
         Ok(plan) => plan,
         Err(e) => {
             tracing::error!("refusing to activate {}: {e:#}", describe(&request.target));
@@ -145,18 +155,56 @@ pub fn activate(host: &dyn Host, request: &Request, observer: &dyn Observer) -> 
     report
 }
 
-fn describe(target: &ActivationTarget) -> &str {
+fn describe(target: &ActivationTarget) -> String {
     match target {
-        ActivationTarget::System { store_path } => store_path,
-        ActivationTarget::PreviousGeneration => "the previous generation",
+        ActivationTarget::System { store_path } => store_path.clone(),
+        ActivationTarget::Build { commit, attribute } => format!("{attribute} at {commit}"),
+        ActivationTarget::PreviousGeneration => "the previous generation".to_owned(),
     }
 }
 
-/// Checks everything that can be checked without changing the machine.
-fn plan(host: &dyn Host, request: &Request) -> anyhow::Result<Plan> {
+/// The flake installable for a build target in `source`. The commit must be
+/// a full hash and the attribute a system of this machine's kind, so the
+/// server can only choose which configuration to build.
+pub fn installable(
+    os: Os,
+    source: &Path,
+    source_ref: &str,
+    commit: &str,
+    attribute: &str,
+) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        commit.len() == 40 && commit.chars().all(|c| c.is_ascii_hexdigit()),
+        "invalid commit {commit:?}"
+    );
+    let prefix = match os {
+        Os::Nixos => "nixosConfigurations.",
+        Os::Darwin => "darwinConfigurations.",
+    };
+    anyhow::ensure!(
+        attribute.starts_with(prefix)
+            && attribute
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "._-\"".contains(c)),
+        "{attribute:?} is not a system this machine can build (expected {prefix}...)"
+    );
+    let source = source.to_str().context("non-UTF-8 source path")?;
+    Ok(format!(
+        "git+file://{source}?ref={source_ref}&rev={commit}#{attribute}"
+    ))
+}
+
+/// Checks everything that can be checked without changing the machine,
+/// building the system first if asked to.
+fn plan(host: &dyn Host, request: &Request, observer: &dyn Observer) -> anyhow::Result<Plan> {
     let config = host
         .agent_config(Path::new("/"))?
         .context("the agent is not configured (no /etc/manage-nix/agent.json)")?;
+    let os = host.os();
+    anyhow::ensure!(
+        crate::host::supports(os, request.mode),
+        "nix-darwin has no boot default; use switch or test"
+    );
 
     let target = match &request.target {
         ActivationTarget::System { store_path } => {
@@ -173,6 +221,21 @@ fn plan(host: &dyn Host, request: &Request) -> anyhow::Result<Plan> {
             tracing::info!("{target} is signed by trusted key {key}");
             target
         }
+        // The machine built it from the source of a server it trusts to
+        // make it build; there is nobody else to vouch for it.
+        ActivationTarget::Build { commit, attribute } => {
+            let source = request
+                .source
+                .as_deref()
+                .context("no source repository for the build")?;
+            let installable = installable(os, source, crate::source::LOCAL_REF, commit, attribute)?;
+            let target = host
+                .build(&installable)
+                .with_context(|| format!("building {attribute}"))?;
+            tracing::info!("built {target}");
+            observer.phase(ActivationPhase::Activating);
+            target
+        }
         // Root put every profile generation there; it needs no signature.
         ActivationTarget::PreviousGeneration => {
             let (number, target) = previous_generation(host)?;
@@ -182,8 +245,12 @@ fn plan(host: &dyn Host, request: &Request) -> anyhow::Result<Plan> {
     };
 
     anyhow::ensure!(
-        host.is_nixos_system(&target),
-        "{target} is not a NixOS system (no bin/switch-to-configuration)"
+        host.is_system(&target),
+        "{target} is not a {} system",
+        match os {
+            Os::Nixos => "NixOS",
+            Os::Darwin => "nix-darwin",
+        }
     );
     let target_config = host.agent_config(target.as_path())?.context(
         "the new system does not enable services.manage-nix.agent; \
@@ -331,6 +398,8 @@ mod tests {
 
     /// A fake machine that records what was done to it.
     struct Fake {
+        os: Os,
+        builds: bool,
         configs: BTreeMap<String, AgentConfig>,
         signatures: Vec<String>,
         not_systems: BTreeSet<String>,
@@ -353,6 +422,7 @@ mod tests {
             },
             mode,
             signatures: Vec::new(),
+            source: None,
         }
     }
 
@@ -395,12 +465,15 @@ mod tests {
                 },
                 ..HealthChecks::default()
             },
+            servers: Vec::new(),
         }
     }
 
     impl Fake {
         fn new() -> Self {
             Self {
+                os: Os::Nixos,
+                builds: true,
                 configs: BTreeMap::from([("/".into(), config(true)), (NEW.into(), config(true))]),
                 signatures: vec![signature("test-1", NEW)],
                 not_systems: BTreeSet::new(),
@@ -423,8 +496,16 @@ mod tests {
     }
 
     impl Host for Fake {
+        fn os(&self) -> Os {
+            self.os
+        }
         fn realise(&self, _: &StorePath) -> anyhow::Result<()> {
             Ok(())
+        }
+        fn build(&self, installable: &str) -> anyhow::Result<StorePath> {
+            self.log.borrow_mut().push(format!("build {installable}"));
+            anyhow::ensure!(self.builds, "build failed");
+            Ok(sp(NEW))
         }
         fn path_info(&self, path: &StorePath) -> anyhow::Result<PathInfo> {
             Ok(PathInfo {
@@ -432,7 +513,7 @@ mod tests {
                 ..fake_path_info(path.as_str())
             })
         }
-        fn is_nixos_system(&self, path: &StorePath) -> bool {
+        fn is_system(&self, path: &StorePath) -> bool {
             !self.not_systems.contains(path.as_str())
         }
         fn agent_config(&self, root: &Path) -> anyhow::Result<Option<AgentConfig>> {
@@ -720,6 +801,7 @@ mod tests {
             target: ActivationTarget::PreviousGeneration,
             mode: ActivationMode::Switch,
             signatures: Vec::new(),
+            source: None,
         }
     }
 
@@ -765,5 +847,101 @@ mod tests {
         };
         host.configs.get_mut(NEW).unwrap().trusted_public_keys = vec![];
         assert_refused(host, NEW, "no valid signature");
+    }
+
+    const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn build(attribute: &str, mode: ActivationMode) -> Request {
+        Request {
+            target: ActivationTarget::Build {
+                commit: COMMIT.to_owned(),
+                attribute: attribute.to_owned(),
+            },
+            mode,
+            signatures: Vec::new(),
+            source: Some("/var/lib/manage-nix/sources/s.git".into()),
+        }
+    }
+
+    #[test]
+    fn built_systems_need_no_signature() {
+        let host = Fake {
+            signatures: vec![],
+            ..Fake::new()
+        };
+        let watcher = Watcher::default();
+        let attribute = Os::Nixos.flake_attribute("web-1");
+        let report = activate(&host, &build(&attribute, ActivationMode::Switch), &watcher);
+        assert_eq!(report.status, ActivationStatus::Succeeded, "{report:?}");
+        assert_eq!(report.store_path, NEW);
+        assert_eq!(
+            host.log()[0],
+            format!(
+                "build git+file:///var/lib/manage-nix/sources/s.git?ref={}&rev={COMMIT}#{attribute}",
+                crate::source::LOCAL_REF
+            )
+        );
+        assert_eq!(
+            watcher.phases.borrow()[..2],
+            [ActivationPhase::Building, ActivationPhase::Activating]
+        );
+    }
+
+    #[test]
+    fn builds_are_limited_to_this_machines_systems() {
+        let host = Fake::new();
+        for attribute in [
+            Os::Darwin.flake_attribute("mac"),
+            "packages.x86_64-linux.default".to_owned(),
+            "nixosConfigurations.x.config.system.build.toplevel --impure".to_owned(),
+        ] {
+            let report = activate(
+                &host,
+                &build(&attribute, ActivationMode::Switch),
+                &Unobserved,
+            );
+            assert_eq!(report.status, ActivationStatus::Failed, "{attribute}");
+            assert!(!report.system_changed);
+        }
+        assert!(installable(
+            Os::Nixos,
+            Path::new("/s"),
+            "r",
+            "abc",
+            "nixosConfigurations.x"
+        )
+        .is_err());
+        assert!(host.log().is_empty(), "{:?}", host.log());
+
+        let host = Fake {
+            builds: false,
+            ..Fake::new()
+        };
+        let report = activate(
+            &host,
+            &build(&Os::Nixos.flake_attribute("web-1"), ActivationMode::Switch),
+            &Unobserved,
+        );
+        assert_eq!(report.status, ActivationStatus::Failed);
+        assert!(report.message.unwrap().contains("build failed"));
+        assert_eq!(host.log().len(), 1);
+    }
+
+    #[test]
+    fn darwin_has_no_boot_mode() {
+        let host = Fake {
+            os: Os::Darwin,
+            ..Fake::new()
+        };
+        let report = run(&host, NEW, ActivationMode::Boot);
+        assert_eq!(report.status, ActivationStatus::Failed);
+        assert!(report.message.unwrap().contains("no boot default"));
+        assert!(host.log().is_empty());
+        let report = activate(
+            &host,
+            &build(&Os::Darwin.flake_attribute("mac"), ActivationMode::Switch),
+            &Unobserved,
+        );
+        assert_eq!(report.status, ActivationStatus::Succeeded, "{report:?}");
     }
 }

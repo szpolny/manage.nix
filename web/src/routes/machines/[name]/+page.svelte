@@ -193,19 +193,25 @@
 					<dd class="mono" title={machine.facts.current_system}>
 						{shortPath(machine.facts.current_system)}
 					</dd>
-					<dt>Booted</dt>
-					<dd class="mono" title={machine.facts.booted_system ?? ''}>
-						{shortPath(machine.facts.booted_system)}
+					{#if machine.facts.os === 'nixos'}
+						<dt>Booted</dt>
+						<dd class="mono" title={machine.facts.booted_system ?? ''}>
+							{shortPath(machine.facts.booted_system)}
+						</dd>
+						<dt>Reboot needed</dt>
+						<dd>
+							{#if machine.facts.reboot_required}
+								<strong class="warn">yes</strong>: the running kernel or initrd differs from the
+								booted one
+							{:else}no{/if}
+						</dd>
+					{/if}
+					<dt>{machine.facts.os === 'darwin' ? 'nix-darwin' : 'NixOS'}</dt>
+					<dd>{machine.facts.os_version ?? '—'}</dd>
+					<dt>Built from</dt>
+					<dd class="mono" title={machine.facts.configuration_revision ?? ''}>
+						{machine.facts.configuration_revision?.slice(0, 12) ?? '—'}
 					</dd>
-					<dt>Reboot needed</dt>
-					<dd>
-						{#if machine.facts.reboot_required}
-							<strong class="warn">yes</strong>: the running kernel or initrd differs from the booted
-							one
-						{:else}no{/if}
-					</dd>
-					<dt>NixOS</dt>
-					<dd>{machine.facts.nixos_version ?? '—'}</dd>
 					<dt>Kernel</dt>
 					<dd>{machine.facts.kernel}</dd>
 					<dt>Hostname</dt>
@@ -238,7 +244,7 @@
 						</select>
 					</label>
 					<label class="grow">
-						nixosConfigurations.
+						{machine.facts?.os === 'darwin' ? 'darwinConfigurations.' : 'nixosConfigurations.'}
 						<input name="configuration" bind:value={configuration} placeholder={name} />
 					</label>
 					<button type="submit">Save</button>

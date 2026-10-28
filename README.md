@@ -77,6 +77,39 @@ Each machine activates its system in its own systemd unit, checks its
 health, and then must reach the server over a **new** connection within
 `confirmTimeout` (60 s); otherwise it rolls back on its own.
 
+## Several servers, machine builds, and macOS
+
+An agent can connect to several independent servers at once
+(`services.manage-nix.agent.servers.<name>`); each enrolls the machine on its
+own, sees its facts, and can deploy to it, and none needs to reach the
+others. A deployment and its confirmation belong to the server that asked,
+and the machine activates one system at a time.
+
+With `services.manage-nix.server.buildOn = "machine"` the server does not
+build: it resolves the revision and sends the machine a Git bundle of the
+commit (`GET /api/agent/deployments/<id>/source`), and the machine builds
+`nixosConfigurations.<name>` or `darwinConfigurations.<name>` itself. Agents
+accept this only from servers with `allowBuilds = true`. No cache is needed.
+
+Servers can declare repositories and machines
+(`services.manage-nix.server.repositories`, `.machines`), including a
+pre-shared `enrollmentTokenFile` that the machine's agent uses too, so
+enrollment needs no manual step. Repositories can carry an SSH deploy key.
+
+`darwinModules.agent` and `darwinModules.server` run the agent and the
+server on nix-darwin (launchd). On macOS, activation runs
+`<system>/activate`, and `boot` mode is refused. `checks.*.vm-fleet` covers
+two servers, one machine, declared tokens, and a machine build.
+
+## Releases
+
+Versions follow Conventional Commits through release-please
+(`.github/workflows/release.yml`): merging its release PR tags `vX.Y.Z` and
+publishes a GitHub release. `checks.*.versions` fails if `Cargo.toml`,
+`Cargo.lock`, `web/package*.json`, `version.txt`, and the release-please
+manifest disagree. Consume a release with
+`inputs.manage-nix.url = "github:szpolny/manage.nix/vX.Y.Z"`.
+
 ## Agent
 
 `mnix-agent activate <store-path> [--mode switch|boot|test]` verifies that a
