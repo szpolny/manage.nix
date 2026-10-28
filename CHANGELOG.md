@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0-alpha](https://github.com/szpolny/manage.nix/compare/v0.2.0...v0.3.0-alpha) (2026-10-28)
+
+
+### Features
+
+* show machine updates and reboot machines ([90730a7](https://github.com/szpolny/manage.nix/commit/90730a70b7b696fb1a9bc6dff4323d81aaa3afb6))
+
 ## [0.2.0](https://github.com/szpolny/manage.nix/compare/v0.1.0...v0.2.0) (2026-10-28)
 
 

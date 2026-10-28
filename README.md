@@ -19,7 +19,7 @@ Add the flake to your configuration:
 
 ```nix
 {
-  inputs.manage-nix.url = "github:szpolny/manage.nix/v0.2.0"; # x-release-please-version
+  inputs.manage-nix.url = "github:szpolny/manage.nix/v0.3.0-alpha"; # x-release-please-version
 
   outputs = { nixpkgs, manage-nix, ... }: {
     # The control plane

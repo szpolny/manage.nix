@@ -12,7 +12,7 @@ Both ship as NixOS and nix-darwin modules in this flake.
 ## 1. Add the flake
 
 ```nix
-inputs.manage-nix.url = "github:szpolny/manage.nix/v0.2.0"; # x-release-please-version
+inputs.manage-nix.url = "github:szpolny/manage.nix/v0.3.0-alpha"; # x-release-please-version
 ```
 
 Pick the latest tag from the
