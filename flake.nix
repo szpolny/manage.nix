@@ -43,6 +43,8 @@
             # Queries are checked against the committed `.sqlx/` data, never a
             # live database.
             SQLX_OFFLINE = "true";
+            # process-compose's own API defaults to 8080, mnix-server's port.
+            PC_PORT_NUM = "8079";
           };
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
           buildBin =
@@ -207,8 +209,11 @@
               postgresql
               attic-client
               nodejs
+              process-compose
             ];
             SQLX_OFFLINE = "true";
+            # process-compose's own API defaults to 8080, mnix-server's port.
+            PC_PORT_NUM = "8079";
           };
         }
       );

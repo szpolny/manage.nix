@@ -1,0 +1,31 @@
+# A local control plane for UI development: `process-compose` in the dev
+# shell runs mnix-server from source on 127.0.0.1:8080 and the SvelteKit
+# dev server (hot reload, http://localhost:5173) in front of it. Log in as
+# `admin` / `dev-password`. State lives in `.dev/`; delete it to start over.
+version: "0.5"
+
+processes:
+  server:
+    command: >
+      mkdir -p .dev && echo dev-password > .dev/admin-password &&
+      cargo run -p mnix-server -- serve
+      --database-url sqlite://.dev/db.sqlite
+      --state-dir .dev
+      --admin-token-file .dev/admin-token --create-admin-token
+      --create-signing-key
+      --initial-admin-password-file .dev/admin-password
+      --insecure-cookies
+    readiness_probe:
+      http_get:
+        host: 127.0.0.1
+        port: 8080
+        path: /healthz
+      period_seconds: 2
+      failure_threshold: 300
+
+  web:
+    working_dir: web
+    command: npm install --no-audit --no-fund && npm run dev
+    depends_on:
+      server:
+        condition: process_healthy

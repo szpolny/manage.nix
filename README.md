@@ -94,9 +94,13 @@ cargo test           # unit tests; store tests run against SQLite
 nix flake check -L   # everything CI runs
 ```
 
-The UI lives in `web/` (SvelteKit 3, Svelte 5). `npm run dev` there proxies
-`/api` to a server on `127.0.0.1:8080`; start one with `--insecure-cookies`
-so the browser keeps the session cookie over plain HTTP. `npm run check`
+The UI lives in `web/` (SvelteKit 3, Svelte 5). `process-compose` (in the
+dev shell, from the repository root) runs `mnix-server` from source with its
+state in `.dev/` and the UI with hot reload at <http://localhost:5173>; log
+in as `admin` / `dev-password`. On its
+own, `npm run dev` proxies `/api` to a server on `127.0.0.1:8080` started
+with `--insecure-cookies`, so the browser keeps the session cookie over
+plain HTTP. `npm run check`
 type-checks it; the flake's `mnix-web` build runs that too. Adding a
 dependency only needs `package-lock.json` updated (`npm install`): Nix reads
 every package from it.
