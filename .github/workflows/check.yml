@@ -1,4 +1,9 @@
-# Runs every flake check, including the NixOS VM tests.
+# The flake's checks, split so each job stays small:
+#
+# - `quick`: tests, lints, the versions check, and the packages.
+# - `vm`: NixOS VM tests, one per runner (several at once starve a hosted
+#   runner). Pushes and pull requests run the ones that cover the most; the
+#   weekly run (or a manual one) runs them all.
 #
 # GitHub's ubuntu-latest runners expose /dev/kvm, but only to the runner user
 # after a udev rule grants access; without KVM the VM tests fall back to
@@ -9,10 +14,31 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
 
 jobs:
-  flake-check:
+  quick:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: experimental-features = nix-command flakes
+      - run: |
+          nix build -L --no-link \
+            .#checks.x86_64-linux.{versions,cargo-fmt,cargo-clippy,cargo-test,store-postgres} \
+            .#checks.x86_64-linux.{mnix,mnix-agent,mnix-server,mnix-web}
+
+  vm:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        test: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+          && '["vm-hello","vm-activate","vm-enroll-sqlite","vm-enroll-postgres","vm-deploy-sqlite","vm-deploy-postgres","vm-web","vm-fleet"]'
+          || '["vm-activate","vm-deploy-sqlite","vm-web","vm-fleet"]') }}
     steps:
       - uses: actions/checkout@v5
       - name: Enable KVM
@@ -28,6 +54,4 @@ jobs:
             system-features = nixos-test benchmark big-parallel kvm
       - name: Check KVM
         run: test -w /dev/kvm || { echo "::error::/dev/kvm is not available to this job"; exit 1; }
-      # One build at a time: several multi-VM tests at once starve the
-      # runner of memory, and GitHub cancels the job.
-      - run: nix flake check -L --max-jobs 1
+      - run: nix build -L --no-link .#checks.x86_64-linux.${{ matrix.test }}
