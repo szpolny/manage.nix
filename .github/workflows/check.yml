@@ -14,7 +14,7 @@ jobs:
   flake-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
@@ -28,4 +28,6 @@ jobs:
             system-features = nixos-test benchmark big-parallel kvm
       - name: Check KVM
         run: test -w /dev/kvm || { echo "::error::/dev/kvm is not available to this job"; exit 1; }
-      - run: nix flake check -L
+      # One build at a time: several multi-VM tests at once starve the
+      # runner of memory, and GitHub cancels the job.
+      - run: nix flake check -L --max-jobs 1
