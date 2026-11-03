@@ -18,35 +18,60 @@
 	let tone = $derived(tones[status ?? ''] ?? 'idle');
 </script>
 
-<span class="badge {tone}" data-status={status}>{words(status)}</span>
+<span class="badge {tone}" class:pulse={tone === 'busy'} data-status={status}>{words(status)}</span>
 
 <style>
 	.badge {
-		display: inline-block;
-		padding: 0.05rem 0.55rem;
-		border-radius: 999px;
+		display: inline-flex;
+		align-items: center;
+		gap: 0.45rem;
+		font-family: var(--mono);
 		font-size: 0.8rem;
-		font-weight: 600;
+		font-weight: 500;
 		white-space: nowrap;
+		color: var(--tone-text);
+	}
+	.badge::before {
+		content: '';
+		width: 0.5rem;
+		height: 0.5rem;
+		flex: none;
+		background: var(--tone);
 	}
 	.ok {
-		color: var(--ok);
-		background: var(--ok-bg);
+		--tone: var(--ok-dot);
+		--tone-text: var(--ok);
 	}
 	.bad {
-		color: var(--bad);
-		background: var(--bad-bg);
+		--tone: var(--bad-dot);
+		--tone-text: var(--bad);
 	}
 	.warn {
-		color: var(--warn);
-		background: var(--warn-bg);
+		--tone: var(--warn-dot);
+		--tone-text: var(--warn);
 	}
 	.busy {
-		color: var(--busy);
-		background: var(--busy-bg);
+		--tone: var(--busy-dot);
+		--tone-text: var(--busy);
 	}
 	.idle {
-		color: var(--idle);
-		background: var(--idle-bg);
+		--tone: transparent;
+		--tone-text: var(--muted);
+	}
+	.idle::before {
+		box-shadow: inset 0 0 0 1.5px var(--idle-dot);
+	}
+	.pulse::before {
+		animation: blink 1s steps(2, jump-none) infinite;
+	}
+	@keyframes blink {
+		50% {
+			opacity: 0.2;
+		}
+	}
+	@media (prefers-reduced-motion: reduce) {
+		.pulse::before {
+			animation: none;
+		}
 	}
 </style>

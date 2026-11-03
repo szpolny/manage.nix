@@ -35,9 +35,10 @@
 		color: var(--text);
 		padding: 1.25rem 1.5rem 1.5rem;
 		width: min(36rem, calc(100vw - 2rem));
+		box-shadow: var(--shadow-lg);
 	}
 	dialog::backdrop {
-		background: rgb(0 0 0 / 0.4);
+		background: rgb(26 26 24 / 0.4);
 	}
 	header {
 		display: flex;
@@ -47,7 +48,8 @@
 	.close {
 		border: none;
 		background: none;
-		padding: 0.1rem 0.3rem;
+		padding: 0.1rem 0.4rem;
 		color: var(--muted);
+		box-shadow: none;
 	}
 </style>
