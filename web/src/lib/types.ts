@@ -1,7 +1,7 @@
 // The HTTP API's bodies, mirroring `crates/protocol/src/api.rs`.
 
 export type MachineStatus = 'pending' | 'online' | 'offline';
-export type DeploymentKind = 'deploy' | 'rollback' | 'reboot';
+export type DeploymentKind = 'deploy' | 'rollback' | 'reboot' | 'update' | 'flatpak_update';
 export type DeploymentStatus = 'queued' | 'building' | 'activating' | 'succeeded' | 'failed';
 export type MachineDeploymentStatus =
 	| 'queued'
@@ -18,7 +18,8 @@ export type ActivationPhase =
 	| 'checking_health'
 	| 'awaiting_confirmation'
 	| 'rolling_back'
-	| 'rebooting';
+	| 'rebooting'
+	| 'updating';
 
 export interface Generation {
 	number: number;
@@ -30,6 +31,7 @@ export interface Generation {
 export type Os = 'nixos' | 'darwin';
 
 export interface Facts {
+	flatpak_updates?: string[] | null;
 	hostname: string;
 	os: Os;
 	current_system: string;
@@ -79,6 +81,13 @@ export interface Machine {
 	tags: string[];
 	revision: Revision | null;
 	last_deployment: MachineDeployment | null;
+	auto_update: AutoUpdate;
+}
+
+/** Updates the server applies on its own, at most once a day each. */
+export interface AutoUpdate {
+	nixpkgs: boolean;
+	flatpak: boolean;
 }
 
 export interface EnrollmentToken {
@@ -168,6 +177,7 @@ export interface Commit {
 }
 
 export interface Updates {
+	nixpkgs_available?: boolean | null;
 	repository: string;
 	/** The revision compared with. */
 	rev: string;
@@ -184,6 +194,7 @@ export interface Updates {
 }
 
 export interface UpdateSummary {
+	nixpkgs_available?: boolean | null;
 	machine: string;
 	rev: string | null;
 	commit: string | null;

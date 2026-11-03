@@ -107,7 +107,8 @@ pub fn activate(host: &dyn Host, request: &Request, observer: &dyn Observer) -> 
             ActivationTarget::System { store_path } => store_path.clone(),
             ActivationTarget::Build { .. }
             | ActivationTarget::PreviousGeneration
-            | ActivationTarget::Reboot => String::new(),
+            | ActivationTarget::Reboot
+            | ActivationTarget::FlatpakUpdate => String::new(),
         },
         mode,
         status: ActivationStatus::Failed,
@@ -163,6 +164,7 @@ fn describe(target: &ActivationTarget) -> String {
         ActivationTarget::Build { commit, attribute } => format!("{attribute} at {commit}"),
         ActivationTarget::PreviousGeneration => "the previous generation".to_owned(),
         ActivationTarget::Reboot => "a reboot".to_owned(),
+        ActivationTarget::FlatpakUpdate => "a Flatpak update".to_owned(),
     }
 }
 
@@ -247,6 +249,7 @@ fn plan(host: &dyn Host, request: &Request, observer: &dyn Observer) -> anyhow::
         }
         // Jobs restart the machine themselves (`crate::job`).
         ActivationTarget::Reboot => anyhow::bail!("a reboot activates no system"),
+        ActivationTarget::FlatpakUpdate => anyhow::bail!("a Flatpak update activates no system"),
     };
 
     anyhow::ensure!(

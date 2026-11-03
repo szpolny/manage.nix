@@ -77,7 +77,12 @@
 	let query = $state('');
 
 	function needsAttention(m: Machine) {
-		return Boolean(updates[m.name]?.behind || m.facts?.reboot_required);
+		return Boolean(
+			updates[m.name]?.behind ||
+				updates[m.name]?.nixpkgs_available ||
+				m.facts?.flatpak_updates?.length ||
+				m.facts?.reboot_required
+		);
 	}
 
 	const matches: Record<Filter, (m: Machine) => boolean> = {
@@ -246,6 +251,26 @@
 									title="{u.rev} is at {u.commit?.slice(0, 12)}">{u.behind} behind {u.rev}</a
 								>
 							{/if}
+							<a
+								class="chip"
+								class:warn={updates[machine.name]?.nixpkgs_available === true}
+								href="/machines/{encodeURIComponent(machine.name)}"
+								>nixpkgs: {updates[machine.name]?.nixpkgs_available === true
+									? 'update available'
+									: updates[machine.name]?.nixpkgs_available === false
+										? 'up to date'
+										: 'unknown'}{machine.auto_update.nixpkgs ? ' · auto' : ''}</a
+							>
+							<a
+								class="chip"
+								class:warn={Boolean(machine.facts?.flatpak_updates?.length)}
+								href="/machines/{encodeURIComponent(machine.name)}"
+								>Flatpak: {machine.facts?.flatpak_updates
+									? machine.facts.flatpak_updates.length
+										? `${machine.facts.flatpak_updates.length} update${machine.facts.flatpak_updates.length === 1 ? '' : 's'}`
+										: 'up to date'
+									: 'unknown'}{machine.auto_update.flatpak ? ' · auto' : ''}</a
+							>
 						</td>
 						<td>
 							{#if machine.last_deployment}

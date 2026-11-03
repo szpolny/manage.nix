@@ -195,6 +195,176 @@ impl Builder {
         Ok(commit)
     }
 
+    /// Updates the flake's `input` at `commit` of the branch `rev` names,
+    /// commits the new `flake.lock`, and pushes it to that branch. Returns
+    /// the commit to deploy: the new one, or `commit` if the input was
+    /// already up to date.
+    pub async fn update_input(
+        &self,
+        repository_id: Uuid,
+        url: &str,
+        rev: &str,
+        commit: &str,
+        input: &str,
+        log: &mut Log,
+    ) -> anyhow::Result<String> {
+        let mirror = self.mirror(repository_id);
+        let branch = branch(&mirror, rev, log).await?;
+        let worktree = self
+            .state_dir
+            .join("worktrees")
+            .join(format!("{repository_id}-{}", Uuid::new_v4()));
+        {
+            let _git = self.git_lock.lock().await;
+            if let Some(dir) = worktree.parent() {
+                tokio::fs::create_dir_all(dir).await?;
+            }
+            run(
+                git()
+                    .arg("-C")
+                    .arg(&mirror)
+                    .args(["worktree", "add", "--quiet", "--detach", "--"])
+                    .arg(&worktree)
+                    .arg(commit),
+                log,
+            )
+            .await?;
+        }
+        let result = self
+            .commit_update(
+                repository_id,
+                url,
+                &mirror,
+                &worktree,
+                &branch,
+                commit,
+                input,
+                log,
+            )
+            .await;
+        let _git = self.git_lock.lock().await;
+        let removed = run(
+            git()
+                .arg("-C")
+                .arg(&mirror)
+                .args(["worktree", "remove", "--force", "--"])
+                .arg(&worktree),
+            log,
+        )
+        .await;
+        if removed.is_err() {
+            let _ = tokio::fs::remove_dir_all(&worktree).await;
+            let _ = run(
+                git().arg("-C").arg(&mirror).args(["worktree", "prune"]),
+                log,
+            )
+            .await;
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_update(
+        &self,
+        repository_id: Uuid,
+        url: &str,
+        mirror: &Path,
+        worktree: &Path,
+        branch: &str,
+        commit: &str,
+        input: &str,
+        log: &mut Log,
+    ) -> anyhow::Result<String> {
+        let dir = worktree.to_str().context("non-UTF-8 state directory")?;
+        log.line(format!("updating the {input} input of {branch} ({commit})"))
+            .await;
+        run(
+            Command::new("nix")
+                .args([
+                    "--extra-experimental-features",
+                    "nix-command flakes",
+                    "flake",
+                    "update",
+                    "--refresh",
+                    "--flake",
+                ])
+                // A path flake: the worktree's `.git` is a file pointing at
+                // the mirror, which Git flakes do not read reliably.
+                .arg(format!("path:{dir}"))
+                .arg("--")
+                .arg(input),
+            log,
+        )
+        .await?;
+        let status = run(
+            git()
+                .arg("-C")
+                .arg(worktree)
+                .args(["status", "--porcelain", "--", "flake.lock"]),
+            log,
+        )
+        .await?;
+        if status.trim().is_empty() {
+            log.line(format!("{input} is already up to date")).await;
+            return Ok(commit.to_owned());
+        }
+        run(
+            git().arg("-C").arg(worktree).args([
+                "-c",
+                "user.name=manage.nix",
+                "-c",
+                "user.email=manage-nix@localhost",
+                "-c",
+                "commit.gpgSign=false",
+                "commit",
+                "--quiet",
+                "--no-verify",
+                "-m",
+                &format!("flake.lock: update {input}"),
+                "--",
+                "flake.lock",
+            ]),
+            log,
+        )
+        .await?;
+        let updated = run(
+            git()
+                .arg("-C")
+                .arg(worktree)
+                .args(["rev-parse", "--verify", "HEAD^{commit}"]),
+            log,
+        )
+        .await?
+        .trim()
+        .to_owned();
+        let _git = self.git_lock.lock().await;
+        log.line(format!("pushing {updated} to {branch}")).await;
+        // Not a force push: if the branch moved since the fetch, this fails
+        // and nothing is deployed.
+        run(
+            self.git_for(repository_id)
+                .arg("-C")
+                .arg(mirror)
+                .args(["push", "--quiet", "--"])
+                .arg(url)
+                .arg(format!("{updated}:refs/heads/{branch}")),
+            log,
+        )
+        .await
+        .context("pushing the updated lock (the repository's key needs write access)")?;
+        // Pushing to the mirror's own remote usually moves its branch too.
+        run(
+            git().arg("-C").arg(mirror).args([
+                "update-ref",
+                &format!("refs/heads/{branch}"),
+                &updated,
+            ]),
+            log,
+        )
+        .await?;
+        Ok(updated)
+    }
+
     /// Builds `nixosConfigurations.<configuration>` at `commit`, signs it,
     /// and pushes it to the cache.
     pub async fn build(
@@ -358,6 +528,37 @@ impl Builder {
         );
         Ok(out.stdout)
     }
+}
+
+/// The branch `rev` names in a mirror: `HEAD` is the default branch.
+async fn branch(mirror: &Path, rev: &str, log: &mut Log) -> anyhow::Result<String> {
+    if rev == "HEAD" {
+        let out = run(
+            git()
+                .arg("-C")
+                .arg(mirror)
+                .args(["symbolic-ref", "--quiet", "--short", "HEAD"]),
+            log,
+        )
+        .await
+        .context("the repository has no default branch")?;
+        return Ok(out.trim().to_owned());
+    }
+    let name = rev.strip_prefix("refs/heads/").unwrap_or(rev);
+    let is_branch = git()
+        .arg("-C")
+        .arg(mirror)
+        .args(["show-ref", "--verify", "--quiet", "--"])
+        .arg(format!("refs/heads/{name}"))
+        .stdin(Stdio::null())
+        .status()
+        .await?
+        .success();
+    anyhow::ensure!(
+        is_branch,
+        "{rev:?} is not a branch; updating nixpkgs needs a branch to push the new lock to"
+    );
+    Ok(name.to_owned())
 }
 
 /// The flake output `attribute` at `commit` of a mirror.

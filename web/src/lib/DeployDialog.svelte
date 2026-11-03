@@ -12,14 +12,16 @@
 	let selected: string[] = $state([]);
 	let rev = $state('');
 	let mode: ActivationMode = $state('switch');
+	let updateNixpkgs = $state(false);
 	let error = $state('');
 	let busy = $state(false);
 
 	let deployable = $derived(machines.filter((m) => m.repository && m.enrolled_at));
 
-	export function open(preselected: string[] = [], presetRev?: string) {
+	export function open(preselected: string[] = [], presetRev?: string, update = false) {
 		selected = preselected.filter((name) => deployable.some((m) => m.name === name));
 		if (presetRev !== undefined) rev = presetRev;
+		updateNixpkgs = update;
 		error = '';
 		dialog.show();
 	}
@@ -29,7 +31,7 @@
 		busy = true;
 		error = '';
 		try {
-			const deployment = await api.deploy(selected, rev.trim() || undefined, mode);
+			const deployment = await api.deploy(selected, rev.trim() || undefined, mode, updateNixpkgs);
 			dialog.close();
 			await goto(`/deploys/${deployment.id}`);
 		} catch (e) {
@@ -73,10 +75,22 @@
 				<option value="boot">boot: activate on next boot</option>
 			</select>
 		</label>
+		<label class="check">
+			<input type="checkbox" name="update_nixpkgs" bind:checked={updateNixpkgs} />
+			Update nixpkgs first
+		</label>
+		{#if updateNixpkgs}
+			<p class="muted small">
+				The server runs <code>nix flake update nixpkgs</code> on the revision, which must be a
+				branch, then commits the new <code>flake.lock</code> and pushes it there before building.
+				The repository's key needs write access.
+			</p>
+		{/if}
 		{#if error}<p class="error" role="alert">{error}</p>{/if}
 		<div class="actions">
 			<button class="primary" type="submit" disabled={busy || selected.length === 0}>
-				Deploy {selected.length || ''}
+				{updateNixpkgs ? 'Update and deploy' : 'Deploy'}
+				{selected.length || ''}
 				{selected.length === 1 ? 'machine' : 'machines'}
 			</button>
 		</div>

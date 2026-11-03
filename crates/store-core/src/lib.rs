@@ -7,7 +7,7 @@
 //! Server code should depend on the `mnix-store` facade instead.
 
 use async_trait::async_trait;
-use mnix_protocol::api::{DeploymentKind, DeploymentStatus, MachineDeploymentStatus};
+use mnix_protocol::api::{AutoUpdate, DeploymentKind, DeploymentStatus, MachineDeploymentStatus};
 use mnix_protocol::{ActivationMode, ActivationPhase, ActivationReport, Facts};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -97,6 +97,8 @@ pub struct Machine {
     pub configuration: Option<String>,
     /// Sorted.
     pub tags: Vec<String>,
+    /// Updates the server applies on its own.
+    pub auto_update: AutoUpdate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -460,6 +462,13 @@ pub trait Store: Send + Sync + 'static {
 
     /// Replaces the machine's tags.
     async fn set_machine_tags(&self, machine_id: Uuid, tags: &[String]) -> Result<()>;
+
+    /// Sets which updates the server applies to the machine on its own.
+    async fn set_machine_auto_update(
+        &self,
+        machine_id: Uuid,
+        auto_update: AutoUpdate,
+    ) -> Result<()>;
 
     /// Creates a deployment and its machines. Machines created as
     /// `activating` are released to their agents at once.

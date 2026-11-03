@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE machines SET auto_update_nixpkgs = ?, auto_update_flatpak = ? WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "55065f2e7b8bcf31e212cfe68a92f66f789b0008a6b4ac708865c735b9601b24"
+}

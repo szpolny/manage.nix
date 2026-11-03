@@ -9,7 +9,7 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use mnix_protocol::api::{DeploymentKind, DeploymentStatus, MachineDeploymentStatus};
+use mnix_protocol::api::{AutoUpdate, DeploymentKind, DeploymentStatus, MachineDeploymentStatus};
 use mnix_protocol::{ActivationMode, ActivationPhase, ActivationReport, ActivationStatus, Facts};
 use mnix_store::{
     disconnect_reason, log_source, Backend, Error, Event, MachineOutcome, NewDeployment,
@@ -137,6 +137,7 @@ const T0: OffsetDateTime = datetime!(2026-10-22 08:00:00.123456 UTC);
 
 fn facts(hostname: &str) -> Facts {
     Facts {
+        flatpak_updates: None,
         hostname: hostname.to_owned(),
         current_system: "/nix/store/00000000000000000000000000000000-nixos-system".to_owned(),
         booted_system: None,
@@ -584,6 +585,20 @@ store_test!(
         assert_eq!(record.tags, ["eu", "web"]);
         store.set_machine_tags(machine.id, &[]).await.unwrap();
         assert!(store.machines(org.id).await.unwrap()[0].tags.is_empty());
+
+        assert_eq!(record.auto_update, AutoUpdate::default());
+        let auto_update = AutoUpdate {
+            nixpkgs: true,
+            flatpak: false,
+        };
+        store
+            .set_machine_auto_update(machine.id, auto_update)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.machines(org.id).await.unwrap()[0].auto_update,
+            auto_update
+        );
     }
 );
 

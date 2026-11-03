@@ -23,6 +23,7 @@ The admin token lives in `/var/lib/manage-nix/admin-token` unless you set
 | `mnix machine configure <machine> --repo <repo>` | Build the machine from a repository |
 | `mnix machine tag <machine> <tag>...` | Add tags |
 | `mnix machine untag <machine> <tag>...` | Remove tags |
+| `mnix machine auto-update <machine> [--nixpkgs <bool>] [--flatpak <bool>]` | Choose the updates the server applies on its own |
 
 ## Repositories
 
@@ -35,16 +36,18 @@ The admin token lives in `/var/lib/manage-nix/admin-token` unless you set
 
 | Command | What it does |
 |---|---|
-| `mnix deploy <machine or tag:name>... [--rev <rev>]` | Build and activate a revision |
+| `mnix deploy <machine or tag:name>... [--rev <rev>] [--update-nixpkgs]` | Build and activate a revision, optionally updating nixpkgs first |
 | `mnix rollback <machine>` | Go back to the previous system |
 | `mnix reboot <machine>` | Restart a machine and wait for it |
+| `mnix flatpak-update <machine>` | Update a machine's Flatpak apps and runtimes |
 | `mnix updates <machine> [--preview]` | Show commits the machine is missing |
 | `mnix deploys` | List recent deployments |
 | `mnix deploys show <id> [--logs]` | Show one deployment |
 | `mnix deploys logs <id> [--follow]` | Print a deployment's log |
 | `mnix signing-key` | Print the key machines must trust |
 
-`deploy`, `rollback`, and `reboot` follow the log until they finish. Pass
+`deploy`, `rollback`, `reboot`, and `flatpak-update` follow the log until
+they finish. Pass
 `--no-wait` to return right away.
 
 Most list commands accept `--json`.

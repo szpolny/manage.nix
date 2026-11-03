@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT id, organization_id, name, created_at, enrolled_at, agent_version,\n                      facts, facts_updated_at, last_seen_at,\n                      EXISTS (\n                          SELECT 1 FROM agent_sessions AS s\n                          WHERE s.machine_id = machines.id AND s.disconnected_at IS NULL\n                      ) AS \"connected!: bool\",\n                      repository_id, configuration,\n                      (SELECT json_group_array(tag) FROM (\n                          SELECT tag FROM machine_tags AS t\n                          WHERE t.machine_id = machines.id ORDER BY tag\n                      )) AS \"tags!: String\"\n               FROM machines WHERE id = ?",
+  "query": "SELECT id, organization_id, name, created_at, enrolled_at, agent_version,\n                      facts, facts_updated_at, last_seen_at,\n                      EXISTS (\n                          SELECT 1 FROM agent_sessions AS s\n                          WHERE s.machine_id = machines.id AND s.disconnected_at IS NULL\n                      ) AS \"connected!: bool\",\n                      repository_id, configuration,\n                      (SELECT json_group_array(tag) FROM (\n                          SELECT tag FROM machine_tags AS t\n                          WHERE t.machine_id = machines.id ORDER BY tag\n                      )) AS \"tags!: String\",\n                      auto_update_nixpkgs, auto_update_flatpak\n               FROM machines WHERE organization_id = ? ORDER BY name",
   "describe": {
     "columns": [
       {
@@ -67,6 +67,16 @@
         "name": "tags!: String",
         "ordinal": 12,
         "type_info": "Null"
+      },
+      {
+        "name": "auto_update_nixpkgs",
+        "ordinal": 13,
+        "type_info": "Bool"
+      },
+      {
+        "name": "auto_update_flatpak",
+        "ordinal": 14,
+        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -85,8 +95,10 @@
       null,
       true,
       true,
-      null
+      null,
+      false,
+      false
     ]
   },
-  "hash": "26538d578761111268ec81068fb4267f82e6a754fdb9ff6c7ba14344f7ee225c"
+  "hash": "87cfbcebd7b5dc22c5cbf148d14884fd2c74022ab78bd3c78f9e39b48939a07f"
 }

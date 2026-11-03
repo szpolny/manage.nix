@@ -375,13 +375,17 @@ impl Session<'_> {
             ) {
                 (DeploymentKind::Rollback, ..) => ActivationTarget::PreviousGeneration,
                 (DeploymentKind::Reboot, ..) => ActivationTarget::Reboot,
-                (DeploymentKind::Deploy, Some(store_path), ..) => {
+                (DeploymentKind::FlatpakUpdate, ..) => ActivationTarget::FlatpakUpdate,
+                (DeploymentKind::Deploy | DeploymentKind::Update, Some(store_path), ..) => {
                     ActivationTarget::System { store_path }
                 }
-                (DeploymentKind::Deploy, None, Some(attribute), Some(commit)) => {
-                    ActivationTarget::Build { commit, attribute }
-                }
-                (DeploymentKind::Deploy, ..) => continue,
+                (
+                    DeploymentKind::Deploy | DeploymentKind::Update,
+                    None,
+                    Some(attribute),
+                    Some(commit),
+                ) => ActivationTarget::Build { commit, attribute },
+                (DeploymentKind::Deploy | DeploymentKind::Update, ..) => continue,
             };
             tracing::info!(
                 "{}: sending deployment {}",

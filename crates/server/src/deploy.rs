@@ -5,15 +5,17 @@
 //! the cache, and releases it to the machines. Agent sessions (on any
 //! server) hand released activations to their agents and record what the
 //! agents report. A sweeper fails activations and builds that take too
-//! long. Rollbacks and reboots skip the build: they are released at once.
+//! long. Rollbacks, reboots, and Flatpak updates skip the build: they are
+//! released at once. An update deploy first updates the repository's
+//! nixpkgs input and pushes the new lock.
 
 use std::collections::HashSet;
 use std::time::Duration;
 
 use axum::http::StatusCode;
 use mnix_protocol::api::{
-    CreateDeployment, CreateReboot, CreateRollback, DeploymentKind, DeploymentStatus,
-    MachineDeploymentStatus, MachineStatus,
+    CreateDeployment, CreateFlatpakUpdate, CreateReboot, CreateRollback, DeploymentKind,
+    DeploymentStatus, MachineDeploymentStatus, MachineStatus,
 };
 use mnix_protocol::ActivationMode;
 use mnix_protocol::{ActivationReport, ActivationStatus};
@@ -125,7 +127,11 @@ pub async fn create(state: &AppState, request: CreateDeployment) -> Result<Uuid,
         .create_deployment(&NewDeployment {
             id,
             organization_id: state.organization.id,
-            kind: DeploymentKind::Deploy,
+            kind: if request.update_nixpkgs {
+                DeploymentKind::Update
+            } else {
+                DeploymentKind::Deploy
+            },
             status: DeploymentStatus::Queued,
             repository_id,
             rev: Some(rev.clone()),
@@ -147,7 +153,12 @@ pub async fn create(state: &AppState, request: CreateDeployment) -> Result<Uuid,
             .event(
                 Some(machine.id),
                 "deployment_created",
-                serde_json::json!({ "deployment_id": id, "rev": rev, "requested_by": requested_by }),
+                serde_json::json!({
+                    "deployment_id": id,
+                    "rev": rev,
+                    "update_nixpkgs": request.update_nixpkgs,
+                    "requested_by": requested_by,
+                }),
             )
             .await;
     }
@@ -210,7 +221,53 @@ pub async fn create_reboot(
     machine: &Machine,
     request: CreateReboot,
 ) -> Result<Uuid, ApiError> {
-    let requested_by = requested_by(request.requested_by)?;
+    create_machine_job(state, machine, DeploymentKind::Reboot, request.requested_by).await
+}
+
+/// `POST /api/machines/:machine/flatpak-update`
+pub async fn create_flatpak_update(
+    state: &AppState,
+    machine: &Machine,
+    request: CreateFlatpakUpdate,
+) -> Result<Uuid, ApiError> {
+    // Older agents ignore requests they do not know, and so would leave
+    // the update to time out.
+    if machine
+        .facts
+        .as_ref()
+        .and_then(|f| f.flatpak_updates.as_ref())
+        .is_none()
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            format!(
+                "{} does not report Flatpak updates: it needs Flatpak and an agent that reports Flatpak updates",
+                machine.name
+            ),
+        ));
+    }
+    create_machine_job(
+        state,
+        machine,
+        DeploymentKind::FlatpakUpdate,
+        request.requested_by,
+    )
+    .await
+}
+
+/// A reboot or Flatpak update: released to the machine at once, and only
+/// while it is online, so it never waits for the machine to come back.
+async fn create_machine_job(
+    state: &AppState,
+    machine: &Machine,
+    kind: DeploymentKind,
+    requested_by: Option<String>,
+) -> Result<Uuid, ApiError> {
+    let requested_by = self::requested_by(requested_by)?;
+    let action = match kind {
+        DeploymentKind::Reboot => "restarted",
+        _ => "updated",
+    };
     let status = crate::api::status(
         machine,
         OffsetDateTime::now_utc(),
@@ -220,7 +277,7 @@ pub async fn create_reboot(
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             format!(
-                "{} is {status}; it can only be restarted while online",
+                "{} is {status}; it can only be {action} while online",
                 machine.name
             ),
         ));
@@ -231,11 +288,11 @@ pub async fn create_reboot(
         .create_deployment(&NewDeployment {
             id,
             organization_id: state.organization.id,
-            kind: DeploymentKind::Reboot,
+            kind,
             status: DeploymentStatus::Activating,
             repository_id: None,
             rev: None,
-            // Agents ignore the mode of a reboot.
+            // Agents ignore the mode of reboots and Flatpak updates.
             mode: ActivationMode::Switch,
             requested_by: requested_by.clone(),
             created_at: OffsetDateTime::now_utc(),
@@ -249,11 +306,11 @@ pub async fn create_reboot(
     state
         .event(
             Some(machine.id),
-            "reboot_created",
+            &format!("{kind}_created"),
             serde_json::json!({ "deployment_id": id, "requested_by": requested_by }),
         )
         .await;
-    tracing::info!("deployment {id}: reboot {}", machine.name);
+    tracing::info!("deployment {id}: {kind} {}", machine.name);
     state.activations_changed();
     Ok(id)
 }
@@ -324,8 +381,13 @@ async fn build_machines(state: &AppState, id: Uuid, log: &mut Log) -> anyhow::Re
 
     let mirror = builder.fetch(repository.id, &repository.url, log).await?;
     let rev = deployment.rev.as_deref().unwrap_or("HEAD");
-    let commit = builder.resolve(&mirror, rev, log).await?;
+    let mut commit = builder.resolve(&mirror, rev, log).await?;
     log.line(format!("{rev} is commit {commit}")).await;
+    if deployment.kind == DeploymentKind::Update {
+        commit = builder
+            .update_input(repository.id, &repository.url, rev, &commit, "nixpkgs", log)
+            .await?;
+    }
     store.set_deployment_commit(id, &commit).await?;
     log.flush().await;
 
@@ -594,6 +656,7 @@ mod tests {
             repository_id: None,
             configuration: None,
             tags: tags.iter().map(|t| t.to_string()).collect(),
+            auto_update: Default::default(),
         }
     }
 

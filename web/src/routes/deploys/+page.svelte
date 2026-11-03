@@ -62,14 +62,18 @@
 						<td><a href="/deploys/{d.id}"><Badge status={d.status} /></a></td>
 						<td>
 							<a href="/deploys/{d.id}">
-								{#if d.kind !== 'deploy'}
+								{#if d.kind === 'flatpak_update'}
+									Flatpak update
+								{:else if d.kind === 'update'}
+									nixpkgs update · <span class="mono">{revisionLabel(d.rev, d.commit)}</span>
+								{:else if d.kind !== 'deploy'}
 									{d.kind}
 								{:else}
 									<span class="mono">{revisionLabel(d.rev, d.commit)}</span>
 								{/if}
 							</a>
 							{#if d.repository}<span class="muted">from {d.repository}</span>{/if}
-							{#if d.kind !== 'reboot' && d.mode !== 'switch'}<span class="muted"
+							{#if d.kind !== 'reboot' && d.kind !== 'flatpak_update' && d.mode !== 'switch'}<span class="muted"
 									>({d.mode})</span
 								>{/if}
 						</td>

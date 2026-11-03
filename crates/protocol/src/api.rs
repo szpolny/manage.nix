@@ -69,6 +69,8 @@ pub struct Machine {
     /// The machine's most recent deployment.
     #[serde(default)]
     pub last_deployment: Option<MachineDeployment>,
+    #[serde(default)]
+    pub auto_update: AutoUpdate,
 }
 
 /// Where a system came from: the newest deployment that built it.
@@ -194,6 +196,12 @@ pub struct CreateDeployment {
     /// Who asked, for the deployment history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_by: Option<String>,
+    /// Update the repository's `nixpkgs` input first: run
+    /// `nix flake update nixpkgs` at `rev`, which must be a branch, commit
+    /// the new `flake.lock`, push it to the branch, and deploy that commit
+    /// (a deployment of kind [`DeploymentKind::Update`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub update_nixpkgs: bool,
 }
 
 /// `POST /api/machines/:machine/rollback`: activate the machine's previous
@@ -214,10 +222,35 @@ pub struct CreateReboot {
     pub requested_by: Option<String>,
 }
 
+/// `POST /api/machines/:machine/flatpak-update`: update the machine's
+/// Flatpak apps and runtimes. Refused while the machine is offline.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateFlatpakUpdate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_by: Option<String>,
+}
+
+/// `PUT /api/machines/:machine/auto-update`: which updates the server
+/// applies to the machine on its own, at most once a day each, while the
+/// machine is online and has no deployment in progress.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoUpdate {
+    /// Update the repository's nixpkgs input and deploy it when upstream
+    /// has a newer revision.
+    #[serde(default)]
+    pub nixpkgs: bool,
+    /// Update Flatpak apps and runtimes when the machine reports updates.
+    #[serde(default)]
+    pub flatpak: bool,
+}
+
 /// `GET /api/machines/:machine/updates?rev=<rev>`: what the machine's
 /// repository has that its running system was not built from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Updates {
+    /// Whether the tracked nixpkgs input has a newer upstream revision.
+    #[serde(default)]
+    pub nixpkgs_available: Option<bool>,
     pub repository: String,
     /// The revision compared with: `rev` if given, otherwise the branch the
     /// running system was deployed from, otherwise `HEAD`.
@@ -250,6 +283,9 @@ pub struct Commit {
 /// configuration: [`Updates`] in short, compared with the default revision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateSummary {
+    /// Whether the tracked nixpkgs input has a newer upstream revision.
+    #[serde(default)]
+    pub nixpkgs_available: Option<bool>,
     pub machine: String,
     pub rev: Option<String>,
     pub commit: Option<String>,
@@ -306,6 +342,11 @@ pub enum DeploymentKind {
     Rollback,
     /// Restart each machine.
     Reboot,
+    /// Update the repository's nixpkgs input, push the new lock, then
+    /// build and activate it like a deploy.
+    Update,
+    /// Update each machine's Flatpak apps and runtimes.
+    FlatpakUpdate,
 }
 
 /// The state of a deployment as a whole.
@@ -366,6 +407,8 @@ string_enum!(DeploymentKind {
     Deploy = "deploy",
     Rollback = "rollback",
     Reboot = "reboot",
+    Update = "update",
+    FlatpakUpdate = "flatpak_update",
 });
 string_enum!(DeploymentStatus {
     Queued = "queued",

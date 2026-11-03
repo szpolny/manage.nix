@@ -49,7 +49,9 @@ in
         path = [
           config.nix.package
           pkgs.git
-        ];
+          pkgs.util-linux
+          pkgs.coreutils
+        ] ++ lib.optional config.services.flatpak.enable pkgs.flatpak;
         serviceConfig = {
           ExecStart = "${lib.getExe cfg.package} run";
           # Root: activating systems needs it.

@@ -11,10 +11,10 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use mnix_protocol::api::{
-    CreateDeployment, CreateEnrollmentToken, CreateMachine, CreatePreview, CreateReboot,
-    CreateRepository, CreateRollback, CreatedMachine, Deployment, DeploymentStatus,
-    EnrollmentToken, Machine, Preview, PreviewStatus, Repository, SetConfiguration, SetTags,
-    SigningKey, Updates,
+    AutoUpdate, CreateDeployment, CreateEnrollmentToken, CreateFlatpakUpdate, CreateMachine,
+    CreatePreview, CreateReboot, CreateRepository, CreateRollback, CreatedMachine, Deployment,
+    DeploymentStatus, EnrollmentToken, Machine, Preview, PreviewStatus, Repository,
+    SetConfiguration, SetTags, SigningKey, Updates,
 };
 use mnix_protocol::ActivationMode;
 use time::format_description::well_known::Rfc3339;
@@ -82,6 +82,11 @@ enum Command {
         /// branch).
         #[arg(long)]
         rev: Option<String>,
+        /// First update the nixpkgs input: commit the new flake.lock and
+        /// push it to the branch (`--rev` must name a branch), then deploy
+        /// that commit.
+        #[arg(long)]
+        update_nixpkgs: bool,
         #[command(flatten)]
         options: DeployOptions,
     },
@@ -96,6 +101,14 @@ enum Command {
     /// Restart a machine. It must be online; the reboot finishes when its
     /// agent reports from the new boot.
     Reboot {
+        /// The machine's name or ID.
+        machine: String,
+        #[command(flatten)]
+        options: FollowOptions,
+    },
+    /// Update a machine's Flatpak apps and runtimes, in the system
+    /// installation and each user's. It must be online.
+    FlatpakUpdate {
         /// The machine's name or ID.
         machine: String,
         #[command(flatten)]
@@ -254,6 +267,17 @@ enum MachineCommand {
         #[arg(required = true)]
         tags: Vec<String>,
     },
+    /// Choose which updates the server applies to a machine on its own, at
+    /// most once a day each. Unset options keep their current value.
+    AutoUpdate {
+        machine: String,
+        /// Update the nixpkgs input and deploy it when upstream is newer.
+        #[arg(long)]
+        nixpkgs: Option<bool>,
+        /// Update Flatpak apps and runtimes when updates are available.
+        #[arg(long)]
+        flatpak: Option<bool>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -352,6 +376,28 @@ fn main() -> anyhow::Result<ExitCode> {
                 current.retain(|t| !tags.contains(t))
             })?;
         }
+        Command::Machine(MachineCommand::AutoUpdate {
+            machine,
+            nixpkgs,
+            flatpak,
+        }) => {
+            let path = format!("/api/machines/{}", client::escape(&machine));
+            let current: Machine = client.get(&path)?;
+            let updated: Machine = client.put(
+                &format!("{path}/auto-update"),
+                &AutoUpdate {
+                    nixpkgs: nixpkgs.unwrap_or(current.auto_update.nixpkgs),
+                    flatpak: flatpak.unwrap_or(current.auto_update.flatpak),
+                },
+            )?;
+            let on = |b: bool| if b { "on" } else { "off" };
+            eprintln!(
+                "{}: nixpkgs auto-update {}, Flatpak auto-update {}",
+                updated.name,
+                on(updated.auto_update.nixpkgs),
+                on(updated.auto_update.flatpak)
+            );
+        }
         Command::Repos { json } => {
             let repositories: Vec<Repository> = client.get("/api/repositories")?;
             if json {
@@ -374,6 +420,7 @@ fn main() -> anyhow::Result<ExitCode> {
         Command::Deploy {
             targets,
             rev,
+            update_nixpkgs,
             options,
         } => {
             let deployment: Deployment = client.post(
@@ -383,6 +430,7 @@ fn main() -> anyhow::Result<ExitCode> {
                     rev,
                     mode: options.mode.into(),
                     requested_by: requested_by(&options.follow),
+                    update_nixpkgs,
                 },
             )?;
             return finish(&client, deployment, &options.follow);
@@ -401,6 +449,15 @@ fn main() -> anyhow::Result<ExitCode> {
             let deployment: Deployment = client.post(
                 &format!("/api/machines/{}/reboot", client::escape(&machine)),
                 &CreateReboot {
+                    requested_by: requested_by(&options),
+                },
+            )?;
+            return finish(&client, deployment, &options);
+        }
+        Command::FlatpakUpdate { machine, options } => {
+            let deployment: Deployment = client.post(
+                &format!("/api/machines/{}/flatpak-update", client::escape(&machine)),
+                &CreateFlatpakUpdate {
                     requested_by: requested_by(&options),
                 },
             )?;
@@ -763,6 +820,7 @@ mod tests {
             tags: Vec::new(),
             revision: None,
             last_deployment: None,
+            auto_update: Default::default(),
         };
         let table = machine_table(
             &[

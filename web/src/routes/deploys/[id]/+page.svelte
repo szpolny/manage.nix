@@ -84,7 +84,11 @@
 					? 'Rollback'
 					: deployment.kind === 'reboot'
 						? 'Reboot'
-						: revisionLabel(deployment.rev, deployment.commit)}
+						: deployment.kind === 'flatpak_update'
+							? 'Flatpak update'
+							: deployment.kind === 'update'
+								? `nixpkgs update · ${revisionLabel(deployment.rev, deployment.commit)}`
+								: revisionLabel(deployment.rev, deployment.commit)}
 			{:else}
 				{id.slice(0, 8)}
 			{/if}
@@ -101,7 +105,7 @@
 {#if deployment}
 	<section class="card">
 		<dl class="facts">
-			{#if deployment.kind === 'deploy'}
+			{#if deployment.kind === 'deploy' || deployment.kind === 'update'}
 				<dt>Revision</dt>
 				<dd class="mono">
 					{deployment.rev ?? '—'}
@@ -110,7 +114,7 @@
 				<dt>Repository</dt>
 				<dd>{deployment.repository ?? '—'}</dd>
 			{/if}
-			{#if deployment.kind !== 'reboot'}
+			{#if deployment.kind !== 'reboot' && deployment.kind !== 'flatpak_update'}
 				<dt>Mode</dt>
 				<dd>{deployment.mode}</dd>
 			{/if}

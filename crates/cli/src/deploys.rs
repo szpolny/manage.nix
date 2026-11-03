@@ -104,13 +104,21 @@ pub fn list(deployments: &[Deployment], now: OffsetDateTime) -> String {
             let what = match d.kind {
                 DeploymentKind::Rollback => "rollback".to_owned(),
                 DeploymentKind::Reboot => "reboot".to_owned(),
-                DeploymentKind::Deploy => match (&d.rev, &d.commit) {
-                    (Some(rev), Some(commit)) => {
-                        format!("{rev} ({})", &commit[..commit.len().min(12)])
+                DeploymentKind::FlatpakUpdate => "flatpak update".to_owned(),
+                DeploymentKind::Deploy | DeploymentKind::Update => {
+                    let rev = match (&d.rev, &d.commit) {
+                        (Some(rev), Some(commit)) => {
+                            format!("{rev} ({})", &commit[..commit.len().min(12)])
+                        }
+                        (Some(rev), None) => rev.clone(),
+                        _ => "-".to_owned(),
+                    };
+                    if d.kind == DeploymentKind::Update {
+                        format!("nixpkgs update, {rev}")
+                    } else {
+                        rev
                     }
-                    (Some(rev), None) => rev.clone(),
-                    _ => "-".to_owned(),
-                },
+                }
             };
             let machines: Vec<&str> = d.machines.iter().map(|m| m.machine.as_str()).collect();
             vec![

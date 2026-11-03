@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT dm.store_path AS \"store_path!\", d.id, d.repository_id, d.rev,\n                      d.commit_id AS \"commit_id!\", d.created_at\n               FROM deployment_machines AS dm JOIN deployments AS d ON d.id = dm.deployment_id\n               WHERE d.organization_id = ? AND d.kind = 'deploy' AND d.commit_id IS NOT NULL\n                 AND dm.store_path IN (SELECT value FROM json_each(?))\n               ORDER BY d.created_at, d.rowid",
+  "query": "SELECT dm.store_path AS \"store_path!\", d.id, d.repository_id, d.rev,\n                      d.commit_id AS \"commit_id!\", d.created_at\n               FROM deployment_machines AS dm JOIN deployments AS d ON d.id = dm.deployment_id\n               WHERE d.organization_id = ? AND d.kind IN ('deploy', 'update') AND d.commit_id IS NOT NULL\n                 AND dm.store_path IN (SELECT value FROM json_each(?))\n               ORDER BY d.created_at, d.rowid",
   "describe": {
     "columns": [
       {
@@ -46,5 +46,5 @@
       false
     ]
   },
-  "hash": "30ddbda30501e6146b786b27825c86e37989ba9a1de6606eec49ac3e99299df7"
+  "hash": "952261073b0df4994b916dcaff12d93092b8fa8dd0a4c6748578a679ce71b26d"
 }

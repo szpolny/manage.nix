@@ -11,10 +11,10 @@ use axum::routing::{get, post, put};
 use axum::{Extension, Json, Router};
 use mnix_nix::StorePath;
 use mnix_protocol::api::{
-    ClosureDiff, CreateDeployment, CreateEnrollmentToken, CreateMachine, CreateReboot,
-    CreateRepository, CreateRollback, CreatedMachine, Deployment, DeploymentMachine,
-    EnrollmentToken, GenerationView, LogEntry, Machine, MachineDeployment, MachineStatus,
-    Repository, Revision, SetConfiguration, SetTags, SigningKey,
+    AutoUpdate, ClosureDiff, CreateDeployment, CreateEnrollmentToken, CreateFlatpakUpdate,
+    CreateMachine, CreateReboot, CreateRepository, CreateRollback, CreatedMachine, Deployment,
+    DeploymentMachine, EnrollmentToken, GenerationView, LogEntry, Machine, MachineDeployment,
+    MachineStatus, Repository, Revision, SetConfiguration, SetTags, SigningKey,
 };
 use mnix_store::{MachineDeploymentRecord, NewEnrollmentToken, SystemRevision};
 use serde::Deserialize;
@@ -46,6 +46,11 @@ pub fn routes(state: AppState) -> axum::Router<AppState> {
         .route("/api/machines/{machine}/tags", put(set_tags))
         .route("/api/machines/{machine}/rollback", post(create_rollback))
         .route("/api/machines/{machine}/reboot", post(create_reboot))
+        .route(
+            "/api/machines/{machine}/flatpak-update",
+            post(create_flatpak_update),
+        )
+        .route("/api/machines/{machine}/auto-update", put(set_auto_update))
         .route(
             "/api/machines/{machine}/deployments",
             get(list_machine_deployments),
@@ -334,6 +339,49 @@ async fn create_reboot(
         StatusCode::CREATED,
         Json(deployment_view(&state, id).await?),
     ))
+}
+
+async fn create_flatpak_update(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(machine): Path<String>,
+    Json(mut request): Json<CreateFlatpakUpdate>,
+) -> Result<(StatusCode, Json<Deployment>), ApiError> {
+    if let Some(username) = principal.username() {
+        request.requested_by = Some(username.to_owned());
+    }
+    let machine = find_machine(&state, &machine).await?;
+    let id = deploy::create_flatpak_update(&state, &machine, request).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(deployment_view(&state, id).await?),
+    ))
+}
+
+async fn set_auto_update(
+    State(state): State<AppState>,
+    Path(machine): Path<String>,
+    Json(request): Json<AutoUpdate>,
+) -> Result<Json<Machine>, ApiError> {
+    let machine = find_machine(&state, &machine).await?;
+    if request.nixpkgs && machine.configuration.is_none() {
+        return Err(ApiError::bad_request(format!(
+            "{} has no configuration; set one with `mnix machine configure`",
+            machine.name
+        )));
+    }
+    state
+        .store
+        .set_machine_auto_update(machine.id, request)
+        .await?;
+    state
+        .event(
+            Some(machine.id),
+            "auto_update_set",
+            serde_json::json!({ "nixpkgs": request.nixpkgs, "flatpak": request.flatpak }),
+        )
+        .await;
+    get_machine(State(state), Path(machine.id.to_string())).await
 }
 
 async fn list_repositories(
@@ -741,6 +789,7 @@ fn machine_view(
         tags: machine.tags.clone(),
         revision: None,
         last_deployment: None,
+        auto_update: machine.auto_update,
     }
 }
 
@@ -799,6 +848,7 @@ mod tests {
             repository_id: None,
             configuration: None,
             tags: Vec::new(),
+            auto_update: Default::default(),
         };
         assert_eq!(status(&m, now, timeout), MachineStatus::Pending);
         m.enrolled_at = Some(now);

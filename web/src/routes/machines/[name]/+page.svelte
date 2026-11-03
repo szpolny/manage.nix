@@ -8,6 +8,7 @@
 	import EnrollmentInstructions from '#lib/EnrollmentInstructions.svelte';
 	import { ago, exact, revisionLabel, shortPath } from '#lib/format.ts';
 	import type {
+		AutoUpdate,
 		ClosureDiff,
 		EnrollmentToken,
 		GenerationView,
@@ -47,6 +48,8 @@
 	let checking = $state(false);
 	let preview: Preview | null = $state(null);
 	let previewError = $state('');
+
+	let autoUpdateError = $state('');
 
 	let deployDialog: DeployDialog | undefined = $state();
 	let tokenDialog: Dialog;
@@ -175,6 +178,27 @@
 			await goto(`/deploys/${deployment.id}`);
 		} catch (e) {
 			error = errorMessage(e);
+		}
+	}
+
+	async function flatpakUpdate() {
+		const count = machine?.facts?.flatpak_updates?.length ?? 0;
+		if (!confirm(`Update ${count} Flatpak ref${count === 1 ? '' : 's'} on ${name} now?`)) return;
+		try {
+			const deployment = await api.flatpakUpdate(name);
+			await goto(`/deploys/${deployment.id}`);
+		} catch (e) {
+			error = errorMessage(e);
+		}
+	}
+
+	async function setAutoUpdate(change: Partial<AutoUpdate>) {
+		if (!machine) return;
+		autoUpdateError = '';
+		try {
+			machine = await api.setAutoUpdate(name, { ...machine.auto_update, ...change });
+		} catch (e) {
+			autoUpdateError = errorMessage(e);
 		}
 	}
 
@@ -329,6 +353,114 @@
 			{#if saved}<p class="muted small" role="status">Saved {saved}.</p>{/if}
 		</section>
 	</div>
+
+	<section class="section" data-testid="package-updates">
+		<h2>Package updates</h2>
+		<div class="table-card">
+			<table>
+				<thead>
+					<tr><th>Source</th><th>Status</th><th>Automatic</th><th></th></tr>
+				</thead>
+				<tbody>
+					<tr>
+						<td>nixpkgs</td>
+						<td>
+							{#if !machine.repository}
+								<span class="muted">needs a configuration</span>
+							{:else if updates?.nixpkgs_available === true}
+								<strong class="warn">update available</strong>
+							{:else if updates?.nixpkgs_available === false}
+								up to date
+							{:else}
+								<span
+									class="muted"
+									title="Needs a known running commit and a GitHub nixpkgs input in flake.lock"
+									>unknown</span
+								>
+							{/if}
+						</td>
+						<td>
+							<label class="check">
+								<input
+									type="checkbox"
+									name="auto_update_nixpkgs"
+									checked={machine.auto_update.nixpkgs}
+									disabled={!machine.repository}
+									onchange={(e) => setAutoUpdate({ nixpkgs: e.currentTarget.checked })}
+								/>
+								daily
+							</label>
+						</td>
+						<td class="row-actions">
+							<button
+								type="button"
+								class:attention={updates?.nixpkgs_available === true}
+								onclick={() => deployDialog?.open([name], updates?.rev, true)}
+								disabled={!machine.repository || !machine.enrolled_at}
+								>Update nixpkgs…</button
+							>
+						</td>
+					</tr>
+					<tr>
+						<td>Flatpak</td>
+						<td>
+							{#if !machine.facts?.flatpak_updates}
+								<span
+									class="muted"
+									title="Needs Flatpak on the machine and an up-to-date agent"
+									>unknown</span
+								>
+							{:else if machine.facts.flatpak_updates.length}
+								<strong class="warn"
+									>{machine.facts.flatpak_updates.length} update{machine.facts.flatpak_updates
+										.length === 1
+										? ''
+										: 's'}</strong
+								>
+							{:else}
+								up to date
+							{/if}
+						</td>
+						<td>
+							<label class="check">
+								<input
+									type="checkbox"
+									name="auto_update_flatpak"
+									checked={machine.auto_update.flatpak}
+									onchange={(e) => setAutoUpdate({ flatpak: e.currentTarget.checked })}
+								/>
+								daily
+							</label>
+						</td>
+						<td class="row-actions">
+							<button
+								type="button"
+								class:attention={Boolean(machine.facts?.flatpak_updates?.length)}
+								onclick={flatpakUpdate}
+								disabled={machine.status !== 'online' || !machine.facts?.flatpak_updates}
+								title={machine.status === 'online' ? '' : 'Only online machines can be updated'}
+								>Update Flatpaks…</button
+							>
+						</td>
+					</tr>
+				</tbody>
+			</table>
+		</div>
+		{#if machine.facts?.flatpak_updates?.length}
+			<details>
+				<summary class="small">Flatpak refs with updates</summary>
+				<ul class="refs">
+					{#each machine.facts.flatpak_updates as ref (ref)}<li class="mono small">{ref}</li>{/each}
+				</ul>
+			</details>
+		{/if}
+		{#if autoUpdateError}<p class="error" role="alert">{autoUpdateError}</p>{/if}
+		<p class="muted small">
+			Checks refresh every 15 minutes. Updating nixpkgs commits the new <code>flake.lock</code> to
+			the branch and pushes it before deploying, so the repository's key needs write access.
+			Automatic updates run at most once a day each, while the machine is online and idle.
+		</p>
+	</section>
 
 	{#if machine.repository}
 		<section class="section" data-testid="updates">
@@ -530,9 +662,9 @@
 								<td><a href="/deploys/{d.deployment_id}"><Badge status={d.status} /></a></td>
 								<td>
 									{d.kind}
-									{#if d.kind !== 'reboot'}<span class="muted">({d.mode})</span>{/if}
+									{#if d.kind !== 'reboot' && d.kind !== 'flatpak_update'}<span class="muted">({d.mode})</span>{/if}
 								</td>
-								<td class="mono">{d.kind === 'deploy' ? revisionLabel(d.rev, d.commit) : '—'}</td>
+								<td class="mono">{d.kind === 'deploy' || d.kind === 'update' ? revisionLabel(d.rev, d.commit) : '—'}</td>
 								<td>{d.requested_by}</td>
 								<td title={exact(d.created_at)}>{ago(d.created_at, now)}</td>
 								<td class="muted">{d.message ?? ''}</td>
@@ -610,5 +742,24 @@
 	}
 	h2 :global(+ p) {
 		margin-top: 0;
+	}
+	.check {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.4rem;
+		font-weight: 400;
+	}
+	.row-actions {
+		text-align: right;
+	}
+	details {
+		margin-top: 0.75rem;
+	}
+	.refs {
+		margin: 0.5rem 0 0;
+		padding-left: 1.25rem;
+	}
+	[data-testid='package-updates'] > .muted.small {
+		margin-top: 0.75rem;
 	}
 </style>

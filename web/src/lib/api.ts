@@ -5,6 +5,7 @@
 import { goto } from '$app/navigation';
 import type {
 	ActivationMode,
+	AutoUpdate,
 	ClosureDiff,
 	CreatedMachine,
 	Deployment,
@@ -87,6 +88,10 @@ export const api = {
 	rollback: (name: string, mode: ActivationMode = 'switch') =>
 		request<Deployment>('POST', `/api/machines/${enc(name)}/rollback`, { mode }),
 	reboot: (name: string) => request<Deployment>('POST', `/api/machines/${enc(name)}/reboot`, {}),
+	flatpakUpdate: (name: string) =>
+		request<Deployment>('POST', `/api/machines/${enc(name)}/flatpak-update`, {}),
+	setAutoUpdate: (name: string, auto_update: AutoUpdate) =>
+		request<Machine>('PUT', `/api/machines/${enc(name)}/auto-update`, auto_update),
 	updates: (name: string, rev?: string) =>
 		request<Updates>(
 			'GET',
@@ -103,8 +108,12 @@ export const api = {
 
 	deployments: (limit = 50) => request<Deployment[]>('GET', `/api/deployments?limit=${limit}`),
 	deployment: (id: string) => request<Deployment>('GET', `/api/deployments/${enc(id)}`),
-	deploy: (targets: string[], rev: string | undefined, mode: ActivationMode) =>
-		request<Deployment>('POST', '/api/deployments', { targets, rev, mode }),
+	deploy: (
+		targets: string[],
+		rev: string | undefined,
+		mode: ActivationMode,
+		update_nixpkgs = false
+	) => request<Deployment>('POST', '/api/deployments', { targets, rev, mode, update_nixpkgs }),
 	deploymentEvents: (id: string) => `/api/deployments/${enc(id)}/events`
 };
 

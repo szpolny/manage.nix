@@ -392,6 +392,7 @@ impl Server {
 
 fn facts(hostname: &str) -> Facts {
     Facts {
+        flatpak_updates: None,
         hostname: hostname.to_owned(),
         current_system: "/nix/store/00000000000000000000000000000000-nixos-system-a".to_owned(),
         booted_system: None,
@@ -1764,4 +1765,328 @@ async fn updates_list_the_commits_a_machine_lacks() {
     assert!(preview.commit.is_some());
     assert!(preview.message.is_some());
     assert!(preview.finished_at.is_some());
+}
+
+#[tokio::test]
+async fn flatpak_updates_run_on_request_and_automatically() {
+    let server = start(Duration::from_secs(30)).await;
+    let credential = server.enrolled("web-1").await;
+    let mut ws = server.session(&credential, "web-1").await;
+    server.wait_for_status("web-1", MachineStatus::Online).await;
+
+    // An agent that does not report Flatpak would ignore the request.
+    let (status, body) = server
+        .admin(
+            "POST",
+            "/api/machines/web-1/flatpak-update",
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("Flatpak"));
+
+    let facts = Facts {
+        flatpak_updates: Some(vec!["app/org.example.App/x86_64/stable".to_owned()]),
+        ..facts("web-1")
+    };
+    ws.send(text(&AgentMessage::Facts { facts })).await.unwrap();
+    for _ in 0..100 {
+        let machine = server.machine("web-1").await;
+        if machine.facts.and_then(|f| f.flatpak_updates).is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Nothing is due while auto-updates are off.
+    crate::auto_update::run_once(&server.state).await.unwrap();
+    let (_, history) = server
+        .admin("GET", "/api/machines/web-1/deployments", None)
+        .await;
+    assert_eq!(history.as_array().unwrap().len(), 0);
+
+    // nixpkgs auto-updates need a configuration to update.
+    let (status, body) = server
+        .admin(
+            "PUT",
+            "/api/machines/web-1/auto-update",
+            Some(json!({ "nixpkgs": true })),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    let (status, body) = server
+        .admin(
+            "PUT",
+            "/api/machines/web-1/auto-update",
+            Some(json!({ "flatpak": true })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let machine: Machine = serde_json::from_value(body).unwrap();
+    assert!(machine.auto_update.flatpak && !machine.auto_update.nixpkgs);
+
+    crate::auto_update::run_once(&server.state).await.unwrap();
+    let Some(ServerMessage::Activate(activate)) =
+        receive_within(&mut ws, Duration::from_secs(5)).await
+    else {
+        panic!("expected activate");
+    };
+    assert_eq!(activate.target, ActivationTarget::FlatpakUpdate);
+    let deployment = server.deployment(&activate.deployment_id).await;
+    assert_eq!(deployment.kind, DeploymentKind::FlatpakUpdate);
+    assert_eq!(deployment.requested_by, crate::auto_update::REQUESTED_BY);
+
+    // In progress: nothing else starts.
+    crate::auto_update::run_once(&server.state).await.unwrap();
+    ws.send(text(&AgentMessage::ActivationStatus {
+        deployment_id: activate.deployment_id.clone(),
+        phase: ActivationPhase::Updating,
+    }))
+    .await
+    .unwrap();
+    ws.send(text(&AgentMessage::ActivationResult {
+        deployment_id: activate.deployment_id.clone(),
+        report: ActivationReport {
+            store_path: String::new(),
+            system_changed: false,
+            previous_system: None,
+            ..succeeded("")
+        },
+    }))
+    .await
+    .unwrap();
+    server
+        .wait_for_deployment(&activate.deployment_id, DeploymentStatus::Succeeded)
+        .await;
+
+    // Done for the day, even though the facts still list the update.
+    crate::auto_update::run_once(&server.state).await.unwrap();
+    let (_, history) = server
+        .admin("GET", "/api/machines/web-1/deployments", None)
+        .await;
+    assert_eq!(history.as_array().unwrap().len(), 1);
+    assert_eq!(history[0]["kind"], "flatpak_update");
+
+    // Asking is not limited.
+    let (status, body) = server
+        .admin(
+            "POST",
+            "/api/machines/web-1/flatpak-update",
+            Some(json!({ "requested_by": "alice" })),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["kind"], "flatpak_update");
+}
+
+/// `nix`, for tests that need it; `None` where it cannot run (the Nix
+/// build's sandbox), so those tests are skipped there.
+fn nix_available() -> bool {
+    std::process::Command::new("nix")
+        .args([
+            "--extra-experimental-features",
+            "nix-command flakes",
+            "store",
+            "ping",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+#[tokio::test]
+async fn update_deploys_push_a_new_nixpkgs_lock_first() {
+    if !nix_available() {
+        eprintln!("skipping: nix is not available");
+        return;
+    }
+    let server = launch_building_on(
+        Duration::from_secs(30),
+        Duration::from_secs(600),
+        None,
+        crate::build::BuildOn::Machine,
+    )
+    .await;
+    let root = server._dir.path();
+    let commit_all = |dir: &std::path::Path, message: &str| {
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "--quiet", "-m", message]);
+        git(dir, &["rev-parse", "HEAD"])
+    };
+    // A stand-in for nixpkgs, and a configuration repository using it.
+    let nixpkgs = root.join("nixpkgs");
+    std::fs::create_dir(&nixpkgs).unwrap();
+    git(&nixpkgs, &["init", "--quiet"]);
+    std::fs::write(nixpkgs.join("flake.nix"), "{ outputs = _: { }; }\n").unwrap();
+    commit_all(&nixpkgs, "one");
+    let origin = root.join("infra.git");
+    git(
+        root,
+        &[
+            "init",
+            "--quiet",
+            "--bare",
+            "--initial-branch=main",
+            "infra.git",
+        ],
+    );
+    let work = root.join("infra");
+    git(
+        root,
+        &["clone", "--quiet", origin.to_str().unwrap(), "infra"],
+    );
+    git(&work, &["checkout", "--quiet", "-b", "main"]);
+    std::fs::write(
+        work.join("flake.nix"),
+        format!(
+            "{{ inputs.nixpkgs.url = \"git+file://{}\"; outputs = _: {{ }}; }}\n",
+            nixpkgs.display()
+        ),
+    )
+    .unwrap();
+    git(&work, &["add", "flake.nix"]);
+    let locked = std::process::Command::new("nix")
+        .args([
+            "--extra-experimental-features",
+            "nix-command flakes",
+            "flake",
+            "lock",
+        ])
+        .current_dir(&work)
+        .status()
+        .unwrap();
+    assert!(locked.success());
+    let base = commit_all(&work, "infra");
+    git(&work, &["tag", "v1"]);
+    git(&work, &["push", "--quiet", "origin", "main", "v1"]);
+    let newer = {
+        std::fs::write(nixpkgs.join("README"), "two\n").unwrap();
+        commit_all(&nixpkgs, "two")
+    };
+
+    let credential = server.enrolled("web-1").await;
+    let (status, body) = server
+        .admin(
+            "POST",
+            "/api/repositories",
+            Some(json!({ "name": "infra", "url": origin.to_str().unwrap() })),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    let (status, body) = server
+        .admin(
+            "PUT",
+            "/api/machines/web-1/configuration",
+            Some(json!({ "repository": "infra" })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let mut ws = server.session(&credential, "web-1").await;
+
+    // A tag cannot take the new lock.
+    let (status, body) = server
+        .admin(
+            "POST",
+            "/api/deployments",
+            Some(json!({ "targets": ["web-1"], "rev": "v1", "update_nixpkgs": true })),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    let failed = server
+        .wait_for_deployment(body["id"].as_str().unwrap(), DeploymentStatus::Failed)
+        .await;
+    assert!(
+        failed
+            .message
+            .as_deref()
+            .unwrap_or("")
+            .contains("not a branch"),
+        "{:?}",
+        failed.message
+    );
+
+    let (status, body) = server
+        .admin(
+            "POST",
+            "/api/deployments",
+            Some(json!({ "targets": ["web-1"], "update_nixpkgs": true })),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["kind"], "update");
+    let deployment_id = body["id"].as_str().unwrap().to_owned();
+    let activate = loop {
+        match receive_within(&mut ws, Duration::from_secs(60)).await {
+            Some(ServerMessage::Activate(activate)) => break activate,
+            Some(_) => {}
+            None => {
+                let (_, logs) = server
+                    .admin(
+                        "GET",
+                        &format!("/api/deployments/{deployment_id}/logs"),
+                        None,
+                    )
+                    .await;
+                panic!("no activation: {logs}");
+            }
+        }
+    };
+    assert_eq!(activate.deployment_id, deployment_id);
+    let ActivationTarget::Build { commit, .. } = &activate.target else {
+        panic!("expected a build, got {:?}", activate.target);
+    };
+    // The new lock was pushed to the branch, on top of what was there.
+    assert_eq!(git(&origin, &["rev-parse", "main"]), *commit);
+    assert_eq!(git(&origin, &["rev-parse", "main^"]), base);
+    let lock = git(&origin, &["show", "main:flake.lock"]);
+    assert!(lock.contains(&newer), "{lock}");
+    assert_eq!(
+        server.deployment(&deployment_id).await.commit.as_deref(),
+        Some(commit.as_str())
+    );
+    // The mirror holds no leftover worktree.
+    let mirror = server.state.builder.mirror(
+        server
+            .state
+            .store
+            .repositories(server.state.organization.id)
+            .await
+            .unwrap()[0]
+            .id,
+    );
+    assert_eq!(git(&mirror, &["worktree", "list"]).lines().count(), 1);
+    ws.send(text(&AgentMessage::ActivationResult {
+        deployment_id: deployment_id.clone(),
+        report: succeeded("/nix/store/11111111111111111111111111111111-nixos-system-web-1"),
+    }))
+    .await
+    .unwrap();
+    server
+        .wait_for_deployment(&deployment_id, DeploymentStatus::Succeeded)
+        .await;
+
+    // Already up to date: the branch's commit is deployed as it is.
+    let (status, body) = server
+        .admin(
+            "POST",
+            "/api/deployments",
+            Some(json!({ "targets": ["web-1"], "update_nixpkgs": true })),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    let again = loop {
+        match receive_within(&mut ws, Duration::from_secs(60)).await {
+            Some(ServerMessage::Activate(activate)) => break activate,
+            Some(_) => {}
+            None => panic!("no activation"),
+        }
+    };
+    assert_eq!(
+        again.target,
+        ActivationTarget::Build {
+            commit: commit.clone(),
+            attribute: "nixosConfigurations.\"web-1\".config.system.build.toplevel".to_owned(),
+        }
+    );
 }

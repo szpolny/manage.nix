@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, organization_id, name, created_at, enrolled_at, agent_version,\n                      facts AS \"facts: Json<Facts>\", facts_updated_at, last_seen_at,\n                      EXISTS (\n                          SELECT 1 FROM agent_sessions AS s\n                          WHERE s.machine_id = machines.id AND s.disconnected_at IS NULL\n                      ) AS \"connected!\",\n                      repository_id, configuration,\n                      ARRAY(\n                          SELECT tag FROM machine_tags AS t\n                          WHERE t.machine_id = machines.id ORDER BY tag COLLATE \"C\"\n                      ) AS \"tags!\"\n               FROM machines WHERE organization_id = $1 ORDER BY name COLLATE \"C\"",
+  "query": "SELECT id, organization_id, name, created_at, enrolled_at, agent_version,\n                      facts AS \"facts: Json<Facts>\", facts_updated_at, last_seen_at,\n                      EXISTS (\n                          SELECT 1 FROM agent_sessions AS s\n                          WHERE s.machine_id = machines.id AND s.disconnected_at IS NULL\n                      ) AS \"connected!\",\n                      repository_id, configuration,\n                      ARRAY(\n                          SELECT tag FROM machine_tags AS t\n                          WHERE t.machine_id = machines.id ORDER BY tag COLLATE \"C\"\n                      ) AS \"tags!\",\n                      auto_update_nixpkgs, auto_update_flatpak\n               FROM machines WHERE organization_id = $1 ORDER BY name COLLATE \"C\"",
   "describe": {
     "columns": [
       {
@@ -67,6 +67,16 @@
         "ordinal": 12,
         "name": "tags!",
         "type_info": "TextArray"
+      },
+      {
+        "ordinal": 13,
+        "name": "auto_update_nixpkgs",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 14,
+        "name": "auto_update_flatpak",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -87,8 +97,10 @@
       null,
       true,
       true,
-      null
+      null,
+      false,
+      false
     ]
   },
-  "hash": "9cbd595948cc9b49f71729804d37686e8aac771bceccf51e603f57167f20d143"
+  "hash": "edb315ca0a5ebc11a6d5486d841edd8ef8288743b59f19b50bdf4948720ae603"
 }

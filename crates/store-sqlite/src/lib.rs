@@ -8,7 +8,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use mnix_protocol::api::{DeploymentKind, DeploymentStatus, MachineDeploymentStatus};
+use mnix_protocol::api::{AutoUpdate, DeploymentKind, DeploymentStatus, MachineDeploymentStatus};
 use mnix_protocol::{ActivationMode, ActivationPhase, Facts};
 use mnix_store_core::{
     disconnect_reason, group_columns, log_source, new_log_text, parse_enum, truncate_to_micros,
@@ -99,6 +99,8 @@ struct MachineRow {
     configuration: Option<String>,
     /// A JSON array.
     tags: String,
+    auto_update_nixpkgs: bool,
+    auto_update_flatpak: bool,
 }
 
 impl TryFrom<MachineRow> for Machine {
@@ -119,6 +121,10 @@ impl TryFrom<MachineRow> for Machine {
             repository_id: row.repository_id.as_deref().map(parse_id).transpose()?,
             configuration: row.configuration,
             tags: serde_json::from_str(&row.tags)?,
+            auto_update: AutoUpdate {
+                nixpkgs: row.auto_update_nixpkgs,
+                flatpak: row.auto_update_flatpak,
+            },
         })
     }
 }
@@ -257,7 +263,8 @@ macro_rules! select_machines {
                       (SELECT json_group_array(tag) FROM (
                           SELECT tag FROM machine_tags AS t
                           WHERE t.machine_id = machines.id ORDER BY tag
-                      )) AS "tags!: String"
+                      )) AS "tags!: String",
+                      auto_update_nixpkgs, auto_update_flatpak
                FROM machines "# + $($where)*
         )
     };
@@ -351,6 +358,7 @@ impl Store for SqliteStore {
             repository_id: None,
             configuration: None,
             tags: Vec::new(),
+            auto_update: AutoUpdate::default(),
         })
     }
 
@@ -732,6 +740,23 @@ impl Store for SqliteStore {
             .await?;
         }
         tx.commit().await?;
+        Ok(())
+    }
+
+    async fn set_machine_auto_update(
+        &self,
+        machine_id: Uuid,
+        auto_update: AutoUpdate,
+    ) -> Result<()> {
+        let machine_id = id(machine_id);
+        sqlx::query!(
+            "UPDATE machines SET auto_update_nixpkgs = ?, auto_update_flatpak = ? WHERE id = ?",
+            auto_update.nixpkgs,
+            auto_update.flatpak,
+            machine_id
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -1262,7 +1287,7 @@ impl Store for SqliteStore {
             r#"SELECT dm.store_path AS "store_path!", d.id, d.repository_id, d.rev,
                       d.commit_id AS "commit_id!", d.created_at
                FROM deployment_machines AS dm JOIN deployments AS d ON d.id = dm.deployment_id
-               WHERE d.organization_id = ? AND d.kind = 'deploy' AND d.commit_id IS NOT NULL
+               WHERE d.organization_id = ? AND d.kind IN ('deploy', 'update') AND d.commit_id IS NOT NULL
                  AND dm.store_path IN (SELECT value FROM json_each(?))
                ORDER BY d.created_at, d.rowid"#,
             org,

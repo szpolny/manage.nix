@@ -3,7 +3,7 @@
 use std::str::FromStr;
 
 use async_trait::async_trait;
-use mnix_protocol::api::{DeploymentKind, DeploymentStatus, MachineDeploymentStatus};
+use mnix_protocol::api::{AutoUpdate, DeploymentKind, DeploymentStatus, MachineDeploymentStatus};
 use mnix_protocol::{ActivationMode, ActivationPhase, ActivationReport, Facts};
 use mnix_store_core::{
     disconnect_reason, group_columns, log_source, new_log_text, parse_enum, truncate_to_micros,
@@ -54,6 +54,8 @@ struct MachineRow {
     repository_id: Option<Uuid>,
     configuration: Option<String>,
     tags: Vec<String>,
+    auto_update_nixpkgs: bool,
+    auto_update_flatpak: bool,
 }
 
 impl From<MachineRow> for Machine {
@@ -72,6 +74,10 @@ impl From<MachineRow> for Machine {
             repository_id: row.repository_id,
             configuration: row.configuration,
             tags: row.tags,
+            auto_update: AutoUpdate {
+                nixpkgs: row.auto_update_nixpkgs,
+                flatpak: row.auto_update_flatpak,
+            },
         }
     }
 }
@@ -185,7 +191,8 @@ macro_rules! select_machines {
                       ARRAY(
                           SELECT tag FROM machine_tags AS t
                           WHERE t.machine_id = machines.id ORDER BY tag COLLATE "C"
-                      ) AS "tags!"
+                      ) AS "tags!",
+                      auto_update_nixpkgs, auto_update_flatpak
                FROM machines "# + $($where)*
         )
     };
@@ -278,6 +285,7 @@ impl Store for PostgresStore {
             repository_id: None,
             configuration: None,
             tags: Vec::new(),
+            auto_update: AutoUpdate::default(),
         })
     }
 
@@ -628,6 +636,22 @@ impl Store for PostgresStore {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        Ok(())
+    }
+
+    async fn set_machine_auto_update(
+        &self,
+        machine_id: Uuid,
+        auto_update: AutoUpdate,
+    ) -> Result<()> {
+        sqlx::query!(
+            "UPDATE machines SET auto_update_nixpkgs = $1, auto_update_flatpak = $2 WHERE id = $3",
+            auto_update.nixpkgs,
+            auto_update.flatpak,
+            machine_id
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -1118,7 +1142,7 @@ impl Store for PostgresStore {
                       dm.store_path AS "store_path!", d.id AS deployment_id, d.repository_id,
                       d.rev, d.commit_id AS "commit_id!", d.created_at
                FROM deployment_machines AS dm JOIN deployments AS d ON d.id = dm.deployment_id
-               WHERE d.organization_id = $1 AND d.kind = 'deploy' AND d.commit_id IS NOT NULL
+               WHERE d.organization_id = $1 AND d.kind IN ('deploy', 'update') AND d.commit_id IS NOT NULL
                  AND dm.store_path = ANY($2)
                ORDER BY dm.store_path, d.created_at DESC, d.id DESC"#,
             organization_id,

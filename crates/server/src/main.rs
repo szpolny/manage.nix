@@ -4,6 +4,7 @@ mod agent;
 mod api;
 mod app;
 mod auth;
+mod auto_update;
 mod build;
 mod closure;
 mod deploy;
@@ -337,6 +338,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     tokio::spawn(agent::reap_stale_sessions(state.clone()));
     tokio::spawn(deploy::run_worker(state.clone()));
     tokio::spawn(deploy::run_sweeper(state.clone()));
+    tokio::spawn(auto_update::run(state.clone()));
     tokio::spawn(auth::delete_expired_sessions(state.clone()));
 
     let (first, others) = args

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT DISTINCT ON (dm.store_path)\n                      dm.store_path AS \"store_path!\", d.id AS deployment_id, d.repository_id,\n                      d.rev, d.commit_id AS \"commit_id!\", d.created_at\n               FROM deployment_machines AS dm JOIN deployments AS d ON d.id = dm.deployment_id\n               WHERE d.organization_id = $1 AND d.kind = 'deploy' AND d.commit_id IS NOT NULL\n                 AND dm.store_path = ANY($2)\n               ORDER BY dm.store_path, d.created_at DESC, d.id DESC",
+  "query": "SELECT DISTINCT ON (dm.store_path)\n                      dm.store_path AS \"store_path!\", d.id AS deployment_id, d.repository_id,\n                      d.rev, d.commit_id AS \"commit_id!\", d.created_at\n               FROM deployment_machines AS dm JOIN deployments AS d ON d.id = dm.deployment_id\n               WHERE d.organization_id = $1 AND d.kind IN ('deploy', 'update') AND d.commit_id IS NOT NULL\n                 AND dm.store_path = ANY($2)\n               ORDER BY dm.store_path, d.created_at DESC, d.id DESC",
   "describe": {
     "columns": [
       {
@@ -49,5 +49,5 @@
       false
     ]
   },
-  "hash": "ad40870e229a0d09d21c6cdcc34a1db8d851b6ddfa565ff6182e4cf0da4481c3"
+  "hash": "d0dfdb2295642012f5472d0f66cf0dae4605217323c304d2b44b40242b0c858b"
 }

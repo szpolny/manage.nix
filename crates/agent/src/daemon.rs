@@ -562,7 +562,9 @@ async fn report_jobs(
         }
         if let Some(report) = &job.report {
             if !seen.result {
-                // Let the server see the new system along with the result.
+                // Let the server see the new system along with the result;
+                // pending Flatpak updates follow with a later heartbeat.
+                facts::refresh_flatpak_updates();
                 let current = collect_facts().await?;
                 if current != *facts {
                     *facts = current.clone();

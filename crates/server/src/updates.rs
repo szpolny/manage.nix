@@ -37,6 +37,7 @@ const MAX_COMMITS: usize = 50;
 /// Update checks' and previews' state in the server.
 #[derive(Default)]
 pub struct Tracker {
+    nixpkgs: tokio::sync::Mutex<HashMap<String, (OffsetDateTime, Option<bool>)>>,
     /// When each repository was last fetched.
     fetched: tokio::sync::Mutex<HashMap<Uuid, OffsetDateTime>>,
     /// The latest preview of each machine.
@@ -142,6 +143,7 @@ async fn check(
     };
     let commit = resolve(&mirror, &rev).await?;
     let mut view = UpdatesView {
+        nixpkgs_available: nixpkgs_updates(state, &mirror, subject.current_commit.as_deref()).await,
         repository: subject.repository.name.clone(),
         rev,
         commit: commit.clone(),
@@ -311,6 +313,7 @@ pub async fn all_updates(
         let summary = match subject(&state, machine).await {
             Ok(subject) => match check(&state, &subject, None).await {
                 Ok(u) => UpdateSummary {
+                    nixpkgs_available: u.nixpkgs_available,
                     machine: name,
                     rev: Some(u.rev),
                     commit: Some(u.commit),
@@ -318,6 +321,7 @@ pub async fn all_updates(
                     error: None,
                 },
                 Err(e) => UpdateSummary {
+                    nixpkgs_available: None,
                     machine: name,
                     rev: None,
                     commit: None,
@@ -326,6 +330,7 @@ pub async fn all_updates(
                 },
             },
             Err(e) => UpdateSummary {
+                nixpkgs_available: None,
                 machine: name,
                 rev: None,
                 commit: None,
@@ -336,6 +341,20 @@ pub async fn all_updates(
         summaries.push(summary);
     }
     Ok(Json(summaries))
+}
+
+/// The revision to update the machine's nixpkgs input on, if upstream has
+/// a newer nixpkgs than the running system was built with; `None` if it is
+/// up to date or that is unknown.
+pub async fn nixpkgs_update(
+    state: &AppState,
+    machine: mnix_store::Machine,
+) -> anyhow::Result<Option<String>> {
+    let subject = subject(state, machine)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.message))?;
+    let updates = check(state, &subject, None).await?;
+    Ok((updates.nixpkgs_available == Some(true)).then_some(updates.rev))
 }
 
 /// `GET /api/machines/:machine/updates/preview`
@@ -483,9 +502,104 @@ async fn run_preview(
     Ok(())
 }
 
+/// Compare the running configuration's lock with the upstream input, without
+/// updating the repository's lock or building a system.
+async fn nixpkgs_updates(state: &AppState, mirror: &Path, current: Option<&str>) -> Option<bool> {
+    let current = current?;
+    if !is_commit(current) {
+        return None;
+    }
+    let lock = git(mirror, &["show", &format!("{current}:flake.lock")])
+        .await
+        .ok()?;
+    let (url, locked) = nixpkgs_input(&lock)?;
+    let key = format!("{url}:{locked}");
+    let mut cache = state.updates.nixpkgs.lock().await;
+    let now = OffsetDateTime::now_utc();
+    if let Some((at, result)) = cache.get(&key) {
+        if now - *at < Duration::from_secs(900) {
+            return *result;
+        }
+    }
+    let result = async {
+        let mut command = tokio::process::Command::new("nix");
+        command
+            .args([
+                "flake",
+                "metadata",
+                "--json",
+                "--refresh",
+                "--no-write-lock-file",
+                &url,
+            ])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let out = tokio::time::timeout(Duration::from_secs(30), command.output())
+            .await
+            .ok()?
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let metadata: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+        Some(metadata.get("locked")?.get("rev")?.as_str()? != locked)
+    }
+    .await;
+    cache.insert(key, (now, result));
+    result
+}
+
+fn nixpkgs_input(lock: &str) -> Option<(String, String)> {
+    let lock: serde_json::Value = serde_json::from_str(lock).ok()?;
+    let nodes = lock.get("nodes")?;
+    let root = lock.get("root")?.as_str()?;
+    let input = nodes.get(root)?.get("inputs")?.get("nixpkgs")?.as_str()?;
+    let node = nodes.get(input)?;
+    let original = node.get("original")?;
+    let locked = node.get("locked")?.get("rev")?.as_str()?;
+    // GitHub inputs are the standard nixpkgs source. Other input kinds and
+    // follows paths remain unknown rather than incorrectly reporting current.
+    if original.get("type")?.as_str()? != "github" {
+        return None;
+    }
+    let owner = original.get("owner")?.as_str()?;
+    let repo = original.get("repo")?.as_str()?;
+    let reference = original
+        .get("rev")
+        .or_else(|| original.get("ref"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let url = if reference.is_empty() {
+        format!("github:{owner}/{repo}")
+    } else {
+        format!("github:{owner}/{repo}/{reference}")
+    };
+    Some((url, locked.to_owned()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nixpkgs_input_uses_the_root_input_and_original_branch() {
+        let lock = r#"{"root":"root","nodes":{
+            "root":{"inputs":{"nixpkgs":"nixpkgs_2"}},
+            "nixpkgs_2":{"original":{"type":"github","owner":"NixOS","repo":"nixpkgs","ref":"nixos-unstable"},
+                "locked":{"rev":"abc"}}
+        }}"#;
+        assert_eq!(
+            nixpkgs_input(lock),
+            Some(("github:NixOS/nixpkgs/nixos-unstable".into(), "abc".into()))
+        );
+        assert_eq!(nixpkgs_input("{}"), None);
+        assert_eq!(nixpkgs_input("invalid"), None);
+        assert_eq!(
+            nixpkgs_input(&lock.replace("\"nixpkgs_2\"}", "[\"other\",\"nixpkgs\"]}")),
+            None
+        );
+    }
 
     #[test]
     fn rev_list_counts_are_left_then_right() {

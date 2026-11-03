@@ -8,7 +8,7 @@
 //! - [`Facts`] and [`ActivationReport`] are what the agent reports about
 //!   itself; `mnix-agent facts` and `mnix-agent activate` print them too.
 //! - [`Activate`] is the one command the server can give an agent: it
-//!   activates a system, or restarts the machine.
+//!   activates a system, restarts the machine, or updates its Flatpaks.
 
 pub mod api;
 
@@ -159,6 +159,10 @@ pub enum ActivationTarget {
     /// Restart the machine (`mnix reboot`). The agent reports success once
     /// it runs again in a new boot; `mode` is ignored.
     Reboot,
+    /// Update the machine's Flatpak apps and runtimes: the system
+    /// installation and each user's (`mnix flatpak-update`); `mode` is
+    /// ignored. Older agents do not know it.
+    FlatpakUpdate,
 }
 
 /// How far an activation has got.
@@ -179,6 +183,8 @@ pub enum ActivationPhase {
     RollingBack,
     /// The machine is restarting.
     Rebooting,
+    /// Updating Flatpak apps and runtimes.
+    Updating,
 }
 
 impl ActivationPhase {
@@ -191,6 +197,7 @@ impl ActivationPhase {
             Self::AwaitingConfirmation => "awaiting_confirmation",
             Self::RollingBack => "rolling_back",
             Self::Rebooting => "rebooting",
+            Self::Updating => "updating",
         }
     }
 
@@ -203,6 +210,7 @@ impl ActivationPhase {
             Self::AwaitingConfirmation,
             Self::RollingBack,
             Self::Rebooting,
+            Self::Updating,
         ]
         .into_iter()
         .find(|p| p.as_str() == s)
@@ -212,6 +220,8 @@ impl ActivationPhase {
 /// What a machine reports about itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Facts {
+    #[serde(default)]
+    pub flatpak_updates: Option<Vec<String>>,
     pub hostname: String,
     /// What kind of system the machine runs; agents before 0.2 only ran on
     /// NixOS.
@@ -457,6 +467,7 @@ mod tests {
             ActivationPhase::AwaitingConfirmation,
             ActivationPhase::RollingBack,
             ActivationPhase::Rebooting,
+            ActivationPhase::Updating,
         ] {
             assert_eq!(ActivationPhase::parse(phase.as_str()), Some(phase));
             assert_eq!(

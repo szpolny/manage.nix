@@ -24,6 +24,9 @@
 //! activations and they wait for it. It has no report until the service
 //! finds it again in a new boot and writes one.
 //!
+//! A Flatpak update ([`ActivationTarget::FlatpakUpdate`]) is a job as well;
+//! its output goes to the job's log like an activation's.
+//!
 //! The service deletes the directory when the server has stored the report.
 
 use std::io::Write;
@@ -189,7 +192,10 @@ impl Jobs {
         if report.is_none() && !unit_is_active(id) && age(created) > START_GRACE {
             let request: Activate = read_json(&request_path)?.context("missing request")?;
             let interrupted = ActivationReport {
-                system_changed: request.target != ActivationTarget::Reboot,
+                system_changed: !matches!(
+                    request.target,
+                    ActivationTarget::Reboot | ActivationTarget::FlatpakUpdate
+                ),
                 ..failed_report(
                     &request,
                     "the activation was interrupted (the machine restarted or the job \
@@ -394,7 +400,8 @@ pub fn failed_report(request: &Activate, message: String) -> ActivationReport {
             ActivationTarget::System { store_path } => store_path.clone(),
             ActivationTarget::Build { .. }
             | ActivationTarget::PreviousGeneration
-            | ActivationTarget::Reboot => String::new(),
+            | ActivationTarget::Reboot
+            | ActivationTarget::FlatpakUpdate => String::new(),
         },
         mode: request.mode,
         status: ActivationStatus::Failed,
@@ -417,6 +424,20 @@ pub fn run(dir: &Path) -> anyhow::Result<ActivationReport> {
     };
     let report = match crate::wait_for_lock() {
         Ok(_lock) if request.target == ActivationTarget::Reboot => reboot(dir, &request, &observer),
+        Ok(_lock) if request.target == ActivationTarget::FlatpakUpdate => {
+            observer.phase(ActivationPhase::Updating);
+            match crate::facts::update_flatpaks() {
+                Ok(()) => ActivationReport {
+                    status: ActivationStatus::Succeeded,
+                    message: None,
+                    ..failed_report(&request, String::new())
+                },
+                Err(e) => {
+                    tracing::error!("{e:#}");
+                    failed_report(&request, format!("{e:#}"))
+                }
+            }
+        }
         Ok(_lock) => match prepare(dir, &request, &observer) {
             Ok(source) => activate::activate(
                 &LocalHost,

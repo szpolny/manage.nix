@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use mnix_protocol::{Facts, Generation, Os};
@@ -21,6 +22,7 @@ pub fn collect() -> anyhow::Result<Facts> {
         Os::Darwin => "darwin-version",
     };
     Ok(Facts {
+        flatpak_updates: flatpak_updates(),
         hostname: hostname()?,
         os: OS,
         kernel: kernel()?,
@@ -150,8 +152,145 @@ pub fn generations(profile: &Path) -> anyhow::Result<Vec<Generation>> {
     Ok(generations)
 }
 
+/// When Flatpak was last checked, the refs with updates (`None` if
+/// unknown), and whether a check is running.
+type FlatpakCache = (Option<Instant>, Option<Vec<String>>, bool);
+static FLATPAK_CACHE: Mutex<FlatpakCache> = Mutex::new((None, None, false));
+
+// Network checks run off the heartbeat path. A missing binary, timeout, or
+// failed remote stays unknown; a successful empty list means up to date.
+fn flatpak_updates() -> Option<Vec<String>> {
+    let mut cache = FLATPAK_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if !cache.2
+        && cache
+            .0
+            .is_none_or(|at| at.elapsed() >= Duration::from_secs(900))
+    {
+        cache.2 = true;
+        std::thread::spawn(|| {
+            let result = collect_flatpak_updates();
+            let mut cache = FLATPAK_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            *cache = (Some(Instant::now()), result, false);
+        });
+    }
+    cache.1.clone()
+}
+
+fn parse_flatpak_updates(output: &str) -> Vec<String> {
+    let mut refs: Vec<_> = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+/// `flatpak` for the system installation (`user` `None`), or for a user's
+/// own installation, run as that user, within `timeout`.
+fn flatpak(user: Option<&str>, timeout: &str) -> Command {
+    let mut command = Command::new("timeout");
+    command.arg(timeout);
+    if let Some(user) = user {
+        command.args(["runuser", "-u", user, "--", "flatpak", "--user"]);
+    } else {
+        command.args(["flatpak", "--system"]);
+    }
+    command.env("LC_ALL", "C").stdin(Stdio::null());
+    command
+}
+
+/// Users with their own Flatpak installation in a standard home directory.
+fn flatpak_users() -> Option<Vec<String>> {
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    Some(
+        passwd
+            .lines()
+            .map(|line| line.split(':').collect::<Vec<_>>())
+            .filter(|fields| fields.len() >= 7)
+            .filter(|fields| {
+                Path::new(fields[5])
+                    .join(".local/share/flatpak/repo")
+                    .is_dir()
+            })
+            .map(|fields| fields[0].to_owned())
+            .collect(),
+    )
+}
+
+/// Forgets the last Flatpak check, so the next facts start a new one.
+pub fn refresh_flatpak_updates() {
+    let mut cache = FLATPAK_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    cache.0 = None;
+}
+
+/// Updates the system installation's apps and runtimes, then each user's.
+/// Output goes to the job's log.
+pub fn update_flatpaks() -> anyhow::Result<()> {
+    let run = |user: Option<&str>| -> anyhow::Result<()> {
+        let who = user.map_or("the system installation".to_owned(), |u| {
+            format!("{u}'s installation")
+        });
+        println!("updating Flatpaks in {who}");
+        let status = flatpak(user, "3600")
+            .args(["update", "--noninteractive", "--assumeyes"])
+            .status()
+            .with_context(|| format!("running flatpak for {who}"))?;
+        anyhow::ensure!(
+            status.success(),
+            "flatpak update failed for {who} ({status})"
+        );
+        Ok(())
+    };
+    let mut failed = Vec::new();
+    if let Err(e) = run(None) {
+        eprintln!("{e:#}");
+        failed.push(e.to_string());
+    }
+    for user in flatpak_users().unwrap_or_default() {
+        if let Err(e) = run(Some(&user)) {
+            eprintln!("{e:#}");
+            failed.push(e.to_string());
+        }
+    }
+    anyhow::ensure!(failed.is_empty(), "{}", failed.join("; "));
+    Ok(())
+}
+
+fn collect_flatpak_updates() -> Option<Vec<String>> {
+    let query = |user: Option<&str>| -> Option<Vec<String>> {
+        let out = flatpak(user, "30")
+            .args(["remote-ls", "--updates", "--columns=ref"])
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|out| out.status.success())?;
+        Some(parse_flatpak_updates(&String::from_utf8_lossy(&out.stdout)))
+    };
+    let mut updates = query(None)?;
+    // The root service must query user installations as their owner.
+    for user in flatpak_users()? {
+        updates.extend(
+            query(Some(&user))?
+                .into_iter()
+                .map(|reference| format!("{user}: {reference}")),
+        );
+    }
+    Some(updates)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn flatpak_refs_are_sorted_and_deduplicated() {
+        assert_eq!(
+            super::parse_flatpak_updates("app/b/x/stable\n\napp/a/x/stable\napp/b/x/stable\n"),
+            vec!["app/a/x/stable", "app/b/x/stable"]
+        );
+    }
+
     #[test]
     fn revisions_come_from_the_version_json() {
         use super::parse_revision;
