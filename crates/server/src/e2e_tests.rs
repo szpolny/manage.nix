@@ -1351,6 +1351,12 @@ async fn the_web_ui_is_served_with_a_fallback_to_index() {
         .header("cache-control")
         .unwrap()
         .contains("immutable"));
+    for path in ["/_app/immutable/missing.js", "/_app/missing.css"] {
+        let response = server.raw("GET", path, &[], None).await;
+        assert_eq!(response.status, 404, "{path}");
+        assert_ne!(response.body, "<!doctype html>app", "{path}");
+        assert_eq!(response.header("cache-control"), Some("no-cache"));
+    }
     let response = server.raw("GET", "/api/nothing-here", &[], None).await;
     assert_eq!(response.status, 404);
     assert!(response.json()["error"].is_string());
