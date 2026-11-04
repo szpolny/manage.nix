@@ -35,6 +35,7 @@ concurrency:
 jobs:
   changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       tests: ${{ steps.select.outputs.tests }}
       has-tests: ${{ steps.select.outputs.has-tests }}
@@ -52,6 +53,7 @@ jobs:
 
   quick:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - uses: cachix/install-nix-action@v31
@@ -72,6 +74,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.has-tests == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
