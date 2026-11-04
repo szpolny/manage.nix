@@ -708,6 +708,21 @@ async fn a_rollback_reaches_the_agent_and_is_confirmed() {
         })
     };
     ws.send(status(ActivationPhase::Accepted)).await.unwrap();
+    // Sending on this socket does not mean the server has persisted the
+    // acknowledgement yet. Reconnect only once it has, otherwise resending
+    // the still-unacknowledged activation is valid.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if server.deployment(&deployment.id).await.machines[0].phase
+                == Some(ActivationPhase::Accepted)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("server did not record the activation acknowledgement");
     let mut ws = server.session(&credential, "web-1").await;
     ws.send(text(&AgentMessage::Heartbeat)).await.unwrap();
     assert!(receive_within(&mut ws, Duration::from_millis(500))
