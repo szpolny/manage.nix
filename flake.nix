@@ -1,6 +1,16 @@
 {
   description = "manage.nix: a control plane for fleets of Nix-managed machines";
 
+  # CI publishes the packages here (see docs/installation.md). Applies to
+  # `nix build` and `nix run` on this flake; machines that import the modules
+  # add the cache to `nix.settings` themselves.
+  nixConfig = {
+    extra-substituters = [ "https://manage-nix.cachix.org" ];
+    extra-trusted-public-keys = [
+      "manage-nix.cachix.org-1:fQDsGQA9QFK9OphLdfUDAkqj3emN+KkeaA0ajFnXtuM="
+    ];
+  };
+
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     crane.url = "github:ipetkov/crane";

@@ -5,6 +5,13 @@
 #   runner). Pushes and pull requests run the ones that cover the most; the
 #   weekly run (or a manual one) runs them all.
 #
+# Both jobs use the Cachix cache named by the CACHIX_NAME repository
+# variable. They pull from it always and push everything they build on
+# pushes to main (which include every commit release-please tags), so users
+# of a release substitute its packages instead of compiling them. Pushing
+# needs the CACHIX_AUTH_TOKEN secret; pull requests never push. Without
+# CACHIX_NAME the cache steps are skipped.
+#
 # GitHub's ubuntu-latest runners expose /dev/kvm, but only to the runner user
 # after a udev rule grants access; without KVM the VM tests fall back to
 # emulation and are too slow to be useful.
@@ -26,6 +33,12 @@ jobs:
       - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: experimental-features = nix-command flakes
+      - if: ${{ vars.CACHIX_NAME != '' }}
+        uses: cachix/cachix-action@v16
+        with:
+          name: ${{ vars.CACHIX_NAME }}
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          skipPush: ${{ github.event_name != 'push' }}
       - run: |
           nix build -L --no-link \
             .#checks.x86_64-linux.{versions,cargo-fmt,cargo-clippy,cargo-test,store-postgres} \
@@ -52,6 +65,12 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
             system-features = nixos-test benchmark big-parallel kvm
+      - if: ${{ vars.CACHIX_NAME != '' }}
+        uses: cachix/cachix-action@v16
+        with:
+          name: ${{ vars.CACHIX_NAME }}
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          skipPush: ${{ github.event_name != 'push' }}
       - name: Check KVM
         run: test -w /dev/kvm || { echo "::error::/dev/kvm is not available to this job"; exit 1; }
       - run: nix build -L --no-link .#checks.x86_64-linux.${{ matrix.test }}

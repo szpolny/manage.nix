@@ -38,6 +38,29 @@ occasional breakage.
 While manage.nix is in alpha, keep the server and the agents on the same
 version.
 
+### Prebuilt binaries
+
+The manage.nix packages are built by CI and published to a public Cachix
+cache, currently for `x86_64-linux` only. Add it to every machine that runs
+the server or the agent so they download the packages instead of compiling
+them:
+
+```nix
+nix.settings = {
+  extra-substituters = [ "https://manage-nix.cachix.org" ];
+  extra-trusted-public-keys = [
+    "manage-nix.cachix.org-1:fQDsGQA9QFK9OphLdfUDAkqj3emN+KkeaA0ajFnXtuM="
+  ];
+};
+```
+
+The cache only matches the packages built against manage.nix's own pinned
+nixpkgs. Setting `inputs.manage-nix.inputs.nixpkgs.follows` changes every
+package, so Nix builds them from source instead.
+
+This cache serves manage.nix itself. The cache for your own systems is a
+separate step (see [Set up a cache](#3-set-up-a-cache)).
+
 ## 2. Set up the server
 
 ```nix
