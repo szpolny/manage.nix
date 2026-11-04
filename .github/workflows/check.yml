@@ -2,8 +2,8 @@
 #
 # - `quick`: tests, lints, the versions check, and the packages.
 # - `vm`: NixOS VM tests, one per runner (several at once starve a hosted
-#   runner). Pushes and pull requests run the ones that cover the most; the
-#   weekly run (or a manual one) runs them all.
+#   runner). Pushes and pull requests select tests by changed paths; the
+#   weekly run (or a manual one) runs them all. See docs/development.md.
 #
 # Both jobs use the Cachix cache named by the CACHIX_NAME repository
 # variable. They pull from it always and push everything they build on
@@ -25,7 +25,31 @@ on:
     - cron: "0 4 * * 1"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      tests: ${{ steps.select.outputs.tests }}
+      has-tests: ${{ steps.select.outputs.has-tests }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: select
+        name: Select VM tests
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 .github/scripts/select-vm-tests.py
+
   quick:
     runs-on: ubuntu-latest
     steps:
@@ -45,13 +69,13 @@ jobs:
             .#checks.x86_64-linux.{mnix,mnix-agent,mnix-server,mnix-web}
 
   vm:
+    needs: changes
+    if: needs.changes.outputs.has-tests == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        test: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-          && '["vm-hello","vm-activate","vm-enroll-sqlite","vm-enroll-postgres","vm-deploy-sqlite","vm-deploy-postgres","vm-web","vm-fleet"]'
-          || '["vm-activate","vm-deploy-sqlite","vm-web","vm-fleet"]') }}
+        test: ${{ fromJSON(needs.changes.outputs.tests) }}
     steps:
       - uses: actions/checkout@v5
       - name: Enable KVM

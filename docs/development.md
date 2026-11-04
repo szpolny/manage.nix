@@ -57,6 +57,24 @@ sets this up for you.
 
 ## VM tests
 
+On every pull request and push to main, CI runs formatting, Clippy, Rust and
+Postgres tests, version consistency, and all package builds (including the
+web type check). VM tests are selected from the changed paths:
+
+- Documentation changes skip VMs; web changes run `vm-web`.
+- Changes to individual VM tests run those scenarios, including both database
+  backends where applicable. Shared deployment fixtures run deployment, web,
+  and fleet scenarios.
+- Shared code, modules, flake inputs, CI configuration, and unrecognized paths
+  run all four core scenarios: activation, SQLite deployment, web, and fleet.
+- Weekly and manual runs execute all eight VM scenarios.
+
+New commits cancel older runs on the same pull request. Main branch runs finish
+so they can populate Cachix. Configure the repository variable `CACHIX_NAME`
+(`manage-nix`) and secret `CACHIX_AUTH_TOKEN` to enable cache reads in all jobs
+and uploads on pushes to main. Each runner has its own Nix store; Cachix lets
+later runs reuse outputs published by previous main branch runs.
+
 `checks.*.vm-*` are NixOS VM tests. `vm-web` drives the UI with Playwright
 (`nix/tests/web/e2e.py`).
 
