@@ -69,9 +69,9 @@ web type check). VM tests are selected from the changed paths:
   run all five core scenarios: activation, SQLite deployment, web, fleet, and local HTTPS.
 - Weekly and manual runs execute all nine VM scenarios.
 
-New commits cancel older runs on the same pull request. Main branch runs finish
-so they can populate Cachix. Build and VM jobs time out after 20 minutes so a
-stuck run cannot hold the main branch queue for hours. Configure the repository
+New commits cancel older runs on the same pull request. Main branch runs execute
+independently so an older run cannot block newer commits, and finish so they can
+populate Cachix. Build and VM jobs time out after 20 minutes. Configure the repository
 variable `CACHIX_NAME`
 (`manage-nix`) and secret `CACHIX_AUTH_TOKEN` to enable cache reads in all jobs
 and uploads on pushes to main. Each runner has its own Nix store; Cachix lets
