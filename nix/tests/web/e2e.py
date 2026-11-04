@@ -88,9 +88,10 @@ def deploy(page: Page, machine: str, rev: str) -> None:
 def verify(page: Page, machine: str, rev: str) -> None:
     # The machines list shows the revision the machine runs.
     row = page.locator(f"tr[data-machine='{machine}']")
-    # A newer commit on the tracked ref adds "N behind <ref>" after it.
-    expect(row.get_by_test_id("revision")).to_have_text(
-        re.compile(rf"^{rev} @ [0-9a-f]{{8}}( \d+ behind \S+)?$")
+    # The revision cell also contains ref, nixpkgs, and Flatpak update badges.
+    # Verify the deployed revision independently of those changing statuses.
+    expect(row.get_by_test_id("revision")).to_contain_text(
+        re.compile(rf"^{re.escape(rev)} @ [0-9a-f]{{8}}(?:\s|$)")
     )
     expect(row.locator("[data-status]").first).to_have_attribute("data-status", "online")
 
