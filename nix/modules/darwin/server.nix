@@ -60,6 +60,28 @@ in
     ]
     ++ lib.optional (cfg.cliPackage != null) cfg.cliPackage;
 
+    networking.hosts = lib.mkIf cfg.localHTTPS.enable {
+      "127.0.0.1" = [ "manage.nix" ];
+    };
+
+    launchd.daemons.mnix-https = lib.mkIf cfg.localHTTPS.enable {
+      serviceConfig = {
+        ProgramArguments = [
+          "${lib.getExe pkgs.caddy}"
+          "run"
+          "--config"
+          "${common.localHTTPSConfig}"
+          "--adapter"
+          "caddyfile"
+        ];
+        RunAtLoad = true;
+        KeepAlive = true;
+        ThrottleInterval = 5;
+        StandardOutPath = "/var/lib/manage-nix-https/proxy.log";
+        StandardErrorPath = "/var/lib/manage-nix-https/proxy.log";
+      };
+    };
+
     users.knownUsers = [ user ];
     users.knownGroups = [ user ];
     users.users.${user} = {
@@ -77,6 +99,7 @@ in
     };
 
     system.activationScripts.postActivation.text = lib.mkAfter ''
+      ${lib.optionalString cfg.localHTTPS.enable "install -d -m 0700 /var/lib/manage-nix-https"}
       mkdir -p ${stateDir}
       chown ${user}:${user} ${stateDir}
       chmod 0750 ${stateDir}

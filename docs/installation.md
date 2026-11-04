@@ -72,7 +72,9 @@ separate step (see [Set up a cache](#3-set-up-a-cache)).
 }
 ```
 
-This runs the server on `127.0.0.1:8080` with an SQLite database in
+Open **https://manage.nix** on the machine running the server. The module
+adds a loopback hosts entry and an HTTPS proxy on `127.0.0.1:443`. The
+backend runs on `127.0.0.1:8080` with an SQLite database in
 `/var/lib/manage-nix`. On first start it generates:
 
 | File | What it is |
@@ -80,6 +82,33 @@ This runs the server on `127.0.0.1:8080` with an SQLite database in
 | `/var/lib/manage-nix/admin-token` | Token for the `mnix` CLI |
 | `/var/lib/manage-nix/initial-admin-password` | Password of the web UI user `admin` |
 | `/var/lib/manage-nix/signing-key` | Key the server signs built systems with |
+
+### Trust local HTTPS
+
+The proxy generates a private local certificate authority and renews its
+certificates automatically. Its keys stay outside the Nix store in
+`/var/lib/manage-nix-https`. On macOS, the proxy installs the root in the
+system keychain on first start.
+
+On NixOS, installation automatically adds the public root to the system CA
+bundle and p11-kit trust source after the proxy starts. Existing configured
+CAs are preserved. No certificate copy or second rebuild is needed. The
+runtime trust bundle is refreshed on activation and proxy restart.
+
+Browsers using system trust need no manual certificate import. Restart an
+already open browser if it cached the old trust store. Browsers configured
+with a separate certificate store may still need the root imported there.
+
+This address opens the server on the same machine; it does not expose the
+proxy to your network. The proxy needs loopback port 443 available.
+
+### Use your own HTTPS proxy
+
+Disable the bundled local proxy if you already serve HTTPS:
+
+```nix
+services.manage-nix.server.localHTTPS.enable = false;
+```
 
 ### Put it behind HTTPS
 
@@ -111,7 +140,7 @@ networking.firewall.allowedTCPPorts = [ 80 443 ];
 
 ### Log in
 
-Open `https://mnix.example.com`, log in as `admin` with the password from
+Open `https://manage.nix` (or your configured hostname), log in as `admin` with the password from
 `initial-admin-password`, and change it on the account page.
 
 ## 3. Set up a cache

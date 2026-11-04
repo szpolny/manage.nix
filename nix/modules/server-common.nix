@@ -18,7 +18,8 @@ let
   localPostgresUrl = "postgres://manage-nix@localhost/manage-nix?host=/run/postgresql";
   adminTokenFile =
     if cfg.adminTokenFile == null then "${stateDir}/admin-token" else cfg.adminTokenFile;
-  address = a: if lib.hasInfix ":" a then "[${a}]:${toString cfg.port}" else "${a}:${toString cfg.port}";
+  address =
+    a: if lib.hasInfix ":" a then "[${a}]:${toString cfg.port}" else "${a}:${toString cfg.port}";
 
   provisionFile = (pkgs.formats.json { }).generate "mnix-provision.json" {
     repositories = lib.mapAttrs (_: r: {
@@ -33,6 +34,33 @@ let
 in
 {
   inherit stateDir adminTokenFile;
+
+  localHTTPSConfig = pkgs.writeText "manage-nix-Caddyfile" ''
+    {
+      admin off
+      auto_https disable_redirects
+      ${lib.optionalString (!isDarwin) "skip_install_trust"}
+      storage file_system {
+        root /var/lib/manage-nix-https
+      }
+    }
+    https://manage.nix {
+      bind 127.0.0.1
+      tls internal
+      reverse_proxy ${
+        if cfg.listenAddress == "0.0.0.0" then
+          "127.0.0.1"
+        else if cfg.listenAddress == "::" then
+          "[::1]"
+        else if lib.hasInfix ":" cfg.listenAddress then
+          "[${cfg.listenAddress}]"
+        else
+          cfg.listenAddress
+      }:${toString cfg.port} {
+        flush_interval -1
+      }
+    }
+  '';
 
   options.services.manage-nix.server = {
     enable = lib.mkEnableOption "the manage.nix control plane";
@@ -56,6 +84,17 @@ in
       default = packages.mnix-web;
       defaultText = lib.literalExpression "manage-nix.packages.\${system}.mnix-web";
       description = "The web UI to serve at `/`, or null for the API only.";
+    };
+
+    localHTTPS.enable = mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        Serve https://manage.nix on loopback using a local certificate
+        authority. Adds manage.nix to the hosts file and runs a TLS proxy
+        on port 443, and trusts its public root certificate automatically.
+        Disable when using your own proxy.
+      '';
     };
 
     secureCookies = mkOption {
@@ -350,58 +389,57 @@ in
 
   # The server's command line, without the database URL (in the
   # environment).
-  args =
-    [
-      (lib.getExe cfg.package)
-      "serve"
-      "--listen"
-      (lib.concatMapStringsSep "," address ([ cfg.listenAddress ] ++ cfg.extraListenAddresses))
-      "--admin-token-file"
-      adminTokenFile
-      "--heartbeat-interval"
-      "${toString cfg.heartbeatInterval}s"
-      "--heartbeat-timeout"
-      "${toString cfg.heartbeatTimeout}s"
-      "--enrollment-token-ttl"
-      cfg.enrollmentTokenTtl
-      "--state-dir"
-      stateDir
-      "--signing-key-file"
-      signingKeyFile
-      "--confirm-timeout"
-      "${toString cfg.confirmTimeout}s"
-      "--activation-timeout"
-      cfg.activationTimeout
-      "--build-timeout"
-      cfg.buildTimeout
-      "--session-lifetime"
-      cfg.sessionLifetime
-      "--build-on"
-      cfg.buildOn
-    ]
-    ++ lib.optionals (cfg.webPackage != null) [
-      "--web-dir"
-      "${cfg.webPackage}"
-    ]
-    ++ lib.optional (!cfg.secureCookies) "--insecure-cookies"
-    ++ lib.optionals (cfg.initialAdminPasswordFile != null) [
-      "--initial-admin-password-file"
-      cfg.initialAdminPasswordFile
-    ]
-    ++ lib.optional (cfg.adminTokenFile == null) "--create-admin-token"
-    ++ lib.optional (cfg.signingKeyFile == null) "--create-signing-key"
-    ++ lib.optionals (cfg.repositories != { } || cfg.machines != { }) [
-      "--provision"
-      "${provisionFile}"
-    ]
-    ++ lib.optionals (cfg.attic.endpoint != null) [
-      "--attic-endpoint"
-      cfg.attic.endpoint
-      "--attic-cache"
-      cfg.attic.cache
-      "--attic-token-file"
-      cfg.attic.tokenFile
-    ];
+  args = [
+    (lib.getExe cfg.package)
+    "serve"
+    "--listen"
+    (lib.concatMapStringsSep "," address ([ cfg.listenAddress ] ++ cfg.extraListenAddresses))
+    "--admin-token-file"
+    adminTokenFile
+    "--heartbeat-interval"
+    "${toString cfg.heartbeatInterval}s"
+    "--heartbeat-timeout"
+    "${toString cfg.heartbeatTimeout}s"
+    "--enrollment-token-ttl"
+    cfg.enrollmentTokenTtl
+    "--state-dir"
+    stateDir
+    "--signing-key-file"
+    signingKeyFile
+    "--confirm-timeout"
+    "${toString cfg.confirmTimeout}s"
+    "--activation-timeout"
+    cfg.activationTimeout
+    "--build-timeout"
+    cfg.buildTimeout
+    "--session-lifetime"
+    cfg.sessionLifetime
+    "--build-on"
+    cfg.buildOn
+  ]
+  ++ lib.optionals (cfg.webPackage != null) [
+    "--web-dir"
+    "${cfg.webPackage}"
+  ]
+  ++ lib.optional (!cfg.secureCookies) "--insecure-cookies"
+  ++ lib.optionals (cfg.initialAdminPasswordFile != null) [
+    "--initial-admin-password-file"
+    cfg.initialAdminPasswordFile
+  ]
+  ++ lib.optional (cfg.adminTokenFile == null) "--create-admin-token"
+  ++ lib.optional (cfg.signingKeyFile == null) "--create-signing-key"
+  ++ lib.optionals (cfg.repositories != { } || cfg.machines != { }) [
+    "--provision"
+    "${provisionFile}"
+  ]
+  ++ lib.optionals (cfg.attic.endpoint != null) [
+    "--attic-endpoint"
+    cfg.attic.endpoint
+    "--attic-cache"
+    cfg.attic.cache
+    "--attic-token-file"
+    cfg.attic.tokenFile
+  ];
 
   assertions = [
     {
@@ -413,9 +451,9 @@ in
       message = "services.manage-nix.server.attic.tokenFile must be set with attic.endpoint.";
     }
     {
-      assertion = lib.all (
-        m: m.repository == null || cfg.repositories ? ${m.repository}
-      ) (lib.attrValues cfg.machines);
+      assertion = lib.all (m: m.repository == null || cfg.repositories ? ${m.repository}) (
+        lib.attrValues cfg.machines
+      );
       message = "services.manage-nix.server.machines.*.repository must name one of services.manage-nix.server.repositories.";
     }
   ];

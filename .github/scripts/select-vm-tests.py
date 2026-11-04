@@ -4,7 +4,7 @@ import json
 import os
 import subprocess
 
-CORE = {"vm-activate", "vm-deploy-sqlite", "vm-web", "vm-fleet"}
+CORE = {"vm-activate", "vm-deploy-sqlite", "vm-web", "vm-fleet", "vm-local-https"}
 ALL = CORE | {
     "vm-hello", "vm-enroll-sqlite", "vm-enroll-postgres", "vm-deploy-postgres"
 }
@@ -15,6 +15,8 @@ def select(paths):
     for path in paths:
         if path.startswith("web/") or path.startswith("nix/tests/web/"):
             tests.add("vm-web")
+        elif path == "nix/tests/local-https.nix":
+            tests.add("vm-local-https")
         elif path == "nix/tests/hello.nix":
             tests.add("vm-hello")
         elif path == "nix/tests/activate.nix":

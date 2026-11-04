@@ -226,6 +226,7 @@
         # NixOS VM tests run on Linux with KVM, or on Apple Silicon macOS with
         # the guests on aarch64-linux (needs the `apple-virt` system feature).
         // lib.optionalAttrs (pkgs.stdenv.hostPlatform.isLinux || system == "aarch64-darwin") {
+          vm-local-https = import ./nix/tests/local-https.nix { inherit self pkgs; };
           vm-hello = import ./nix/tests/hello.nix { inherit self pkgs; };
           vm-activate = import ./nix/tests/activate.nix { inherit self pkgs; };
           vm-enroll-sqlite = import ./nix/tests/enroll.nix {

@@ -66,8 +66,8 @@ web type check). VM tests are selected from the changed paths:
   backends where applicable. Shared deployment fixtures run deployment, web,
   and fleet scenarios.
 - Shared code, modules, flake inputs, CI configuration, and unrecognized paths
-  run all four core scenarios: activation, SQLite deployment, web, and fleet.
-- Weekly and manual runs execute all eight VM scenarios.
+  run all five core scenarios: activation, SQLite deployment, web, fleet, and local HTTPS.
+- Weekly and manual runs execute all nine VM scenarios.
 
 New commits cancel older runs on the same pull request. Main branch runs finish
 so they can populate Cachix. Configure the repository variable `CACHIX_NAME`
