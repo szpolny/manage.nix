@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.1-alpha](https://github.com/szpolny/manage.nix/compare/v0.3.0-alpha...v0.3.1-alpha) (2026-11-04)
+
+
+### Features
+
+* show and apply nixpkgs and Flatpak updates ([5c8e1b8](https://github.com/szpolny/manage.nix/commit/5c8e1b8b78aad04960c5bffc84c1c72eae7e5fe1))
+* **web:** redesign the dashboard ([cee4bc9](https://github.com/szpolny/manage.nix/commit/cee4bc9e839fc09d8feba346b5bf76afe7ba0ce3))
+
+
+### Bug Fixes
+
+* **server:** return uncached 404s for missing web assets ([2e458b0](https://github.com/szpolny/manage.nix/commit/2e458b0915a7a9f89215245fd9e5f530b7b8d884))
+
 ## [0.3.0-alpha](https://github.com/szpolny/manage.nix/compare/v0.2.0...v0.3.0-alpha) (2026-10-28)
 
 
