@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.2-alpha](https://github.com/szpolny/manage.nix/compare/v0.3.1-alpha...v0.3.2-alpha) (2026-11-04)
+
+
+### Features
+
+* **server:** serve trusted local HTTPS at manage.nix ([7c8a5b2](https://github.com/szpolny/manage.nix/commit/7c8a5b2263eca26b62150c6aed7b39d457a7ed13))
+
 ## [0.3.1-alpha](https://github.com/szpolny/manage.nix/compare/v0.3.0-alpha...v0.3.1-alpha) (2026-11-04)
 
 
