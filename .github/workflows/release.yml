@@ -1,6 +1,9 @@
 # Releases with release-please: every push to main updates a release PR
 # from the Conventional Commits since the last release. Merging it tags
-# `vX.Y.Z-alpha.N` and publishes it as a GitHub pre-release.
+# `vX.Y.Z-alpha` and publishes it as a GitHub pre-release. Fixes and
+# features bump the patch version and breaking changes the minor one; the
+# `-alpha` suffix carries over from the current version. A `Release-As:`
+# footer overrides that (`Release-As: 1.0.0` drops the suffix).
 #
 # release-please bumps the version in Cargo.toml, web/package.json, and
 # web/package-lock.json (release-please-config.json); this workflow then
