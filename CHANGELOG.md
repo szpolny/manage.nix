@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.2-alpha](https://github.com/szpolny/manage.nix/compare/v0.4.1-alpha...v0.4.2-alpha) (2026-11-05)
+
+
+### Bug Fixes
+
+* **build:** place command tests after production items ([faba851](https://github.com/szpolny/manage.nix/commit/faba8517c168ea8e1e820b3d213ab70424357045))
+* **nixos:** isolate agent state and migrate existing installations ([00a1a69](https://github.com/szpolny/manage.nix/commit/00a1a69640408d4a2061f998f55222eb7eaa7f24))
+* **nixos:** preserve server state permissions on agent restart ([0777104](https://github.com/szpolny/manage.nix/commit/0777104fa0620349e14bbcd640eadc964bd0b460))
+* **server:** preserve command failure diagnostics ([619e330](https://github.com/szpolny/manage.nix/commit/619e330cd929d6f9d692cf59dac065b40acfb68f))
+* **updates:** refresh all flake inputs and hide unavailable Flatpak controls ([6983ca9](https://github.com/szpolny/manage.nix/commit/6983ca9f7df60e2169dcff2bce2249dfc13d8f58))
+
 ## [0.4.1-alpha](https://github.com/szpolny/manage.nix/compare/v0.4.0-alpha...v0.4.1-alpha) (2026-11-05)
 
 
