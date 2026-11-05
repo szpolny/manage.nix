@@ -84,8 +84,6 @@ in
             "--adapter"
             "caddyfile"
           ];
-          # Caddy's trust installer invokes the macOS security tool.
-          EnvironmentVariables.PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
           RunAtLoad = true;
           KeepAlive = true;
           ThrottleInterval = 5;
@@ -115,6 +113,11 @@ in
         mkdir -p ${stateDir}
         chown ${user}:${user} ${stateDir}
         chmod 0750 ${stateDir}
+        ${lib.optionalString cfg.localHTTPS.enable ''
+          # Install and verify trust from activation, not the background daemon.
+          ${pkgs.runtimeShell} ${./local-https-trust.sh} /usr/bin/security \
+            /var/lib/manage-nix-https/pki/authorities/local/root.crt || exit 1
+        ''}
       '';
 
       launchd.daemons.mnix-server.serviceConfig = {

@@ -45,7 +45,10 @@ builtins.deepSeq
     assert enabled.services.manage-nix.server.secureCookies;
     assert !(disabled.launchd.daemons ? mnix-https);
     assert !(serverDisabled.launchd.daemons ? mnix-https);
-    assert proxy.EnvironmentVariables.PATH == "/usr/bin:/bin:/usr/sbin:/sbin";
+    assert lib.hasInfix "local-https-trust.sh" enabled.system.activationScripts.postActivation.text;
+    assert !(lib.hasInfix "local-https-trust.sh" disabled.system.activationScripts.postActivation.text);
+    assert
+      !(lib.hasInfix "local-https-trust.sh" serverDisabled.system.activationScripts.postActivation.text);
     pkgs.runCommand "manage-nix-darwin-local-https"
       {
         nativeBuildInputs = [
@@ -57,7 +60,7 @@ builtins.deepSeq
         # Parsing only: this does not start a listener or modify any trust store.
         caddy adapt --config ${localHTTPSConfig} --adapter caddyfile > proxy.json
         jq -e '.apps.http.servers[].listen == ["127.0.0.1:443"]' proxy.json
-        jq -e '.apps.pki.certificate_authorities.local.install_trust != false' proxy.json
+        jq -e '.apps.pki.certificate_authorities.local.install_trust == false' proxy.json
 
         printf '%s\n' '127.0.0.1 localhost' '192.0.2.1 example.test # keep me' > original
         cp original hosts
@@ -78,6 +81,42 @@ builtins.deepSeq
         ${pkgs.runtimeShell} ${../modules/darwin/local-https-hosts.sh} hosts true
         ${pkgs.runtimeShell} ${../modules/darwin/local-https-hosts.sh} hosts false
         cmp hosts original
+        # Simulate a certificate present in the Keychain but lacking trust.
+        # The installer must repair admin SSL trust, and fail on any rejection.
+        export trust_state="$PWD/trusted"
+        export trust_calls="$PWD/trust-calls"
+        cat > security <<'SECURITY'
+        #!${pkgs.runtimeShell}
+        set -eu
+        case "$1" in
+          verify-cert)
+            test -f "$trust_state" && test -z "''${reject_verify:-}"
+            ;;
+          add-trusted-cert)
+            printf '%s\n' "$*" >> "$trust_calls"
+            test -z "''${reject_install:-}"
+            touch "$trust_state"
+            ;;
+          *) exit 2 ;;
+        esac
+        SECURITY
+        chmod +x security
+        echo 'public test certificate' > root.crt
+        ${pkgs.runtimeShell} ${../modules/darwin/local-https-trust.sh} "$PWD/security" root.crt
+        grep -Fx 'add-trusted-cert -d -r trustRoot -p ssl -k /Library/Keychains/System.keychain root.crt' "$trust_calls"
+        cp "$trust_calls" calls-once
+        ${pkgs.runtimeShell} ${../modules/darwin/local-https-trust.sh} "$PWD/security" root.crt
+        cmp "$trust_calls" calls-once
+        rm "$trust_state"
+        if reject_install=1 ${pkgs.runtimeShell} ${../modules/darwin/local-https-trust.sh} "$PWD/security" root.crt; then
+          echo 'Trust installation rejection was ignored' >&2; exit 1
+        fi
+        if reject_verify=1 ${pkgs.runtimeShell} ${../modules/darwin/local-https-trust.sh} "$PWD/security" root.crt; then
+          echo 'Trust verification rejection was ignored' >&2; exit 1
+        fi
+        if ${pkgs.runtimeShell} ${../modules/darwin/local-https-trust.sh} "$PWD/security" missing.crt 0; then
+          echo 'Missing CA root was ignored' >&2; exit 1
+        fi
         touch $out
       ''
   )

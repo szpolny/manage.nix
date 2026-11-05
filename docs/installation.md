@@ -87,8 +87,11 @@ backend runs on `127.0.0.1:8080` with an SQLite database in
 
 The proxy generates a private local certificate authority and renews its
 certificates automatically. Its keys stay outside the Nix store in
-`/var/lib/manage-nix-https`. On macOS, the proxy installs the root in the
-system keychain on first start. Activation maintains a marked entry in
+`/var/lib/manage-nix-https`. On macOS, privileged activation waits for the
+proxy's root, installs SSL trust in the System Keychain's admin trust store,
+and verifies that macOS trusts it. Trust failures stop activation with an
+error instead of leaving a silently untrusted dashboard. Activation also
+maintains a marked entry in
 `/etc/hosts`, preserving other entries. Disabling local HTTPS or the server
 removes that managed entry.
 

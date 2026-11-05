@@ -39,7 +39,7 @@ in
     {
       admin off
       auto_https disable_redirects
-      ${lib.optionalString (!isDarwin) "skip_install_trust"}
+      skip_install_trust
       storage file_system {
         root /var/lib/manage-nix-https
       }
