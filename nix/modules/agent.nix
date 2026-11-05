@@ -26,7 +26,12 @@ self:
 let
   cfg = config.services.manage-nix.agent;
   common = import ./agent-common.nix {
-    inherit self config lib pkgs;
+    inherit
+      self
+      config
+      lib
+      pkgs
+      ;
     isDarwin = false;
   };
 in
@@ -51,11 +56,17 @@ in
           pkgs.git
           pkgs.util-linux
           pkgs.coreutils
-        ] ++ lib.optional config.services.flatpak.enable pkgs.flatpak;
+        ]
+        ++ lib.optional config.services.flatpak.enable pkgs.flatpak;
         serviceConfig = {
           ExecStart = "${lib.getExe cfg.package} run";
           # Root: activating systems needs it.
-          StateDirectory = "manage-nix";
+          # The server owns the shared parent when co-located. Having
+          # systemd also manage it for this root service resets its owner
+          # and mode on agent restarts, locking the server out of SQLite.
+          StateDirectory = lib.mkIf (
+            !(lib.attrByPath [ "services" "manage-nix" "server" "enable" ] false config)
+          ) "manage-nix";
           StateDirectoryMode = "0700";
           Restart = "always";
           RestartSec = 5;

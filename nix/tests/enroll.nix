@@ -61,7 +61,16 @@ pkgs.testers.runNixOSTest {
     server =
       { pkgs, ... }:
       {
-        imports = [ self.nixosModules.server ];
+        imports = [
+          self.nixosModules.server
+          self.nixosModules.agent
+        ];
+        # Exercise a co-located agent, even before it has an enrollment token.
+        services.manage-nix.agent = {
+          enable = true;
+          server.url = "https://server";
+          enrollmentTokenFile = tokenFile;
+        };
         services.manage-nix.server = {
           enable = true;
           database.createLocally = backend == "postgres";
@@ -120,6 +129,12 @@ pkgs.testers.runNixOSTest {
     server.wait_for_unit("nginx.service")
     server.wait_for_open_port(8080)
     server.wait_for_open_port(443)
+
+    with subtest("agent restarts preserve server state access"):
+        server.succeed("systemctl restart mnix-agent.service")
+        server.succeed("test $(stat -c %U:%a /var/lib/manage-nix) = manage-nix:750")
+        server.succeed("runuser -u manage-nix -- test -r /var/lib/manage-nix/admin-token")
+        mnix("machines --json")
 
     with subtest(f"the server uses {backend}"):
         server.wait_until_succeeds(
