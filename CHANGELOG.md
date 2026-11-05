@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.3-alpha](https://github.com/szpolny/manage.nix/compare/v0.3.2-alpha...v0.3.3-alpha) (2026-11-05)
+
+
+### Bug Fixes
+
+* **darwin:** restore local HTTPS dashboard ([b54f42a](https://github.com/szpolny/manage.nix/commit/b54f42a57d1d2a9bc1ad33c760e940327f98e064))
+
 ## [0.3.2-alpha](https://github.com/szpolny/manage.nix/compare/v0.3.1-alpha...v0.3.2-alpha) (2026-11-04)
 
 
