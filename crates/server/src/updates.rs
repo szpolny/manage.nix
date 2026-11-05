@@ -82,12 +82,15 @@ async fn subject(state: &AppState, machine: mnix_store::Machine) -> Result<Subje
     }
     let current_commit = match &revision {
         Some(r) => Some(r.commit_id.clone()),
-        // A clean `system.configurationRevision`: a full commit hash.
+        // `system.configurationRevision`: a full commit hash, with a
+        // `-dirty` suffix when built from a tree with uncommitted changes.
         None => machine
             .facts
             .as_ref()
-            .and_then(|f| f.configuration_revision.clone())
-            .filter(|c| is_commit(c)),
+            .and_then(|f| f.configuration_revision.as_deref())
+            .map(|c| c.strip_suffix("-dirty").unwrap_or(c))
+            .filter(|c| is_commit(c))
+            .map(str::to_owned),
     };
     Ok(Subject {
         deployed_rev: revision.and_then(|r| r.rev),
@@ -537,9 +540,12 @@ async fn nixpkgs_updates(state: &AppState, mirror: &Path, current: Option<&str>)
             .kill_on_drop(true);
         let out = tokio::time::timeout(Duration::from_secs(30), command.output())
             .await
+            .inspect_err(|_| tracing::warn!("checking {url} for a newer nixpkgs timed out"))
             .ok()?
+            .inspect_err(|e| tracing::warn!("running nix to check {url}: {e}"))
             .ok()?;
         if !out.status.success() {
+            tracing::warn!("checking {url} for a newer nixpkgs failed ({})", out.status);
             return None;
         }
         let metadata: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;

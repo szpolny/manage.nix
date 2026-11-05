@@ -261,16 +261,18 @@
 										? 'up to date'
 										: 'unknown'}{machine.auto_update.nixpkgs ? ' · auto' : ''}</a
 							>
-							<a
-								class="chip"
-								class:warn={Boolean(machine.facts?.flatpak_updates?.length)}
-								href="/machines/{encodeURIComponent(machine.name)}"
-								>Flatpak: {machine.facts?.flatpak_updates
-									? machine.facts.flatpak_updates.length
-										? `${machine.facts.flatpak_updates.length} update${machine.facts.flatpak_updates.length === 1 ? '' : 's'}`
-										: 'up to date'
-									: 'unknown'}{machine.auto_update.flatpak ? ' · auto' : ''}</a
-							>
+							{#if machine.facts?.os !== 'darwin'}
+								<a
+									class="chip"
+									class:warn={Boolean(machine.facts?.flatpak_updates?.length)}
+									href="/machines/{encodeURIComponent(machine.name)}"
+									>Flatpak: {machine.facts?.flatpak_updates
+										? machine.facts.flatpak_updates.length
+											? `${machine.facts.flatpak_updates.length} update${machine.facts.flatpak_updates.length === 1 ? '' : 's'}`
+											: 'up to date'
+										: 'unknown'}{machine.auto_update.flatpak ? ' · auto' : ''}</a
+								>
+							{/if}
 						</td>
 						<td>
 							{#if machine.last_deployment}
