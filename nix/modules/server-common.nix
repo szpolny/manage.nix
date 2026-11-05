@@ -214,8 +214,9 @@ in
               type = types.nullOr types.str;
               default = null;
               description = ''
-                SSH private key (a read-only deploy key) to fetch the
-                repository with, readable by the server. Host keys are
+                SSH private key to fetch the repository with, readable by
+                the server. The deploy key needs write access when updating
+                nixpkgs through manage.nix. Host keys are
                 trusted on first use and kept in
                 {file}`${stateDir}/known_hosts`.
               '';

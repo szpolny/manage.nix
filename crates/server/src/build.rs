@@ -595,12 +595,24 @@ async fn run(command: &mut Command, log: &mut Log) -> anyhow::Result<String> {
     });
     let mut lines = BufReader::new(child.stderr.take().expect("piped")).lines();
     let mut last = String::new();
+    let mut diagnostic = None;
     while let Some(line) = lines.next_line().await? {
         log.line(line.clone()).await;
+        // Git often ends with generic advice after the actual failure.
+        // Keep the first explicit diagnostic for the deployment summary.
+        let trimmed = line.trim_start();
+        if diagnostic.is_none()
+            && (trimmed.starts_with("ERROR:")
+                || trimmed.starts_with("error:")
+                || trimmed.starts_with("fatal:"))
+        {
+            diagnostic = Some(line.clone());
+        }
         last = line;
     }
     let status = child.wait().await?;
     let out = String::from_utf8_lossy(&stdout.await??).into_owned();
+    let last = diagnostic.unwrap_or(last);
     anyhow::ensure!(
         status.success(),
         "{program} failed ({status}){}",
@@ -611,6 +623,39 @@ async fn run(command: &mut Command, log: &mut Log) -> anyhow::Result<String> {
         }
     );
     Ok(out)
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failure_summary_preserves_git_diagnostic() {
+        let mut log = Log::discard();
+        let error = run(
+            Command::new("sh").args([
+                "-c",
+                "printf '%s\\n' 'ERROR: The key you are authenticating with has been marked as read only.' 'fatal: Could not read from remote repository.' '' 'Please make sure you have the correct access rights' 'and the repository exists.' >&2; exit 128",
+            ]),
+            &mut log,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("marked as read only"));
+        assert!(!error.to_string().contains("and the repository exists"));
+        assert!(log.buffer.contains("and the repository exists"));
+    }
+
+    #[tokio::test]
+    async fn failure_without_explicit_diagnostic_uses_last_line() {
+        let error = run(
+            Command::new("sh").args(["-c", "echo 'connection refused' >&2; exit 1"]),
+            &mut Log::discard(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("connection refused"));
+    }
 }
 
 /// Buffers output for a deployment's log and writes it in batches.

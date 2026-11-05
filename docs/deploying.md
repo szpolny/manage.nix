@@ -111,6 +111,14 @@ deployed. `--rev` must name a branch, and the repository's SSH key needs
 write access. In the web UI, use **Update nixpkgs…** on the machine's page,
 or tick **Update nixpkgs first** when deploying.
 
+If GitHub reports `The key you are authenticating with has been marked as
+read only`, the server can fetch the repository but cannot push the updated
+lock file. In the source repository's **Settings → Deploy keys**, register
+the server's public key with **Allow write access** enabled. An existing
+read-only key must be removed and added again with that permission. Keep
+the same key pair so the server's `sshKeyFile` remains valid, then retry
+the update. A failed push does not deploy the updated system.
+
 ### Update Flatpaks
 
 ```sh
