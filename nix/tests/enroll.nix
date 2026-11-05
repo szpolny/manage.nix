@@ -90,7 +90,10 @@ pkgs.testers.runNixOSTest {
           };
         };
         networking.firewall.allowedTCPPorts = [ 443 ];
-        environment.systemPackages = [ pkgs.jq ];
+        environment.systemPackages = [
+          pkgs.jq
+          pkgs.git
+        ];
       };
     machine1 = machine;
     machine2 = machine;
@@ -136,6 +139,36 @@ pkgs.testers.runNixOSTest {
         server.succeed("runuser -u manage-nix -- test -r /var/lib/manage-nix/admin-token")
         mnix("machines --json")
 
+    with subtest("co-located source migration survives server ownership repair"):
+        server.systemctl("stop mnix-agent.service")
+        server.succeed(
+            "rm -f /var/lib/manage-nix/sources",
+            "rmdir /var/lib/manage-nix-agent/sources",
+            "mkdir -p /var/lib/manage-nix/sources",
+            "git init --bare /var/lib/manage-nix/sources/default.git",
+            "chown -R manage-nix:manage-nix /var/lib/manage-nix/sources",
+        )
+        server.systemctl("start mnix-agent.service")
+        server.succeed(
+            "test $(stat -c %U:%a /var/lib/manage-nix-agent) = root:700",
+            "git -C /var/lib/manage-nix-agent/sources/default.git for-each-ref",
+            # Force systemd to repair the server's directory recursively.
+            "chown root:root /var/lib/manage-nix",
+        )
+        server.systemctl("restart mnix-server.service")
+        server.succeed(
+            "git -C /var/lib/manage-nix-agent/sources/default.git for-each-ref",
+            "test $(stat -c %U /var/lib/manage-nix-agent/sources/default.git) = root",
+        )
+        server.systemctl("restart mnix-agent.service")
+        server.succeed(
+            "git -C /var/lib/manage-nix-agent/sources/default.git for-each-ref",
+            "test $(stat -c %U /var/lib/manage-nix-agent/sources/default.git) = root",
+            "test $(stat -c %U /var/lib/manage-nix) = manage-nix",
+            "runuser -u manage-nix -- test -r /var/lib/manage-nix/admin-token",
+        )
+        mnix("machines --json")
+
     with subtest(f"the server uses {backend}"):
         server.wait_until_succeeds(
             f"journalctl -u mnix-server | grep -i '{backend} database'"
@@ -164,7 +197,7 @@ pkgs.testers.runNixOSTest {
             node.systemctl("restart mnix-agent.service")
         for node in [machine1, machine2]:
             wait_for_status(node.name, "online")
-            node.succeed("test $(stat -c %a /var/lib/manage-nix/servers/default/credential.json) = 600")
+            node.succeed("test $(stat -c %a /var/lib/manage-nix-agent/servers/default/credential.json) = 600")
 
     with subtest("online machines report correct facts"):
         listed = listed_machines()
@@ -180,6 +213,29 @@ pkgs.testers.runNixOSTest {
         assert "machine1" in table and "online" in table, table
         shown = json.loads(mnix(f"machine show {listed['machine1']['id']}"))
         assert shown["name"] == "machine1", shown
+
+    with subtest("existing enrollment and activation paths survive migration"):
+        node = machine1
+        node.systemctl("stop mnix-agent.service")
+        # Emulate the old layout, without retaining a usable enrollment token.
+        node.succeed(
+            "rm ${tokenFile}",
+            "mkdir -p /var/lib/manage-nix",
+            "cp /var/lib/manage-nix-agent/servers/default/credential.json /run/credential-before",
+            "touch /var/lib/manage-nix-agent/activations/migration-marker",
+            "mv /var/lib/manage-nix-agent/servers /var/lib/manage-nix/servers",
+            "mv /var/lib/manage-nix-agent/activations /var/lib/manage-nix/activations",
+            "chown -R nobody:nogroup /var/lib/manage-nix",
+        )
+        node.systemctl("start mnix-agent.service")
+        wait_for_status(node.name, "online")
+        node.succeed(
+            "cmp /run/credential-before /var/lib/manage-nix-agent/servers/default/credential.json",
+            "test -f /var/lib/manage-nix/activations/migration-marker",
+            "test $(stat -c %U:%a /var/lib/manage-nix-agent/servers/default/credential.json) = root:600",
+        )
+        node.systemctl("restart mnix-agent.service")
+        wait_for_status(node.name, "online")
 
     with subtest("a reused enrollment token is rejected"):
         assert enroll_status(machine1, tokens["machine1"]) == "401"

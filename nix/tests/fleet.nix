@@ -231,8 +231,8 @@ pkgs.testers.runNixOSTest {
               assert m["name"] == "machine" and m["tags"] == ["fleet"], m
               assert m["repository"] == "infra" and m["configuration"] == "machine", m
               assert m["facts"]["os"] == "nixos", m
-          machine.succeed("test -f /var/lib/manage-nix/servers/alpha/credential.json")
-          machine.succeed("test -f /var/lib/manage-nix/servers/beta/credential.json")
+          machine.succeed("test -f /var/lib/manage-nix-agent/servers/alpha/credential.json")
+          machine.succeed("test -f /var/lib/manage-nix-agent/servers/beta/credential.json")
           booted = running()
 
       with subtest("alpha deploys revision a, which the machine builds itself"):
@@ -246,7 +246,7 @@ pkgs.testers.runNixOSTest {
           assert "machine builds nixosConfigurations" in logs, logs
           assert "downloaded" in logs and "built /nix/store/" in logs, logs
           assert "the server confirmed the new system" in logs, logs
-          machine.succeed(f"git -C /var/lib/manage-nix/sources/alpha.git cat-file -e {commit}")
+          machine.succeed(f"git -C /var/lib/manage-nix-agent/sources/alpha.git cat-file -e {commit}")
           # beta sees the new system too.
           wait_for(beta, '.current_system == "${systemA}"')
 

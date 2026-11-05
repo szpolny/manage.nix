@@ -221,13 +221,28 @@ On the machine, save the token to a file outside the Nix store (for example
 ```
 
 Switch to this configuration once by hand. The agent enrolls, stores its
-credential in `/var/lib/manage-nix`, and shows up as online:
+credential in `/var/lib/manage-nix-agent` on NixOS (or `/var/lib/manage-nix`
+on macOS), and shows up as online:
 
 ```sh
 sudo mnix --token-file /var/lib/manage-nix/admin-token machines
 ```
 
 From now on, deploy this machine through manage.nix.
+
+### Agent state directory upgrades on NixOS
+
+The NixOS agent uses `/var/lib/manage-nix-agent`, owned by root. The server
+continues to use `/var/lib/manage-nix`, owned by `manage-nix`. Separate directories
+prevent service restarts from changing the ownership of the agent's Git sources.
+
+When upgrading an existing installation, the agent automatically moves its
+credentials, source repositories, and activation jobs from the old shared
+directory. Compatibility links preserve paths used by running activation jobs.
+Enrollment tokens do not need to be issued again. Server data stays in place.
+If both locations already contain the same state entry, startup stops with an
+error rather than overwriting either copy; reconcile those entries before
+restarting `mnix-agent`.
 
 ## Next steps
 

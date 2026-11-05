@@ -3,7 +3,7 @@
 # The `mnix-agent` service connects to every server in `servers`, enrolls
 # with each once (using its `enrollmentTokenFile`), and keeps a WebSocket to
 # each open. The credentials it receives are kept in
-# /var/lib/manage-nix/servers/<name>.
+# /var/lib/manage-nix-agent/servers/<name>.
 #
 # Systems a server deploys run in their own transient units
 # (`mnix-activation-<deployment>.service`), so an activation finishes, or
@@ -45,7 +45,15 @@ in
         description = "manage.nix agent";
         wantedBy = [ "multi-user.target" ];
         wants = [ "network-online.target" ];
-        after = [ "network-online.target" ];
+        after = [
+          "network-online.target"
+        ]
+        ++ lib.optional (lib.attrByPath [
+          "services"
+          "manage-nix"
+          "server"
+          "enable"
+        ] false config) "mnix-server.service";
         # The server list is read at start.
         restartTriggers = [ config.environment.etc."manage-nix/agent.json".source ];
         environment.RUST_LOG = lib.mkDefault "info";
@@ -58,15 +66,33 @@ in
           pkgs.coreutils
         ]
         ++ lib.optional config.services.flatpak.enable pkgs.flatpak;
+        # Preserve paths used by activation jobs that survive the agent restart.
+        # Only agent-owned entries move; the server keeps its database and keys.
+        preStart = ''
+          for entry in servers sources activations credential.json; do
+            old="/var/lib/manage-nix/$entry"
+            new="/var/lib/manage-nix-agent/$entry"
+            if [ -e "$old" ] && [ ! -L "$old" ]; then
+              if [ -e "$new" ] || [ -L "$new" ]; then
+                echo "Cannot migrate $old: $new already exists" >&2
+                exit 1
+              fi
+              mv -T "$old" "$new"
+            fi
+            if [ "$entry" != credential.json ]; then
+              mkdir -p "$new"
+            fi
+            if [ -d /var/lib/manage-nix ] && [ -e "$new" ] && [ ! -e "$old" ] && [ ! -L "$old" ]; then
+              ln -s "$new" "$old"
+            fi
+          done
+          # Earlier co-located installations may have server-owned agent files.
+          chown -R root:root /var/lib/manage-nix-agent
+        '';
         serviceConfig = {
-          ExecStart = "${lib.getExe cfg.package} run";
+          ExecStart = "${lib.getExe cfg.package} run --state-dir /var/lib/manage-nix-agent";
           # Root: activating systems needs it.
-          # The server owns the shared parent when co-located. Having
-          # systemd also manage it for this root service resets its owner
-          # and mode on agent restarts, locking the server out of SQLite.
-          StateDirectory = lib.mkIf (
-            !(lib.attrByPath [ "services" "manage-nix" "server" "enable" ] false config)
-          ) "manage-nix";
+          StateDirectory = "manage-nix-agent";
           StateDirectoryMode = "0700";
           Restart = "always";
           RestartSec = 5;

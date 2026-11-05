@@ -72,7 +72,9 @@ in
                 {option}`services.manage-nix.server.machines`. It is read
                 only while the machine has not enrolled with this server;
                 afterwards the agent uses the credential it stored in
-                {file}`/var/lib/manage-nix/servers/<name>/credential.json`.
+                {file}`${
+                  if isDarwin then "/var/lib/manage-nix" else "/var/lib/manage-nix-agent"
+                }/servers/<name>/credential.json`.
                 Keep it out of the Nix store.
               '';
             };
@@ -187,23 +189,25 @@ in
     };
 
     environment.systemPackages = [ cfg.package ];
-    environment.etc."manage-nix/agent.json".source = (pkgs.formats.json { }).generate "mnix-agent.json" {
-      version = 1;
-      trusted_public_keys = cfg.trustedPublicKeys;
-      inherit servers;
-      health_checks = {
-        timeout_secs = cfg.healthChecks.timeout;
-        interval_secs = cfg.healthChecks.interval;
-        systemd_units = cfg.healthChecks.systemdUnits or [ ];
-        inherit (cfg.healthChecks) http;
-        commands = lib.mapAttrs (
-          name: command:
-          if lib.isString command then
-            "${pkgs.writeShellScript "mnix-health-check-${name}" command}"
-          else
-            lib.getExe command
-        ) cfg.healthChecks.commands;
-      };
-    };
+    environment.etc."manage-nix/agent.json".source =
+      (pkgs.formats.json { }).generate "mnix-agent.json"
+        {
+          version = 1;
+          trusted_public_keys = cfg.trustedPublicKeys;
+          inherit servers;
+          health_checks = {
+            timeout_secs = cfg.healthChecks.timeout;
+            interval_secs = cfg.healthChecks.interval;
+            systemd_units = cfg.healthChecks.systemdUnits or [ ];
+            inherit (cfg.healthChecks) http;
+            commands = lib.mapAttrs (
+              name: command:
+              if lib.isString command then
+                "${pkgs.writeShellScript "mnix-health-check-${name}" command}"
+              else
+                lib.getExe command
+            ) cfg.healthChecks.commands;
+          };
+        };
   };
 }
