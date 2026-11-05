@@ -58,7 +58,11 @@ services.manage-nix.server.extraListenAddresses = [ "100.64.0.1" ];
 Agents can then use `http://100.64.0.1:8080`. Use plain HTTP only on a
 private network: it sends the machine's credential unencrypted.
 
-To test the web UI without HTTPS, also set `secureCookies = false`.
+The local dashboard defaults to `http://manage.nix/` on loopback, with
+`secureCookies = false`. Enabling `localHTTPS.enable` selects the optional
+HTTPS proxy and secure cookies instead. For an external HTTPS proxy, disable
+both `localHTTP.enable` and `localHTTPS.enable`; secure cookies then default
+to true.
 
 ### Declaring repositories and machines
 

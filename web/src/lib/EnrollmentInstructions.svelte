@@ -5,10 +5,35 @@
 
 	let { name, token }: { name: string; token: EnrollmentToken } = $props();
 	let copied = $state(false);
+	let copyFailed = $state(false);
 
 	async function copy() {
-		await navigator.clipboard.writeText(token.token);
-		copied = true;
+		copyFailed = false;
+		if (navigator.clipboard) {
+			try {
+				await navigator.clipboard.writeText(token.token);
+				copied = true;
+				return;
+			} catch {
+				// Fall through when browser clipboard permission is unavailable.
+			}
+		}
+		// HTTP on a custom loopback hostname has no Clipboard API.
+		const input = document.createElement('textarea');
+		input.value = token.token;
+		input.style.position = 'fixed';
+		input.style.opacity = '0';
+		input.readOnly = true;
+		document.body.append(input);
+		try {
+			input.select();
+			copied = document.execCommand('copy');
+		} catch {
+			copied = false;
+		} finally {
+			input.remove();
+		}
+		copyFailed = !copied;
 	}
 </script>
 
@@ -21,6 +46,9 @@
 		<code data-testid="enrollment-token">{token.token}</code>
 		<button type="button" onclick={copy}>{copied ? 'Copied' : 'Copy'}</button>
 	</div>
+	{#if copyFailed}
+		<p role="status">Copy was blocked. Select the token above and copy it manually.</p>
+	{/if}
 	<p class="muted">
 		On the machine, write it to a file and point the agent at it:
 	</p>

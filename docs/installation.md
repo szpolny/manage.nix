@@ -72,8 +72,9 @@ separate step (see [Set up a cache](#3-set-up-a-cache)).
 }
 ```
 
-Open **https://manage.nix** on the machine running the server. The module
-adds a loopback hosts entry and an HTTPS proxy on `127.0.0.1:443`. The
+Open **http://manage.nix/** on the machine running the server. The module
+adds a loopback hosts entry and an HTTP proxy on `127.0.0.1:80`. No local
+certificate authority or Keychain setup is needed. The
 backend runs on `127.0.0.1:8080` with an SQLite database in
 `/var/lib/manage-nix`. On first start it generates:
 
@@ -83,7 +84,18 @@ backend runs on `127.0.0.1:8080` with an SQLite database in
 | `/var/lib/manage-nix/initial-admin-password` | Password of the web UI user `admin` |
 | `/var/lib/manage-nix/signing-key` | Key the server signs built systems with |
 
-### Trust local HTTPS
+### Optional local HTTPS
+
+The default dashboard uses HTTP on loopback. To opt into local HTTPS instead:
+
+```nix
+services.manage-nix.server.localHTTPS.enable = true;
+```
+
+This disables the default HTTP proxy and enables secure session cookies.
+When upgrading from an older release, remove an explicit `localHTTPS.enable = true`
+to use the new HTTP default. When switching from HTTPS, clear existing
+`manage.nix` cookies before signing in over HTTP.
 
 The proxy generates a private local certificate authority and renews its
 certificates automatically. Its keys stay outside the Nix store in
@@ -92,8 +104,8 @@ proxy's root, installs SSL trust in the System Keychain's admin trust store,
 and verifies that macOS trusts it. Trust failures stop activation with an
 error instead of leaving a silently untrusted dashboard. Activation also
 maintains a marked entry in
-`/etc/hosts`, preserving other entries. Disabling local HTTPS or the server
-removes that managed entry.
+`/etc/hosts`, preserving other entries. Disabling both local proxies or the
+server removes that managed entry.
 
 On NixOS, installation automatically adds the public root to the system CA
 bundle and p11-kit trust source after the proxy starts. Existing configured
@@ -112,7 +124,10 @@ proxy to your network. The proxy needs loopback port 443 available.
 Disable the bundled local proxy if you already serve HTTPS:
 
 ```nix
-services.manage-nix.server.localHTTPS.enable = false;
+services.manage-nix.server = {
+  localHTTP.enable = false;
+  localHTTPS.enable = false;
+};
 ```
 
 ### Put it behind HTTPS
@@ -145,7 +160,7 @@ networking.firewall.allowedTCPPorts = [ 80 443 ];
 
 ### Log in
 
-Open `https://manage.nix` (or your configured hostname), log in as `admin` with the password from
+Open `http://manage.nix/` (or your configured hostname), log in as `admin` with the password from
 `initial-admin-password`, and change it on the account page.
 
 ## 3. Set up a cache

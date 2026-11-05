@@ -46,10 +46,10 @@ in
   config = lib.mkMerge [
     {
       # nix-darwin has no networking.hosts option. Manage only our marked
-      # entry, including removing it when HTTPS or the server is disabled.
+      # entry, removing it when both local proxies or the server are disabled.
       system.activationScripts.postActivation.text = lib.mkAfter ''
-        mnix_hosts_changed=$(${pkgs.runtimeShell} ${./local-https-hosts.sh} /etc/hosts ${
-          lib.boolToString (cfg.enable && cfg.localHTTPS.enable)
+        mnix_hosts_changed=$(${pkgs.runtimeShell} ${./local-hosts.sh} /etc/hosts ${
+          lib.boolToString (cfg.enable && (cfg.localHTTP.enable || cfg.localHTTPS.enable))
         }) || exit 1
         if [ -n "$mnix_hosts_changed" ]; then
           /usr/bin/dscacheutil -flushcache
@@ -73,6 +73,24 @@ in
         cfg.package
       ]
       ++ lib.optional (cfg.cliPackage != null) cfg.cliPackage;
+
+      launchd.daemons.mnix-http = lib.mkIf cfg.localHTTP.enable {
+        serviceConfig = {
+          ProgramArguments = [
+            "${lib.getExe pkgs.caddy}"
+            "run"
+            "--config"
+            "${common.localHTTPConfig}"
+            "--adapter"
+            "caddyfile"
+          ];
+          RunAtLoad = true;
+          KeepAlive = true;
+          ThrottleInterval = 5;
+          StandardOutPath = "${stateDir}/http-proxy.log";
+          StandardErrorPath = "${stateDir}/http-proxy.log";
+        };
+      };
 
       launchd.daemons.mnix-https = lib.mkIf cfg.localHTTPS.enable {
         serviceConfig = {

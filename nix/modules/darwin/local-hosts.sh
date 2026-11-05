@@ -6,9 +6,9 @@ updated=$(mktemp)
 trap 'rm -f "$updated"' EXIT
 
 # Preserve other entries, including unmarked entries for the same hostname.
-awk '$0 !~ /# manage-nix local HTTPS$/ { print }' "$hosts" > "$updated"
+awk '$0 !~ /# manage-nix local (HTTPS|dashboard)$/ { print }' "$hosts" > "$updated"
 if [ "$enabled" = true ]; then
-    printf '%s\n' '127.0.0.1 manage.nix # manage-nix local HTTPS' >> "$updated"
+    printf '%s\n' '127.0.0.1 manage.nix # manage-nix local dashboard' >> "$updated"
 fi
 if ! cmp -s "$hosts" "$updated"; then
     # Write through the existing file to preserve its permissions and ownership.

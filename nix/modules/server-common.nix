@@ -21,6 +21,17 @@ let
   address =
     a: if lib.hasInfix ":" a then "[${a}]:${toString cfg.port}" else "${a}:${toString cfg.port}";
 
+  localUpstream = "${
+    if cfg.listenAddress == "0.0.0.0" then
+      "127.0.0.1"
+    else if cfg.listenAddress == "::" then
+      "[::1]"
+    else if lib.hasInfix ":" cfg.listenAddress then
+      "[${cfg.listenAddress}]"
+    else
+      cfg.listenAddress
+  }:${toString cfg.port}";
+
   provisionFile = (pkgs.formats.json { }).generate "mnix-provision.json" {
     repositories = lib.mapAttrs (_: r: {
       inherit (r) url;
@@ -35,6 +46,20 @@ in
 {
   inherit stateDir adminTokenFile;
 
+  localHTTPConfig = pkgs.writeText "manage-nix-HTTP-Caddyfile" ''
+    {
+      admin off
+      auto_https off
+      persist_config off
+    }
+    http://manage.nix {
+      bind 127.0.0.1
+      reverse_proxy ${localUpstream} {
+        flush_interval -1
+      }
+    }
+  '';
+
   localHTTPSConfig = pkgs.writeText "manage-nix-Caddyfile" ''
     {
       admin off
@@ -47,16 +72,7 @@ in
     https://manage.nix {
       bind 127.0.0.1
       tls internal
-      reverse_proxy ${
-        if cfg.listenAddress == "0.0.0.0" then
-          "127.0.0.1"
-        else if cfg.listenAddress == "::" then
-          "[::1]"
-        else if lib.hasInfix ":" cfg.listenAddress then
-          "[${cfg.listenAddress}]"
-        else
-          cfg.listenAddress
-      }:${toString cfg.port} {
+      reverse_proxy ${localUpstream} {
         flush_interval -1
       }
     }
@@ -86,9 +102,19 @@ in
       description = "The web UI to serve at `/`, or null for the API only.";
     };
 
+    localHTTP.enable = mkOption {
+      type = types.bool;
+      default = !cfg.localHTTPS.enable;
+      defaultText = lib.literalExpression "!config.services.manage-nix.server.localHTTPS.enable";
+      description = ''
+        Serve http://manage.nix on loopback port 80, without certificates.
+        Adds manage.nix to the hosts file. Disable when using your own proxy.
+      '';
+    };
+
     localHTTPS.enable = mkOption {
       type = types.bool;
-      default = true;
+      default = false;
       description = ''
         Serve https://manage.nix on loopback using a local certificate
         authority. Adds manage.nix to the hosts file and runs a TLS proxy
@@ -99,10 +125,12 @@ in
 
     secureCookies = mkOption {
       type = types.bool;
-      default = true;
+      default = !cfg.localHTTP.enable;
+      defaultText = lib.literalExpression "!config.services.manage-nix.server.localHTTP.enable";
       description = ''
         Mark the web UI's session cookie `Secure`, so browsers send it only
-        over HTTPS. Turn this off only to test without a TLS proxy.
+        over HTTPS. Defaults to false for the local HTTP dashboard and true
+        when using HTTPS or an external proxy.
       '';
     };
 
@@ -442,6 +470,10 @@ in
   ];
 
   assertions = [
+    {
+      assertion = !(cfg.localHTTP.enable && cfg.localHTTPS.enable);
+      message = "Enable only one of services.manage-nix.server.localHTTP or localHTTPS.";
+    }
     {
       assertion = cfg.heartbeatTimeout > cfg.heartbeatInterval;
       message = "services.manage-nix.server.heartbeatTimeout must be longer than heartbeatInterval.";

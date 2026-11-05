@@ -15,6 +15,9 @@ A dashboard and control plane for fleets of Nix-managed machines.
 
 ## Installation
 
+The server module serves the local dashboard at **http://manage.nix/** on
+loopback. HTTPS is optional through `localHTTPS.enable`.
+
 Add the flake to your configuration:
 
 ```nix

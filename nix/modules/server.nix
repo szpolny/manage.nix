@@ -1,7 +1,7 @@
 # NixOS module for mnix-server, the manage.nix control plane.
 #
-# A local HTTPS proxy serves https://manage.nix by default. Disable
-# localHTTPS.enable when using an existing TLS proxy instead.
+# A loopback HTTP proxy serves http://manage.nix by default.
+# localHTTPS.enable opts into local TLS; disable localHTTP for an external proxy.
 #
 # With `buildOn = "server"`, the server builds machines' systems itself, as
 # the `manage-nix` user, through this machine's Nix daemon, signs them with
@@ -66,7 +66,7 @@ in
     ]
     ++ lib.optional (cfg.cliPackage != null) cfg.cliPackage;
 
-    networking.hosts = lib.mkIf cfg.localHTTPS.enable {
+    networking.hosts = lib.mkIf (cfg.localHTTP.enable || cfg.localHTTPS.enable) {
       "127.0.0.1" = [ "manage.nix" ];
     };
 
@@ -112,6 +112,29 @@ in
         mv -f ${trustDir}/root.crt.new ${trustDir}/root.crt
         ${updateTrust}
       '';
+    };
+
+    systemd.services.mnix-http = lib.mkIf cfg.localHTTP.enable {
+      description = "manage.nix local HTTP proxy";
+      wantedBy = [ "multi-user.target" ];
+      after = [
+        "network.target"
+        "mnix-server.service"
+      ];
+      serviceConfig = {
+        ExecStart = "${lib.getExe pkgs.caddy} run --config ${common.localHTTPConfig} --adapter caddyfile";
+        DynamicUser = true;
+        StateDirectory = "manage-nix-http";
+        StateDirectoryMode = "0700";
+        AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ];
+        CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ];
+        NoNewPrivileges = true;
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        PrivateTmp = true;
+        Restart = "on-failure";
+        RestartSec = 2;
+      };
     };
 
     systemd.services.mnix-https = lib.mkIf cfg.localHTTPS.enable {

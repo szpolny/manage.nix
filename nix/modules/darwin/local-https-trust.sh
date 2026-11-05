@@ -14,11 +14,8 @@ while [ ! -s "$root" ]; do
     remaining=$((remaining - 1))
 done
 
-# A certificate's presence in System.keychain does not imply SSL trust.
-if "$security" verify-cert -q -l -p ssl -c "$root" >/dev/null 2>&1; then
-    exit 0
-fi
-
+# Always ensure admin-domain SSL trust. Presence in System.keychain, or
+# verification using root's personal trust settings, is not sufficient.
 if ! "$security" add-trusted-cert -d -r trustRoot -p ssl \
     -k /Library/Keychains/System.keychain "$root"; then
     echo "manage.nix: failed to trust the local HTTPS root in the macOS admin trust store" >&2
