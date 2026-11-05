@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.4.0-alpha](https://github.com/szpolny/manage.nix/compare/v0.3.3-alpha...v0.4.0-alpha) (2026-11-05)
+
+
+### ⚠ BREAKING CHANGES
+
+* **server:** The local dashboard now defaults to HTTP. Enable localHTTPS.enable to retain local TLS, or disable localHTTP.enable when using an external proxy.
+
+### Features
+
+* **server:** default to a loopback HTTP dashboard ([8818924](https://github.com/szpolny/manage.nix/commit/88189246b9aa496b0e8ce737ffe4a826ab12023e))
+
+
+### Bug Fixes
+
+* **darwin:** explicitly install and verify local HTTPS trust ([2c73c9c](https://github.com/szpolny/manage.nix/commit/2c73c9cdec58090e5f9b7f4f495d3b1a6cdec25d))
+
 ## [0.3.3-alpha](https://github.com/szpolny/manage.nix/compare/v0.3.2-alpha...v0.3.3-alpha) (2026-11-05)
 
 
