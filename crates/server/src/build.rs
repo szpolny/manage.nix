@@ -612,39 +612,6 @@ async fn run(command: &mut Command, log: &mut Log) -> anyhow::Result<String> {
     Ok(out)
 }
 
-#[cfg(test)]
-mod command_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn failure_summary_preserves_git_diagnostic() {
-        let mut log = Log::discard();
-        let error = run(
-            Command::new("sh").args([
-                "-c",
-                "printf '%s\\n' 'ERROR: The key you are authenticating with has been marked as read only.' 'fatal: Could not read from remote repository.' '' 'Please make sure you have the correct access rights' 'and the repository exists.' >&2; exit 128",
-            ]),
-            &mut log,
-        )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("marked as read only"));
-        assert!(!error.to_string().contains("and the repository exists"));
-        assert!(log.buffer.contains("and the repository exists"));
-    }
-
-    #[tokio::test]
-    async fn failure_without_explicit_diagnostic_uses_last_line() {
-        let error = run(
-            Command::new("sh").args(["-c", "echo 'connection refused' >&2; exit 1"]),
-            &mut Log::discard(),
-        )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("connection refused"));
-    }
-}
-
 /// Buffers output for a deployment's log and writes it in batches.
 pub struct Log {
     /// `None` for output that only goes to the server's own log.
@@ -711,5 +678,38 @@ impl Log {
         if let Err(e) = store.append_log(&entry).await {
             tracing::error!("writing the log of deployment {}: {e}", self.deployment_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failure_summary_preserves_git_diagnostic() {
+        let mut log = Log::discard();
+        let error = run(
+            Command::new("sh").args([
+                "-c",
+                "printf '%s\\n' 'ERROR: The key you are authenticating with has been marked as read only.' 'fatal: Could not read from remote repository.' '' 'Please make sure you have the correct access rights' 'and the repository exists.' >&2; exit 128",
+            ]),
+            &mut log,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("marked as read only"));
+        assert!(!error.to_string().contains("and the repository exists"));
+        assert!(log.buffer.contains("and the repository exists"));
+    }
+
+    #[tokio::test]
+    async fn failure_without_explicit_diagnostic_uses_last_line() {
+        let error = run(
+            Command::new("sh").args(["-c", "echo 'connection refused' >&2; exit 1"]),
+            &mut Log::discard(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("connection refused"));
     }
 }
