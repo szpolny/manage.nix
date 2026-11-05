@@ -61,7 +61,9 @@ On every pull request and push to main, CI runs formatting, Clippy, Rust and
 Postgres tests, version consistency, and all package builds (including the
 web type check). VM tests are selected from the changed paths:
 
-- Documentation changes skip VMs; web changes run `vm-web`.
+- Documentation and version-only release changes skip VMs; web changes run
+  `vm-web`. Release metadata is compared structurally: dependency, build, and
+  other non-version changes still select VMs.
 - Changes to individual VM tests run those scenarios, including both database
   backends where applicable. Shared deployment fixtures run deployment, web,
   and fleet scenarios.
@@ -76,6 +78,15 @@ variable `CACHIX_NAME`
 (`manage-nix`) and secret `CACHIX_AUTH_TOKEN` to enable cache reads in all jobs
 and uploads on pushes to main. Each runner has its own Nix store; Cachix lets
 later runs reuse outputs published by previous main branch runs.
+
+The build job checks formatting, versions, and Darwin modules before compiling
+Rust dependencies and all packages once. It exports separate Zstandard-compressed
+binary caches as one-day workflow artifacts. Rust checks import the dependencies;
+VM jobs import the packages, then run in parallel with the Rust checks. These
+artifacts are scoped to the same workflow run, including on fork pull requests,
+and need no cache upload credentials. Package artifacts are skipped when no VMs
+are selected. The local artifact imports disable signature checks because they
+contain this run's unsigned builds; external caches still require signatures.
 
 `checks.*.vm-*` are NixOS VM tests. `vm-web` drives the UI with Playwright
 (`nix/tests/web/e2e.py`).

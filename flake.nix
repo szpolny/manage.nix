@@ -150,6 +150,9 @@
         in
         rust.packages
         // {
+          # Shared with downstream CI jobs through a per-run binary cache.
+          cargo-deps = cargoArtifacts;
+
           cargo-test = craneLib.cargoTest (
             commonArgs
             // {

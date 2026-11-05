@@ -1,11 +1,12 @@
 # The flake's checks, split so each job stays small:
 #
-# - `quick`: tests, lints, the versions check, and the packages.
+# - `build`: packages and Rust dependencies, shared through a per-run artifact.
+# - `quick`: tests and Clippy, using the shared Rust dependencies.
 # - `vm`: NixOS VM tests, one per runner (several at once starve a hosted
 #   runner). Pushes and pull requests select tests by changed paths; the
 #   weekly run (or a manual one) runs them all. See docs/development.md.
 #
-# Both jobs use the Cachix cache named by the CACHIX_NAME repository
+# Jobs use the Cachix cache named by the CACHIX_NAME repository
 # variable. They pull from it always and push everything they build on
 # pushes to main (which include every commit release-please tags), so users
 # of a release substitute its packages instead of compiling them. Pushing
@@ -45,6 +46,8 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
+      - name: Test VM selection
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
       - id: select
         name: Select VM tests
         env:
@@ -53,7 +56,8 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: python3 .github/scripts/select-vm-tests.py
 
-  quick:
+  build:
+    needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -67,13 +71,69 @@ jobs:
           name: ${{ vars.CACHIX_NAME }}
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
           skipPush: ${{ github.event_name != 'push' }}
-      - run: |
+      - name: Check formatting, versions, and Darwin modules
+        run: |
           nix build -L --no-link \
-            .#checks.x86_64-linux.{versions,darwin-local-https,cargo-fmt,cargo-clippy,cargo-test,store-postgres} \
+            .#checks.x86_64-linux.{versions,darwin-local-https,cargo-fmt}
+      - name: Build shared dependencies and packages
+        run: |
+          nix build -L --no-link \
+            .#checks.x86_64-linux.{cargo-deps,mnix,mnix-agent,mnix-server,mnix-web}
+      - name: Export shared Rust dependencies
+        run: |
+          nix copy --to "file://$RUNNER_TEMP/nix-deps?compression=zstd" \
+            .#checks.x86_64-linux.cargo-deps
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nix-deps
+          path: ${{ runner.temp }}/nix-deps
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+      - name: Export shared packages
+        if: needs.changes.outputs.has-tests == 'true'
+        run: |
+          nix copy --to "file://$RUNNER_TEMP/nix-packages?compression=zstd" \
             .#checks.x86_64-linux.{mnix,mnix-agent,mnix-server,mnix-web}
+      - uses: actions/upload-artifact@v4
+        if: needs.changes.outputs.has-tests == 'true'
+        with:
+          name: nix-packages
+          path: ${{ runner.temp }}/nix-packages
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+  quick:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: experimental-features = nix-command flakes
+      - if: ${{ vars.CACHIX_NAME != '' }}
+        uses: cachix/cachix-action@v16
+        with:
+          name: ${{ vars.CACHIX_NAME }}
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          skipPush: ${{ github.event_name != 'push' }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: nix-deps
+          path: ${{ runner.temp }}/nix-deps
+      - name: Import shared builds
+        run: |
+          nix copy --from "file://$RUNNER_TEMP/nix-deps" --no-check-sigs \
+            .#checks.x86_64-linux.cargo-deps
+      - name: Run checks
+        run: |
+          nix build -L --no-link \
+            .#checks.x86_64-linux.{cargo-clippy,cargo-test,store-postgres}
 
   vm:
-    needs: changes
+    needs: [changes, build]
     if: needs.changes.outputs.has-tests == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -100,6 +160,14 @@ jobs:
           name: ${{ vars.CACHIX_NAME }}
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
           skipPush: ${{ github.event_name != 'push' }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: nix-packages
+          path: ${{ runner.temp }}/nix-packages
+      - name: Import shared packages
+        run: |
+          nix copy --from "file://$RUNNER_TEMP/nix-packages" --no-check-sigs \
+            .#checks.x86_64-linux.{mnix,mnix-agent,mnix-server,mnix-web}
       - name: Check KVM
         run: test -w /dev/kvm || { echo "::error::/dev/kvm is not available to this job"; exit 1; }
       - run: nix build -L --no-link .#checks.x86_64-linux.${{ matrix.test }}
