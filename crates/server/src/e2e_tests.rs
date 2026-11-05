@@ -1911,7 +1911,7 @@ fn nix_available() -> bool {
 }
 
 #[tokio::test]
-async fn update_deploys_push_a_new_nixpkgs_lock_first() {
+async fn update_deploys_push_all_flake_inputs_first() {
     if !nix_available() {
         eprintln!("skipping: nix is not available");
         return;
@@ -1935,6 +1935,11 @@ async fn update_deploys_push_a_new_nixpkgs_lock_first() {
     git(&nixpkgs, &["init", "--quiet"]);
     std::fs::write(nixpkgs.join("flake.nix"), "{ outputs = _: { }; }\n").unwrap();
     commit_all(&nixpkgs, "one");
+    let extra = root.join("extra");
+    git(
+        root,
+        &["clone", "--quiet", nixpkgs.to_str().unwrap(), "extra"],
+    );
     let origin = root.join("infra.git");
     git(
         root,
@@ -1955,8 +1960,8 @@ async fn update_deploys_push_a_new_nixpkgs_lock_first() {
     std::fs::write(
         work.join("flake.nix"),
         format!(
-            "{{ inputs.nixpkgs.url = \"git+file://{}\"; outputs = _: {{ }}; }}\n",
-            nixpkgs.display()
+            "{{ inputs.nixpkgs.url = \"git+file://{}\"; inputs.extra.url = \"git+file://{}\"; outputs = _: {{ }}; }}\n",
+            nixpkgs.display(), extra.display()
         ),
     )
     .unwrap();
@@ -1976,8 +1981,8 @@ async fn update_deploys_push_a_new_nixpkgs_lock_first() {
     git(&work, &["tag", "v1"]);
     git(&work, &["push", "--quiet", "origin", "main", "v1"]);
     let newer = {
-        std::fs::write(nixpkgs.join("README"), "two\n").unwrap();
-        commit_all(&nixpkgs, "two")
+        std::fs::write(extra.join("README"), "two\n").unwrap();
+        commit_all(&extra, "two")
     };
 
     let credential = server.enrolled("web-1").await;
@@ -2071,6 +2076,14 @@ async fn update_deploys_push_a_new_nixpkgs_lock_first() {
             .id,
     );
     assert_eq!(git(&mirror, &["worktree", "list"]).lines().count(), 1);
+    assert_eq!(
+        crate::updates::nixpkgs_updates(&server.state, &mirror, Some(&base)).await,
+        Some(true)
+    );
+    assert_eq!(
+        crate::updates::nixpkgs_updates(&server.state, &mirror, Some(commit)).await,
+        Some(false)
+    );
     ws.send(text(&AgentMessage::ActivationResult {
         deployment_id: deployment_id.clone(),
         report: succeeded("/nix/store/11111111111111111111111111111111-nixos-system-web-1"),

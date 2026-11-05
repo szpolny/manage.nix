@@ -4,7 +4,7 @@
 //! Every [`POLL`], each machine with auto-updates that is online and has no
 //! deployment in progress gets at most one of them, if it is due: one has
 //! not been started for the machine within [`INTERVAL`], and there is
-//! something to update. Flatpak updates run first; the nixpkgs update
+//! something to update. Flatpak updates run first; the flake input update
 //! follows at a later poll. Deployments the scheduler starts are
 //! requested by [`REQUESTED_BY`], which is how it finds its last attempt.
 
@@ -118,7 +118,7 @@ async fn update(state: &AppState, machine: Machine) -> anyhow::Result<()> {
             )
             .await
             .map_err(|e| anyhow::anyhow!(e.message))?;
-            tracing::info!("auto-update {name}: nixpkgs on {rev} in deployment {id}");
+            tracing::info!("auto-update {name}: flake inputs on {rev} in deployment {id}");
         }
     }
     Ok(())

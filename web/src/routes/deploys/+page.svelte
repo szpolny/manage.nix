@@ -65,7 +65,7 @@
 								{#if d.kind === 'flatpak_update'}
 									Flatpak update
 								{:else if d.kind === 'update'}
-									nixpkgs update · <span class="mono">{revisionLabel(d.rev, d.commit)}</span>
+									flake input update · <span class="mono">{revisionLabel(d.rev, d.commit)}</span>
 								{:else if d.kind !== 'deploy'}
 									{d.kind}
 								{:else}

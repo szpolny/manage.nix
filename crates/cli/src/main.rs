@@ -82,7 +82,7 @@ enum Command {
         /// branch).
         #[arg(long)]
         rev: Option<String>,
-        /// First update the nixpkgs input: commit the new flake.lock and
+        /// First update all flake inputs: commit the new flake.lock and
         /// push it to the branch (`--rev` must name a branch), then deploy
         /// that commit.
         #[arg(long)]
@@ -271,7 +271,7 @@ enum MachineCommand {
     /// most once a day each. Unset options keep their current value.
     AutoUpdate {
         machine: String,
-        /// Update the nixpkgs input and deploy it when upstream is newer.
+        /// Update all flake inputs and deploy it when upstream is newer.
         #[arg(long)]
         nixpkgs: Option<bool>,
         /// Update Flatpak apps and runtimes when updates are available.
@@ -392,7 +392,7 @@ fn main() -> anyhow::Result<ExitCode> {
             )?;
             let on = |b: bool| if b { "on" } else { "off" };
             eprintln!(
-                "{}: nixpkgs auto-update {}, Flatpak auto-update {}",
+                "{}: flake input auto-update {}, Flatpak auto-update {}",
                 updated.name,
                 on(updated.auto_update.nixpkgs),
                 on(updated.auto_update.flatpak)

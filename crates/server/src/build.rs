@@ -195,17 +195,16 @@ impl Builder {
         Ok(commit)
     }
 
-    /// Updates the flake's `input` at `commit` of the branch `rev` names,
+    /// Updates all flake inputs at `commit` of the branch `rev` names,
     /// commits the new `flake.lock`, and pushes it to that branch. Returns
-    /// the commit to deploy: the new one, or `commit` if the input was
+    /// the commit to deploy: the new one, or `commit` if the inputs were
     /// already up to date.
-    pub async fn update_input(
+    pub async fn update_inputs(
         &self,
         repository_id: Uuid,
         url: &str,
         rev: &str,
         commit: &str,
-        input: &str,
         log: &mut Log,
     ) -> anyhow::Result<String> {
         let mirror = self.mirror(repository_id);
@@ -231,16 +230,7 @@ impl Builder {
             .await?;
         }
         let result = self
-            .commit_update(
-                repository_id,
-                url,
-                &mirror,
-                &worktree,
-                &branch,
-                commit,
-                input,
-                log,
-            )
+            .commit_update(repository_id, url, &mirror, &worktree, &branch, commit, log)
             .await;
         let _git = self.git_lock.lock().await;
         let removed = run(
@@ -272,11 +262,10 @@ impl Builder {
         worktree: &Path,
         branch: &str,
         commit: &str,
-        input: &str,
         log: &mut Log,
     ) -> anyhow::Result<String> {
         let dir = worktree.to_str().context("non-UTF-8 state directory")?;
-        log.line(format!("updating the {input} input of {branch} ({commit})"))
+        log.line(format!("updating all flake inputs of {branch} ({commit})"))
             .await;
         run(
             Command::new("nix")
@@ -290,9 +279,7 @@ impl Builder {
                 ])
                 // A path flake: the worktree's `.git` is a file pointing at
                 // the mirror, which Git flakes do not read reliably.
-                .arg(format!("path:{dir}"))
-                .arg("--")
-                .arg(input),
+                .arg(format!("path:{dir}")),
             log,
         )
         .await?;
@@ -305,7 +292,7 @@ impl Builder {
         )
         .await?;
         if status.trim().is_empty() {
-            log.line(format!("{input} is already up to date")).await;
+            log.line("flake inputs are already up to date").await;
             return Ok(commit.to_owned());
         }
         run(
@@ -320,7 +307,7 @@ impl Builder {
                 "--quiet",
                 "--no-verify",
                 "-m",
-                &format!("flake.lock: update {input}"),
+                "chore: update flake inputs",
                 "--",
                 "flake.lock",
             ]),
@@ -556,7 +543,7 @@ async fn branch(mirror: &Path, rev: &str, log: &mut Log) -> anyhow::Result<Strin
         .success();
     anyhow::ensure!(
         is_branch,
-        "{rev:?} is not a branch; updating nixpkgs needs a branch to push the new lock to"
+        "{rev:?} is not a branch; updating flake inputs needs a branch to push the new lock to"
     );
     Ok(name.to_owned())
 }

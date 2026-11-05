@@ -36,7 +36,7 @@ The admin token lives in `/var/lib/manage-nix/admin-token` unless you set
 
 | Command | What it does |
 |---|---|
-| `mnix deploy <machine or tag:name>... [--rev <rev>] [--update-nixpkgs]` | Build and activate a revision, optionally updating nixpkgs first |
+| `mnix deploy <machine or tag:name>... [--rev <rev>] [--update-nixpkgs]` | Build and activate a revision, optionally updating all flake inputs first |
 | `mnix rollback <machine>` | Go back to the previous system |
 | `mnix reboot <machine>` | Restart a machine and wait for it |
 | `mnix flatpak-update <machine>` | Update a machine's Flatpak apps and runtimes |

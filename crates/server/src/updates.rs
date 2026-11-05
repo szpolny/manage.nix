@@ -346,8 +346,8 @@ pub async fn all_updates(
     Ok(Json(summaries))
 }
 
-/// The revision to update the machine's nixpkgs input on, if upstream has
-/// a newer nixpkgs than the running system was built with; `None` if it is
+/// The revision to update all flake inputs on when refreshing the running
+/// system's lock changes any input; `None` if it is
 /// up to date or that is unknown.
 pub async fn nixpkgs_update(
     state: &AppState,
@@ -505,9 +505,13 @@ async fn run_preview(
     Ok(())
 }
 
-/// Compare the running configuration's lock with the upstream input, without
+/// Compare the running configuration's lock with the refreshed inputs, without
 /// updating the repository's lock or building a system.
-async fn nixpkgs_updates(state: &AppState, mirror: &Path, current: Option<&str>) -> Option<bool> {
+pub(crate) async fn nixpkgs_updates(
+    state: &AppState,
+    mirror: &Path,
+    current: Option<&str>,
+) -> Option<bool> {
     let current = current?;
     if !is_commit(current) {
         return None;
@@ -515,8 +519,9 @@ async fn nixpkgs_updates(state: &AppState, mirror: &Path, current: Option<&str>)
     let lock = git(mirror, &["show", &format!("{current}:flake.lock")])
         .await
         .ok()?;
-    let (url, locked) = nixpkgs_input(&lock)?;
-    let key = format!("{url}:{locked}");
+    let locked: serde_json::Value = serde_json::from_str(&lock).ok()?;
+    let url = format!("git+file://{}?rev={current}", mirror.to_str()?);
+    let key = url.clone();
     let mut cache = state.updates.nixpkgs.lock().await;
     let now = OffsetDateTime::now_utc();
     if let Some((at, result)) = cache.get(&key) {
@@ -528,11 +533,14 @@ async fn nixpkgs_updates(state: &AppState, mirror: &Path, current: Option<&str>)
         let mut command = tokio::process::Command::new("nix");
         command
             .args([
+                "--extra-experimental-features",
+                "nix-command flakes",
                 "flake",
                 "metadata",
                 "--json",
                 "--refresh",
                 "--no-write-lock-file",
+                "--recreate-lock-file",
                 &url,
             ])
             .stdin(Stdio::null())
@@ -540,72 +548,28 @@ async fn nixpkgs_updates(state: &AppState, mirror: &Path, current: Option<&str>)
             .kill_on_drop(true);
         let out = tokio::time::timeout(Duration::from_secs(30), command.output())
             .await
-            .inspect_err(|_| tracing::warn!("checking {url} for a newer nixpkgs timed out"))
+            .inspect_err(|_| tracing::warn!("checking {url} for flake input updates timed out"))
             .ok()?
             .inspect_err(|e| tracing::warn!("running nix to check {url}: {e}"))
             .ok()?;
         if !out.status.success() {
-            tracing::warn!("checking {url} for a newer nixpkgs failed ({})", out.status);
+            tracing::warn!(
+                "checking {url} for flake input updates failed ({})",
+                out.status
+            );
             return None;
         }
         let metadata: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-        Some(metadata.get("locked")?.get("rev")?.as_str()? != locked)
+        Some(metadata.get("locks")? != &locked)
     }
     .await;
     cache.insert(key, (now, result));
     result
 }
 
-fn nixpkgs_input(lock: &str) -> Option<(String, String)> {
-    let lock: serde_json::Value = serde_json::from_str(lock).ok()?;
-    let nodes = lock.get("nodes")?;
-    let root = lock.get("root")?.as_str()?;
-    let input = nodes.get(root)?.get("inputs")?.get("nixpkgs")?.as_str()?;
-    let node = nodes.get(input)?;
-    let original = node.get("original")?;
-    let locked = node.get("locked")?.get("rev")?.as_str()?;
-    // GitHub inputs are the standard nixpkgs source. Other input kinds and
-    // follows paths remain unknown rather than incorrectly reporting current.
-    if original.get("type")?.as_str()? != "github" {
-        return None;
-    }
-    let owner = original.get("owner")?.as_str()?;
-    let repo = original.get("repo")?.as_str()?;
-    let reference = original
-        .get("rev")
-        .or_else(|| original.get("ref"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let url = if reference.is_empty() {
-        format!("github:{owner}/{repo}")
-    } else {
-        format!("github:{owner}/{repo}/{reference}")
-    };
-    Some((url, locked.to_owned()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn nixpkgs_input_uses_the_root_input_and_original_branch() {
-        let lock = r#"{"root":"root","nodes":{
-            "root":{"inputs":{"nixpkgs":"nixpkgs_2"}},
-            "nixpkgs_2":{"original":{"type":"github","owner":"NixOS","repo":"nixpkgs","ref":"nixos-unstable"},
-                "locked":{"rev":"abc"}}
-        }}"#;
-        assert_eq!(
-            nixpkgs_input(lock),
-            Some(("github:NixOS/nixpkgs/nixos-unstable".into(), "abc".into()))
-        );
-        assert_eq!(nixpkgs_input("{}"), None);
-        assert_eq!(nixpkgs_input("invalid"), None);
-        assert_eq!(
-            nixpkgs_input(&lock.replace("\"nixpkgs_2\"}", "[\"other\",\"nixpkgs\"]}")),
-            None
-        );
-    }
 
     #[test]
     fn rev_list_counts_are_left_then_right() {

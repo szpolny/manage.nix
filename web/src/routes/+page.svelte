@@ -255,13 +255,13 @@
 								class="chip"
 								class:warn={updates[machine.name]?.nixpkgs_available === true}
 								href="/machines/{encodeURIComponent(machine.name)}"
-								>nixpkgs: {updates[machine.name]?.nixpkgs_available === true
+								>flake inputs: {updates[machine.name]?.nixpkgs_available === true
 									? 'update available'
 									: updates[machine.name]?.nixpkgs_available === false
 										? 'up to date'
 										: 'unknown'}{machine.auto_update.nixpkgs ? ' · auto' : ''}</a
 							>
-							{#if machine.facts?.os !== 'darwin'}
+							{#if machine.facts?.flatpak_updates != null}
 								<a
 									class="chip"
 									class:warn={Boolean(machine.facts?.flatpak_updates?.length)}

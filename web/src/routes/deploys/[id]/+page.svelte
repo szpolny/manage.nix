@@ -87,7 +87,7 @@
 						: deployment.kind === 'flatpak_update'
 							? 'Flatpak update'
 							: deployment.kind === 'update'
-								? `nixpkgs update · ${revisionLabel(deployment.rev, deployment.commit)}`
+								? `flake input update · ${revisionLabel(deployment.rev, deployment.commit)}`
 								: revisionLabel(deployment.rev, deployment.commit)}
 			{:else}
 				{id.slice(0, 8)}

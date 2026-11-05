@@ -363,7 +363,7 @@
 				</thead>
 				<tbody>
 					<tr>
-						<td>nixpkgs</td>
+						<td>Flake inputs</td>
 						<td>
 							{#if !machine.repository}
 								<span class="muted">needs a configuration</span>
@@ -374,7 +374,7 @@
 							{:else}
 								<span
 									class="muted"
-									title="Needs a known running commit and a GitHub nixpkgs input in flake.lock"
+									title="Needs a known running commit and a flake.lock that Nix can refresh"
 									>unknown</span
 								>
 							{/if}
@@ -397,52 +397,48 @@
 								class:attention={updates?.nixpkgs_available === true}
 								onclick={() => deployDialog?.open([name], updates?.rev, true)}
 								disabled={!machine.repository || !machine.enrolled_at}
-								>Update nixpkgs…</button
+								>Update flake inputs…</button
 							>
 						</td>
 					</tr>
-					<tr>
-						<td>Flatpak</td>
-						<td>
-							{#if !machine.facts?.flatpak_updates}
-								<span
-									class="muted"
-									title="Needs Flatpak on the machine and an up-to-date agent"
-									>unknown</span
+					{#if machine.facts?.flatpak_updates != null}
+						<tr>
+							<td>Flatpak</td>
+							<td>
+								{#if machine.facts.flatpak_updates.length}
+									<strong class="warn"
+										>{machine.facts.flatpak_updates.length} update{machine.facts.flatpak_updates
+											.length === 1
+											? ''
+											: 's'}</strong
+									>
+								{:else}
+									up to date
+								{/if}
+							</td>
+							<td>
+								<label class="check">
+									<input
+										type="checkbox"
+										name="auto_update_flatpak"
+										checked={machine.auto_update.flatpak}
+										onchange={(e) => setAutoUpdate({ flatpak: e.currentTarget.checked })}
+									/>
+									daily
+								</label>
+							</td>
+							<td class="row-actions">
+								<button
+									type="button"
+									class:attention={Boolean(machine.facts?.flatpak_updates?.length)}
+									onclick={flatpakUpdate}
+									disabled={machine.status !== 'online' || !machine.facts?.flatpak_updates}
+									title={machine.status === 'online' ? '' : 'Only online machines can be updated'}
+									>Update Flatpaks…</button
 								>
-							{:else if machine.facts.flatpak_updates.length}
-								<strong class="warn"
-									>{machine.facts.flatpak_updates.length} update{machine.facts.flatpak_updates
-										.length === 1
-										? ''
-										: 's'}</strong
-								>
-							{:else}
-								up to date
-							{/if}
-						</td>
-						<td>
-							<label class="check">
-								<input
-									type="checkbox"
-									name="auto_update_flatpak"
-									checked={machine.auto_update.flatpak}
-									onchange={(e) => setAutoUpdate({ flatpak: e.currentTarget.checked })}
-								/>
-								daily
-							</label>
-						</td>
-						<td class="row-actions">
-							<button
-								type="button"
-								class:attention={Boolean(machine.facts?.flatpak_updates?.length)}
-								onclick={flatpakUpdate}
-								disabled={machine.status !== 'online' || !machine.facts?.flatpak_updates}
-								title={machine.status === 'online' ? '' : 'Only online machines can be updated'}
-								>Update Flatpaks…</button
-							>
-						</td>
-					</tr>
+							</td>
+						</tr>
+					{/if}
 				</tbody>
 			</table>
 		</div>
@@ -456,7 +452,7 @@
 		{/if}
 		{#if autoUpdateError}<p class="error" role="alert">{autoUpdateError}</p>{/if}
 		<p class="muted small">
-			Checks refresh every 15 minutes. Updating nixpkgs commits the new <code>flake.lock</code> to
+			Checks refresh every 15 minutes. Updating flake inputs commits the new <code>flake.lock</code> to
 			the branch and pushes it before deploying, so the repository's key needs write access.
 			Automatic updates run at most once a day each, while the machine is online and idle.
 		</p>

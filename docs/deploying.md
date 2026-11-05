@@ -24,7 +24,7 @@ flake calls it something else.
 
 For a private repository, give the server a read-only SSH deploy key with
 [`repositories.<name>.sshKeyFile`](configuration.md#declaring-repositories-and-machines).
-To [update nixpkgs](#update-nixpkgs) from manage.nix, the key needs write
+To [update flake inputs](#update-flake-inputs) from manage.nix, the key needs write
 access.
 
 ## Deploy
@@ -90,26 +90,30 @@ mnix updates web-1 --rev main --preview
 ```
 
 The machine list in the web UI shows how far behind each machine is, and
-whether nixpkgs or Flatpak updates are available. The nixpkgs check compares
-the `nixpkgs` input locked by the running commit's `flake.lock` with its
-upstream branch; it works for GitHub inputs. The Flatpak check covers the
+whether flake input or Flatpak updates are available. The flake check compares
+the running commit’s `flake.lock` with a refreshed lock for all inputs, using
+the same update scope as `nix flake update`. The Flatpak check covers the
 system installation and each user's, and needs an up-to-date agent with
-`services.flatpak.enable`. Both refresh every 15 minutes.
+`services.flatpak.enable`. Flatpak controls are hidden until the agent reports
+a Flatpak update list.
+Both checks refresh every 15 minutes.
 
-### Update nixpkgs
+### Update flake inputs
 
 ```sh
 mnix deploy web-1 --update-nixpkgs
 ```
 
-The server runs `nix flake update nixpkgs` on the branch (`--rev`, or the
+The CLI flag `--update-nixpkgs` updates all flake inputs.
+
+The server runs `nix flake update` on the branch (`--rev`, or the
 default branch), commits the new `flake.lock` as `manage.nix`, pushes it to
-the branch, and then deploys that commit as usual. If nixpkgs is already
+the branch, and then deploys that commit as usual. If all inputs are already
 current, it deploys the branch as it is. The push is never forced: if the
 branch moved since the server fetched it, the deployment fails and nothing is
 deployed. `--rev` must name a branch, and the repository's SSH key needs
-write access. In the web UI, use **Update nixpkgs…** on the machine's page,
-or tick **Update nixpkgs first** when deploying.
+write access. In the web UI, use **Update flake inputs…** on the machine's page,
+or tick **Update flake inputs first** when deploying.
 
 If GitHub reports `The key you are authenticating with has been marked as
 read only`, the server can fetch the repository but cannot push the updated
@@ -135,11 +139,11 @@ history with its output in the log.
 mnix machine auto-update web-1 --nixpkgs true --flatpak true
 ```
 
-Or tick **daily** next to nixpkgs or Flatpak on the machine's page. The
+Or tick **daily** next to Flake inputs or Flatpak on the machine's page. The
 server then checks every 15 minutes and starts an update when one is
 available, the machine is online, and nothing else is deploying to it. Each
 kind runs at most once a day per machine, even if it failed, and shows up in
-the history as requested by `auto-update`. Automatic nixpkgs updates deploy
+the history as requested by `auto-update`. Automatic flake input updates deploy
 the branch the machine was last deployed from, with `switch`.
 
 ## Reboot

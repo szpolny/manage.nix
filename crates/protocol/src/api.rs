@@ -196,8 +196,8 @@ pub struct CreateDeployment {
     /// Who asked, for the deployment history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_by: Option<String>,
-    /// Update the repository's `nixpkgs` input first: run
-    /// `nix flake update nixpkgs` at `rev`, which must be a branch, commit
+    /// Update the repository's flake inputs first: run
+    /// `nix flake update` at `rev`, which must be a branch, commit
     /// the new `flake.lock`, push it to the branch, and deploy that commit
     /// (a deployment of kind [`DeploymentKind::Update`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -235,7 +235,7 @@ pub struct CreateFlatpakUpdate {
 /// machine is online and has no deployment in progress.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AutoUpdate {
-    /// Update the repository's nixpkgs input and deploy it when upstream
+    /// Update the repository's flake inputs and deploy it when upstream
     /// has a newer revision.
     #[serde(default)]
     pub nixpkgs: bool,
@@ -248,7 +248,7 @@ pub struct AutoUpdate {
 /// repository has that its running system was not built from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Updates {
-    /// Whether the tracked nixpkgs input has a newer upstream revision.
+    /// Whether refreshing all flake inputs changes the lock.
     #[serde(default)]
     pub nixpkgs_available: Option<bool>,
     pub repository: String,
@@ -283,7 +283,7 @@ pub struct Commit {
 /// configuration: [`Updates`] in short, compared with the default revision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateSummary {
-    /// Whether the tracked nixpkgs input has a newer upstream revision.
+    /// Whether refreshing all flake inputs changes the lock.
     #[serde(default)]
     pub nixpkgs_available: Option<bool>,
     pub machine: String,
@@ -342,7 +342,7 @@ pub enum DeploymentKind {
     Rollback,
     /// Restart each machine.
     Reboot,
-    /// Update the repository's nixpkgs input, push the new lock, then
+    /// Update the repository's flake inputs, push the new lock, then
     /// build and activate it like a deploy.
     Update,
     /// Update each machine's Flatpak apps and runtimes.

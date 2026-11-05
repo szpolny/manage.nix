@@ -7,7 +7,7 @@
 //! agents report. A sweeper fails activations and builds that take too
 //! long. Rollbacks, reboots, and Flatpak updates skip the build: they are
 //! released at once. An update deploy first updates the repository's
-//! nixpkgs input and pushes the new lock.
+//! flake inputs and pushes the new lock.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -385,7 +385,7 @@ async fn build_machines(state: &AppState, id: Uuid, log: &mut Log) -> anyhow::Re
     log.line(format!("{rev} is commit {commit}")).await;
     if deployment.kind == DeploymentKind::Update {
         commit = builder
-            .update_input(repository.id, &repository.url, rev, &commit, "nixpkgs", log)
+            .update_inputs(repository.id, &repository.url, rev, &commit, log)
             .await?;
     }
     store.set_deployment_commit(id, &commit).await?;

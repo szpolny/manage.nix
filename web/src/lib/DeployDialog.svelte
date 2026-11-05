@@ -77,11 +77,11 @@
 		</label>
 		<label class="check">
 			<input type="checkbox" name="update_nixpkgs" bind:checked={updateNixpkgs} />
-			Update nixpkgs first
+			Update flake inputs first
 		</label>
 		{#if updateNixpkgs}
 			<p class="muted small">
-				The server runs <code>nix flake update nixpkgs</code> on the revision, which must be a
+				The server runs <code>nix flake update</code> on the revision, which must be a
 				branch, then commits the new <code>flake.lock</code> and pushes it there before building.
 				The repository's key needs write access.
 			</p>

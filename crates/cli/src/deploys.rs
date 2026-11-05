@@ -114,7 +114,7 @@ pub fn list(deployments: &[Deployment], now: OffsetDateTime) -> String {
                         _ => "-".to_owned(),
                     };
                     if d.kind == DeploymentKind::Update {
-                        format!("nixpkgs update, {rev}")
+                        format!("flake input update, {rev}")
                     } else {
                         rev
                     }
