@@ -69,7 +69,7 @@ jobs:
           skipPush: ${{ github.event_name != 'push' }}
       - run: |
           nix build -L --no-link \
-            .#checks.x86_64-linux.{versions,cargo-fmt,cargo-clippy,cargo-test,store-postgres} \
+            .#checks.x86_64-linux.{versions,darwin-local-https,cargo-fmt,cargo-clippy,cargo-test,store-postgres} \
             .#checks.x86_64-linux.{mnix,mnix-agent,mnix-server,mnix-web}
 
   vm:

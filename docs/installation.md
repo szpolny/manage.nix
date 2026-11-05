@@ -88,7 +88,9 @@ backend runs on `127.0.0.1:8080` with an SQLite database in
 The proxy generates a private local certificate authority and renews its
 certificates automatically. Its keys stay outside the Nix store in
 `/var/lib/manage-nix-https`. On macOS, the proxy installs the root in the
-system keychain on first start.
+system keychain on first start. Activation maintains a marked entry in
+`/etc/hosts`, preserving other entries. Disabling local HTTPS or the server
+removes that managed entry.
 
 On NixOS, installation automatically adds the public root to the system CA
 bundle and p11-kit trust source after the proxy starts. Existing configured

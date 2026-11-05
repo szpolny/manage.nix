@@ -14,6 +14,9 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     crane.url = "github:ipetkov/crane";
+    # Evaluate the Darwin modules in checks on every CI platform.
+    nix-darwin.url = "github:nix-darwin/nix-darwin/master";
+    nix-darwin.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =
@@ -21,6 +24,7 @@
       self,
       nixpkgs,
       crane,
+      nix-darwin,
     }:
     let
       inherit (nixpkgs) lib;
@@ -164,6 +168,10 @@
           );
 
           cargo-fmt = craneLib.cargoFmt { inherit (commonArgs) src pname version; };
+
+          darwin-local-https = import ./nix/tests/darwin-local-https.nix {
+            inherit self pkgs nix-darwin;
+          };
 
           # release-please bumps these together (release-please-config.json).
           versions =
