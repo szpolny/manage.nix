@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1-alpha](https://github.com/szpolny/manage.nix/compare/v0.4.0-alpha...v0.4.1-alpha) (2026-11-05)
+
+
+### Bug Fixes
+
+* **server:** resolve dirty-build revisions and hide Flatpak on macOS ([#8](https://github.com/szpolny/manage.nix/issues/8)) ([bd6247b](https://github.com/szpolny/manage.nix/commit/bd6247bf9acad1cc745020fb9e62cc550bf17e17))
+
 ## [0.4.0-alpha](https://github.com/szpolny/manage.nix/compare/v0.3.3-alpha...v0.4.0-alpha) (2026-11-05)
 
 
