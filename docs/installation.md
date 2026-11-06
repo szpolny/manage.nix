@@ -18,6 +18,12 @@ inputs.manage-nix.url = "github:szpolny/manage.nix/v0.4.2-alpha"; # x-release-pl
 Pick the latest tag from the
 [releases page](https://github.com/szpolny/manage.nix/releases).
 
+### Finding the running version
+
+Open **About** in the web UI navigation to see the running server version and
+its build revision when available. Nix builds include the flake revision; builds
+without revision metadata show “Not available”.
+
 ### Updating
 
 **Pinned to a release (recommended).** Change the tag in the URL, then run

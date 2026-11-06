@@ -33,6 +33,7 @@ const MAX_LOG_ENTRIES: u32 = 1000;
 
 pub fn routes(state: AppState) -> axum::Router<AppState> {
     Router::new()
+        .route("/api/version", get(version))
         .route("/api/machines", get(list_machines).post(create_machine))
         .route("/api/machines/{machine}", get(get_machine))
         .route(
@@ -84,6 +85,17 @@ pub fn routes(state: AppState) -> axum::Router<AppState> {
         .route("/api/session", get(auth::session).delete(auth::logout))
         .route("/api/session/password", put(auth::change_password))
         .route_layer(middleware::from_fn_with_state(state, auth::authenticate))
+}
+
+/// Metadata of the running server, independent of the static web assets.
+async fn version() -> impl axum::response::IntoResponse {
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "revision": option_env!("MNIX_BUILD_REVISION").filter(|rev| !rev.is_empty()),
+        })),
+    )
 }
 
 /// Repository names by ID, for views.

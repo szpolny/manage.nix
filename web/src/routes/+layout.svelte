@@ -40,6 +40,11 @@
 			href: '/repositories',
 			label: 'Repositories',
 			icon: 'M6 3v12M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM18 9a9 9 0 0 1-9 9'
+		},
+		{
+			href: '/about',
+			label: 'About',
+			icon: 'M12 11v6M12 7h.01M22 12a10 10 0 1 1-20 0 10 10 0 0 1 20 0'
 		}
 	];
 

@@ -41,6 +41,13 @@ hot reload at <http://localhost:5173>. Log in as `admin` / `dev-password`.
 - To add a dependency, run `npm install`. Nix reads every package from
   `package-lock.json`.
 
+For Cargo builds, set `MNIX_BUILD_REVISION` at compile time to include a source
+revision in the About view. Nix package builds set this automatically. For example:
+
+```sh
+MNIX_BUILD_REVISION=$(git rev-parse HEAD) cargo build -p mnix-server
+```
+
 ## Database queries
 
 Queries use sqlx's checked macros against the committed offline data in

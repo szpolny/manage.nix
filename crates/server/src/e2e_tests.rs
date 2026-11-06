@@ -427,6 +427,24 @@ async fn receive(
 }
 
 #[tokio::test]
+async fn version_reports_the_running_server_build() {
+    let server = start(Duration::from_secs(30)).await;
+    assert_eq!(
+        server.request("GET", "/api/version", None, None).await.0,
+        401
+    );
+    let (status, body) = server.admin("GET", "/api/version", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        body,
+        json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "revision": option_env!("MNIX_BUILD_REVISION").filter(|rev| !rev.is_empty()),
+        })
+    );
+}
+
+#[tokio::test]
 async fn the_admin_api_requires_the_admin_token() {
     let server = start(Duration::from_secs(30)).await;
     assert_eq!(

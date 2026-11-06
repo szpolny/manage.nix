@@ -67,6 +67,7 @@
               commonArgs
               // {
                 inherit cargoArtifacts;
+                MNIX_BUILD_REVISION = self.rev or self.dirtyRev or "";
                 pname = bin;
                 cargoExtraArgs = "--locked -p ${crate}";
                 # Tests run once for the whole workspace in `checks.cargo-test`.

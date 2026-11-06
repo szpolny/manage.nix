@@ -60,6 +60,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 const enc = encodeURIComponent;
 
 export const api = {
+	version: () => request<{ version: string; revision: string | null }>('GET', '/api/version'),
 	session: () => request<Session>('GET', '/api/session'),
 	login: (username: string, password: string) =>
 		request<Session>('POST', '/api/session', { username, password }),
