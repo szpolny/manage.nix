@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.3-alpha](https://github.com/szpolny/manage.nix/compare/v0.4.2-alpha...v0.4.3-alpha) (2026-11-06)
+
+
+### Features
+
+* **services:** add machine service inspection ([daae755](https://github.com/szpolny/manage.nix/commit/daae755a7dde48f895d897f52ba124bbf366632a))
+* **web:** display running application version (MN-13) ([b4c98ed](https://github.com/szpolny/manage.nix/commit/b4c98edef8b433227ea36a0dfcec195ed08061ca))
+
 ## [0.4.2-alpha](https://github.com/szpolny/manage.nix/compare/v0.4.1-alpha...v0.4.2-alpha) (2026-11-05)
 
 
