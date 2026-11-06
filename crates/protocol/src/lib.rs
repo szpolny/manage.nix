@@ -220,6 +220,9 @@ impl ActivationPhase {
 /// What a machine reports about itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Facts {
+    /// Latest service inspection; absent on older agents.
+    #[serde(default)]
+    pub services: Option<ServiceSnapshot>,
     #[serde(default)]
     pub flatpak_updates: Option<Vec<String>>,
     pub hostname: String,
@@ -245,6 +248,25 @@ pub struct Facts {
     pub reboot_required: bool,
     /// Generations of the system profile, oldest first.
     pub generations: Vec<Generation>,
+}
+
+/// A service inspection, including unsuccessful attempts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceSnapshot {
+    pub refreshed_at: String,
+    pub error: Option<String>,
+    pub services: Vec<MachineService>,
+}
+
+/// Public service state without environment variables or command arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineService {
+    pub name: String,
+    pub description: String,
+    pub state: String,
+    pub active_state: String,
+    pub sub_state: String,
+    pub load_state: String,
 }
 
 /// The kind of system a machine runs.

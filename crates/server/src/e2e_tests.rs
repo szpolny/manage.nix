@@ -392,6 +392,7 @@ impl Server {
 
 fn facts(hostname: &str) -> Facts {
     Facts {
+        services: None,
         flatpak_updates: None,
         hostname: hostname.to_owned(),
         current_system: "/nix/store/00000000000000000000000000000000-nixos-system-a".to_owned(),
@@ -577,6 +578,18 @@ async fn sessions_report_facts_and_go_offline() {
         .unwrap();
     let mut updated = facts("web-1");
     updated.reboot_required = true;
+    updated.services = Some(mnix_protocol::ServiceSnapshot {
+        refreshed_at: "2026-11-06T12:00:00Z".into(),
+        error: None,
+        services: vec![mnix_protocol::MachineService {
+            name: "example.service".into(),
+            description: "Example service".into(),
+            state: "failed".into(),
+            active_state: "failed".into(),
+            sub_state: "failed".into(),
+            load_state: "loaded".into(),
+        }],
+    });
     ws.send(text(&AgentMessage::Facts {
         facts: updated.clone(),
     }))

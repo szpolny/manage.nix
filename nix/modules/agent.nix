@@ -62,6 +62,7 @@ in
         path = [
           config.nix.package
           pkgs.git
+          pkgs.systemd
           pkgs.util-linux
           pkgs.coreutils
         ]

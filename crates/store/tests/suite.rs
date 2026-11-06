@@ -137,6 +137,7 @@ const T0: OffsetDateTime = datetime!(2026-10-22 08:00:00.123456 UTC);
 
 fn facts(hostname: &str) -> Facts {
     Facts {
+        services: None,
         flatpak_updates: None,
         hostname: hostname.to_owned(),
         current_system: "/nix/store/00000000000000000000000000000000-nixos-system".to_owned(),

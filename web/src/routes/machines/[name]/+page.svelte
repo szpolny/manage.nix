@@ -2,6 +2,7 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { api, ApiError, errorMessage } from '#lib/api.ts';
+	import Services from '#lib/Services.svelte';
 	import Badge from '#lib/Badge.svelte';
 	import DeployDialog from '#lib/DeployDialog.svelte';
 	import Dialog from '#lib/Dialog.svelte';
@@ -353,6 +354,8 @@
 			{#if saved}<p class="muted small" role="status">Saved {saved}.</p>{/if}
 		</section>
 	</div>
+
+	<Services snapshot={machine.facts?.services} online={machine.status === 'online'} {now} />
 
 	<section class="section" data-testid="package-updates">
 		<h2>Package updates</h2>

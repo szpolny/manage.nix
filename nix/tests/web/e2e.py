@@ -32,7 +32,7 @@ def login(page: Page) -> None:
     password.fill(PASSWORD)
     expect(username).to_have_value("admin")
     page.get_by_role("button", name="Log in").click()
-    expect(page.get_by_role("heading", name="Machines")).to_be_visible(timeout=30_000)
+    expect(page.get_by_role("heading", name="Machines", exact=True)).to_be_visible(timeout=30_000)
     expect(page.get_by_role("link", name="admin")).to_be_visible()
 
 
@@ -51,6 +51,24 @@ def configure(page: Page, machine: str, repository: str) -> None:
     header = page.locator(".page-header [data-status]")
     # The agent enrolls and connects; the page refreshes every 5 seconds.
     expect(header).to_have_attribute("data-status", "online", timeout=120_000)
+    services = page.get_by_test_id("services")
+    expect(services).to_contain_text("Last inspection")
+    for name, state in [
+        ("mnix-agent.service", "running"),
+        ("systemd-tmpfiles-clean.service", "stopped"),
+        ("mnix-inspect-failed.service", "failed"),
+    ]:
+        services.get_by_label("Find service").fill(name)
+        services.get_by_role("combobox").select_option(state)
+        row = services.locator("tbody tr")
+        expect(row).to_have_count(1, timeout=60_000)
+        expect(row.locator("td").nth(1)).to_have_text(state)
+        row.locator("summary").click()
+        expect(row.get_by_text("Active state", exact=True)).to_be_visible()
+        expect(row.get_by_text("Load state", exact=True)).to_be_visible()
+    services.get_by_label("Find service").fill("")
+    services.get_by_role("combobox").select_option("all")
+
     page.get_by_label("Repository").select_option(repository)
     page.get_by_role("button", name="Save", exact=True).click()
     expect(page.get_by_role("status")).to_have_text("Saved configuration.")

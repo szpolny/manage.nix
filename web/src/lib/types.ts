@@ -30,7 +30,14 @@ export interface Generation {
 
 export type Os = 'nixos' | 'darwin';
 
+export interface ServiceSnapshot {
+ refreshed_at: string;
+ error: string | null;
+ services: { name: string; description: string; state: string; active_state: string; sub_state: string; load_state: string }[];
+}
+
 export interface Facts {
+ services?: ServiceSnapshot | null;
 	flatpak_updates?: string[] | null;
 	hostname: string;
 	os: Os;

@@ -22,6 +22,7 @@ pub fn collect() -> anyhow::Result<Facts> {
         Os::Darwin => "darwin-version",
     };
     Ok(Facts {
+        services: Some(crate::services::collect()),
         flatpak_updates: flatpak_updates(),
         hostname: hostname()?,
         os: OS,

@@ -288,6 +288,9 @@ pkgs.testers.runNixOSTest {
             machine1.wait_for_unit("multi-user.target")
             machine1.succeed(f"echo {token} > ${tokenFile}")
             machine1.systemctl("restart mnix-agent.service")
+            machine1.succeed("systemctl stop systemd-tmpfiles-clean.service")
+            machine1.succeed("systemd-run --unit=mnix-inspect-failed /run/current-system/sw/bin/false")
+            machine1.wait_until_succeeds("systemctl is-failed mnix-inspect-failed.service")
             browser("configure machine1 infra")
 
         with subtest("the browser deploys revision a and follows it to the end"):
