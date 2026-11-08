@@ -54,6 +54,7 @@ struct MachineRow {
     repository_id: Option<Uuid>,
     configuration: Option<String>,
     tags: Vec<String>,
+    auto_prebuild: bool,
     auto_update_nixpkgs: bool,
     auto_update_flatpak: bool,
 }
@@ -75,6 +76,7 @@ impl From<MachineRow> for Machine {
             configuration: row.configuration,
             tags: row.tags,
             auto_update: AutoUpdate {
+                prebuild: row.auto_prebuild,
                 nixpkgs: row.auto_update_nixpkgs,
                 flatpak: row.auto_update_flatpak,
             },
@@ -192,7 +194,7 @@ macro_rules! select_machines {
                           SELECT tag FROM machine_tags AS t
                           WHERE t.machine_id = machines.id ORDER BY tag COLLATE "C"
                       ) AS "tags!",
-                      auto_update_nixpkgs, auto_update_flatpak
+                      auto_prebuild, auto_update_nixpkgs, auto_update_flatpak
                FROM machines "# + $($where)*
         )
     };
@@ -645,9 +647,10 @@ impl Store for PostgresStore {
         auto_update: AutoUpdate,
     ) -> Result<()> {
         sqlx::query!(
-            "UPDATE machines SET auto_update_nixpkgs = $1, auto_update_flatpak = $2 WHERE id = $3",
+            "UPDATE machines SET auto_update_nixpkgs = $1, auto_update_flatpak = $2, auto_prebuild = $3 WHERE id = $4",
             auto_update.nixpkgs,
             auto_update.flatpak,
+            auto_update.prebuild,
             machine_id
         )
         .execute(&self.pool)

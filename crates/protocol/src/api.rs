@@ -230,11 +230,14 @@ pub struct CreateFlatpakUpdate {
     pub requested_by: Option<String>,
 }
 
-/// `PUT /api/machines/:machine/auto-update`: which updates the server
-/// applies to the machine on its own, at most once a day each, while the
-/// machine is online and has no deployment in progress.
+/// `PUT /api/machines/:machine/auto-update`: automatic updates and optional
+/// prebuilds, while the machine is online and has no deployment in progress.
+/// Updates run at most daily; prebuilds may run sooner for new commits.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AutoUpdate {
+    /// Prebuild available Nix updates on the server without activating them.
+    #[serde(default)]
+    pub prebuild: bool,
     /// Update the repository's flake inputs and deploy it when upstream
     /// has a newer revision.
     #[serde(default)]
@@ -299,6 +302,9 @@ pub struct UpdateSummary {
 /// system. `GET` on the same path returns the latest preview.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreatePreview {
+    /// Refresh flake inputs for this build without writing the lock.
+    #[serde(default)]
+    pub update_nixpkgs: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rev: Option<String>,
 }
@@ -313,6 +319,9 @@ pub enum PreviewStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Preview {
+    /// Whether this preview builds with refreshed flake inputs.
+    #[serde(default)]
+    pub update_nixpkgs: bool,
     pub status: PreviewStatus,
     pub rev: String,
     /// The commit `rev` resolved to, once fetched.

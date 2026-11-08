@@ -23,7 +23,7 @@ The admin token lives in `/var/lib/manage-nix/admin-token` unless you set
 | `mnix machine configure <machine> --repo <repo>` | Build the machine from a repository |
 | `mnix machine tag <machine> <tag>...` | Add tags |
 | `mnix machine untag <machine> <tag>...` | Remove tags |
-| `mnix machine auto-update <machine> [--nixpkgs <bool>] [--flatpak <bool>]` | Choose the updates the server applies on its own |
+| `mnix machine auto-update <machine> [--nixpkgs <bool>] [--flatpak <bool>] [--prebuild <bool>]` | Choose automatic updates and prebuilds |
 
 ## Repositories
 

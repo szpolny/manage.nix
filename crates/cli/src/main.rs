@@ -267,8 +267,8 @@ enum MachineCommand {
         #[arg(required = true)]
         tags: Vec<String>,
     },
-    /// Choose which updates the server applies to a machine on its own, at
-    /// most once a day each. Unset options keep their current value.
+    /// Choose automatic updates and prebuilds for a machine.
+    /// Unset options keep their current value.
     AutoUpdate {
         machine: String,
         /// Update all flake inputs and deploy it when upstream is newer.
@@ -277,6 +277,9 @@ enum MachineCommand {
         /// Update Flatpak apps and runtimes when updates are available.
         #[arg(long)]
         flatpak: Option<bool>,
+        /// Prebuild available Nix updates without switching the machine.
+        #[arg(long)]
+        prebuild: Option<bool>,
     },
 }
 
@@ -380,22 +383,25 @@ fn main() -> anyhow::Result<ExitCode> {
             machine,
             nixpkgs,
             flatpak,
+            prebuild,
         }) => {
             let path = format!("/api/machines/{}", client::escape(&machine));
             let current: Machine = client.get(&path)?;
             let updated: Machine = client.put(
                 &format!("{path}/auto-update"),
                 &AutoUpdate {
+                    prebuild: prebuild.unwrap_or(current.auto_update.prebuild),
                     nixpkgs: nixpkgs.unwrap_or(current.auto_update.nixpkgs),
                     flatpak: flatpak.unwrap_or(current.auto_update.flatpak),
                 },
             )?;
             let on = |b: bool| if b { "on" } else { "off" };
             eprintln!(
-                "{}: flake input auto-update {}, Flatpak auto-update {}",
+                "{}: flake input auto-update {}, Flatpak auto-update {}, auto-prebuild {}",
                 updated.name,
                 on(updated.auto_update.nixpkgs),
-                on(updated.auto_update.flatpak)
+                on(updated.auto_update.flatpak),
+                on(updated.auto_update.prebuild)
             );
         }
         Command::Repos { json } => {
@@ -575,7 +581,13 @@ fn finish(
 /// Starts a preview of `rev` and waits for it to finish.
 fn build_preview(client: &Client, path: &str, rev: Option<String>) -> anyhow::Result<Preview> {
     let path = format!("{path}/preview");
-    let mut preview: Preview = client.post(&path, &CreatePreview { rev })?;
+    let mut preview: Preview = client.post(
+        &path,
+        &CreatePreview {
+            rev,
+            ..Default::default()
+        },
+    )?;
     eprintln!("Building the new system on the server…");
     while preview.status == PreviewStatus::Building {
         std::thread::sleep(Duration::from_secs(2));

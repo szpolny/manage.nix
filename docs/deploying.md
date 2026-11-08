@@ -146,6 +146,34 @@ kind runs at most once a day per machine, even if it failed, and shows up in
 the history as requested by `auto-update`. Automatic flake input updates deploy
 the branch the machine was last deployed from, with `switch`.
 
+### Prebuilding updates
+
+Enable **Automatically prebuild Nix updates** on a machine's page, or run:
+
+```sh
+mnix machine auto-update web-1 --prebuild true
+```
+
+This setting is off by default and independent of automatic deployment. With
+server-side builds enabled, the server checks every 15 minutes while the machine
+is online and idle. When new repository commits or flake input updates are
+available, it builds the latest configuration with refreshed inputs. It does not
+write or push a lock file, activate a system, or update Flatpaks. Build status and
+package changes appear in the machine's update preview.
+
+Only one automatic prebuild runs at a time. The same configuration is attempted
+at most once a day, including failures; a new repository commit can trigger a
+build sooner. Restarting the server resets this cooldown. Turning the setting
+off prevents future builds; a running build finishes normally.
+
+The latest preview is kept in the server's Nix store with a garbage collector
+root, using extra CPU and disk space. Later deployments reuse matching packages,
+which reduces build time before switching. Inputs that change again, packages
+that depend on the configuration's commit, and packages built on the machine
+may still need building. A later preview replaces the retained preview system.
+
+Disable it with `mnix machine auto-update web-1 --prebuild false`.
+
 ## Reboot
 
 ```sh

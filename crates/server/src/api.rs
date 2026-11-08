@@ -376,11 +376,16 @@ async fn set_auto_update(
     Json(request): Json<AutoUpdate>,
 ) -> Result<Json<Machine>, ApiError> {
     let machine = find_machine(&state, &machine).await?;
-    if request.nixpkgs && machine.configuration.is_none() {
+    if (request.nixpkgs || request.prebuild) && machine.configuration.is_none() {
         return Err(ApiError::bad_request(format!(
             "{} has no configuration; set one with `mnix machine configure`",
             machine.name
         )));
+    }
+    if request.prebuild && state.builder.build_on != crate::build::BuildOn::Server {
+        return Err(ApiError::bad_request(
+            "automatic prebuilds require server-side builds",
+        ));
     }
     state
         .store
@@ -390,7 +395,7 @@ async fn set_auto_update(
         .event(
             Some(machine.id),
             "auto_update_set",
-            serde_json::json!({ "nixpkgs": request.nixpkgs, "flatpak": request.flatpak }),
+            serde_json::json!({ "nixpkgs": request.nixpkgs, "flatpak": request.flatpak, "prebuild": request.prebuild }),
         )
         .await;
     get_machine(State(state), Path(machine.id.to_string())).await

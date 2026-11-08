@@ -91,8 +91,9 @@ export interface Machine {
 	auto_update: AutoUpdate;
 }
 
-/** Updates the server applies on its own, at most once a day each. */
+/** Automatic updates and optional Nix prebuilds. */
 export interface AutoUpdate {
+	prebuild: boolean;
 	nixpkgs: boolean;
 	flatpak: boolean;
 }
@@ -212,6 +213,7 @@ export interface UpdateSummary {
 export type PreviewStatus = 'building' | 'succeeded' | 'failed';
 
 export interface Preview {
+	update_nixpkgs: boolean;
 	status: PreviewStatus;
 	rev: string;
 	commit: string | null;

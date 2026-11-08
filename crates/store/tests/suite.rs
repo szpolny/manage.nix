@@ -589,6 +589,7 @@ store_test!(
 
         assert_eq!(record.auto_update, AutoUpdate::default());
         let auto_update = AutoUpdate {
+            prebuild: true,
             nixpkgs: true,
             flatpak: false,
         };

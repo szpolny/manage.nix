@@ -37,6 +37,7 @@ const MAX_COMMITS: usize = 50;
 /// Update checks' and previews' state in the server.
 #[derive(Default)]
 pub struct Tracker {
+    prebuilds: tokio::sync::Mutex<HashMap<Uuid, (String, OffsetDateTime)>>,
     nixpkgs: tokio::sync::Mutex<HashMap<String, (OffsetDateTime, Option<bool>)>>,
     /// When each repository was last fetched.
     fetched: tokio::sync::Mutex<HashMap<Uuid, OffsetDateTime>>,
@@ -360,6 +361,55 @@ pub async fn nixpkgs_update(
     Ok((updates.nixpkgs_available == Some(true)).then_some(updates.rev))
 }
 
+/// Starts at most one background preview at a time, once a day for an
+/// unchanged configuration. A new repository commit can be prepared sooner.
+pub async fn prebuild(state: &AppStateRef, machine: mnix_store::Machine) -> anyhow::Result<()> {
+    if state.builder.build_on != build::BuildOn::Server {
+        return Ok(());
+    }
+    let subject = subject(state, machine.clone())
+        .await
+        .map_err(|e| anyhow::anyhow!(e.message))?;
+    let updates = check(state, &subject, None).await?;
+    if updates.behind.unwrap_or(0) == 0 && updates.nixpkgs_available != Some(true) {
+        return Ok(());
+    }
+    let key = format!(
+        "{}:{:?}:{:?}:{:?}",
+        updates.commit, subject.current_system, machine.repository_id, machine.configuration
+    );
+    let now = OffsetDateTime::now_utc();
+    let mut attempts = state.updates.prebuilds.lock().await;
+    if attempts
+        .get(&machine.id)
+        .is_some_and(|(previous, at)| previous == &key && now - *at < crate::auto_update::INTERVAL)
+    {
+        return Ok(());
+    }
+    if state
+        .updates
+        .previews
+        .lock()
+        .expect("previews lock")
+        .values()
+        .any(|p| p.status == PreviewStatus::Building)
+    {
+        return Ok(());
+    }
+    let _ = start_preview(
+        state.clone(),
+        machine.clone(),
+        CreatePreview {
+            rev: Some(updates.commit),
+            update_nixpkgs: true,
+        },
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!(e.message))?;
+    attempts.insert(machine.id, (key, now));
+    Ok(())
+}
+
 /// `GET /api/machines/:machine/updates/preview`
 pub async fn get_preview(
     State(state): State<AppStateRef>,
@@ -389,6 +439,14 @@ pub async fn create_preview(
         crate::deploy::validate_rev(rev)?;
     }
     let machine = api::find_machine(&state, &machine).await?;
+    start_preview(state, machine, request).await
+}
+
+async fn start_preview(
+    state: AppStateRef,
+    machine: mnix_store::Machine,
+    request: CreatePreview,
+) -> Result<(StatusCode, Json<Preview>), ApiError> {
     let subject = subject(&state, machine).await?;
     let Some(from) = subject.current_system.clone() else {
         return Err(ApiError::new(
@@ -397,6 +455,7 @@ pub async fn create_preview(
         ));
     };
     let preview = Preview {
+        update_nixpkgs: request.update_nixpkgs,
         status: PreviewStatus::Building,
         rev: request.rev.clone().unwrap_or_default(),
         commit: None,
@@ -425,7 +484,7 @@ pub async fn create_preview(
     tokio::spawn(async move {
         let machine_id = subject.machine.id;
         let timeout = task_state.settings.build_timeout;
-        let result = tokio::time::timeout(timeout, run_preview(&task_state, &subject, request.rev))
+        let result = tokio::time::timeout(timeout, run_preview(&task_state, &subject, request))
             .await
             .unwrap_or_else(|_| {
                 Err(anyhow::anyhow!(
@@ -454,7 +513,7 @@ pub async fn create_preview(
 async fn run_preview(
     state: &AppState,
     subject: &Subject,
-    rev: Option<String>,
+    request: CreatePreview,
 ) -> anyhow::Result<()> {
     let id = subject.machine.id;
     let update = |change: &dyn Fn(&mut Preview)| {
@@ -469,7 +528,7 @@ async fn run_preview(
         }
     };
     let (mirror, _) = state.updates.fetch(state, &subject.repository).await?;
-    let rev = match rev {
+    let rev = match request.rev {
         Some(rev) => rev,
         None => default_rev(&mirror, subject.deployed_rev.as_deref()).await,
     };
@@ -496,7 +555,12 @@ async fn run_preview(
         .join(format!("preview-{id}"));
     let to = state
         .builder
-        .nix_build(&installable, &out_link, &mut Log::discard())
+        .nix_build_preview(
+            &installable,
+            &out_link,
+            request.update_nixpkgs,
+            &mut Log::discard(),
+        )
         .await?;
     update(&|p| p.to = Some(to.to_string()));
     let from = StorePath::parse(subject.current_system.as_deref().unwrap_or_default())?;

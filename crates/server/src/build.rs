@@ -404,27 +404,40 @@ impl Builder {
         out_link: &Path,
         log: &mut Log,
     ) -> anyhow::Result<StorePath> {
+        self.nix_build_preview(installable, out_link, false, log)
+            .await
+    }
+
+    /// Builds a preview, optionally refreshing inputs without changing its lock.
+    pub async fn nix_build_preview(
+        &self,
+        installable: &str,
+        out_link: &Path,
+        update_nixpkgs: bool,
+        log: &mut Log,
+    ) -> anyhow::Result<StorePath> {
         if let Some(dir) = out_link.parent() {
             tokio::fs::create_dir_all(dir).await?;
         }
         log.line(format!("building {installable}")).await;
         let started = Instant::now();
-        let out = run(
-            Command::new("nix")
-                .args([
-                    "--extra-experimental-features",
-                    "nix-command flakes",
-                    "build",
-                    "--print-build-logs",
-                    "--print-out-paths",
-                    "--no-write-lock-file",
-                    "--out-link",
-                ])
-                .arg(out_link)
-                .arg(installable),
-            log,
-        )
-        .await?;
+        let mut command = Command::new("nix");
+        command
+            .args([
+                "--extra-experimental-features",
+                "nix-command flakes",
+                "build",
+                "--print-build-logs",
+                "--print-out-paths",
+                "--no-write-lock-file",
+                "--out-link",
+            ])
+            .arg(out_link);
+        if update_nixpkgs {
+            command.args(["--recreate-lock-file", "--refresh"]);
+        }
+        command.arg(installable);
+        let out = run(&mut command, log).await?;
         let store_path = out
             .lines()
             .last()

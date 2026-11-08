@@ -453,6 +453,21 @@
 				</ul>
 			</details>
 		{/if}
+		<label class="check">
+			<input
+				type="checkbox"
+				name="auto_prebuild"
+				checked={machine.auto_update.prebuild}
+				disabled={!machine.repository}
+				onchange={(e) => setAutoUpdate({ prebuild: e.currentTarget.checked })}
+			/>
+			Automatically prebuild Nix updates
+		</label>
+		<p class="muted small">
+			Builds the latest configuration with refreshed flake inputs on the server, without switching
+			the machine. Checks every 15 minutes while online and idle; unchanged configurations run at
+			most daily. Requires server-side builds. Uses extra CPU and disk space.
+		</p>
 		{#if autoUpdateError}<p class="error" role="alert">{autoUpdateError}</p>{/if}
 		<p class="muted small">
 			Checks refresh every 15 minutes. Updating flake inputs commits the new <code>flake.lock</code> to
@@ -546,7 +561,7 @@
 				<div data-testid="preview">
 					{#if preview.status === 'building'}
 						<p class="muted">
-							Building {preview.rev || 'the default revision'}{preview.commit
+							Building {preview.update_nixpkgs ? 'with refreshed flake inputs: ' : ''}{preview.rev || 'the default revision'}{preview.commit
 								? ` (${preview.commit.slice(0, 12)})`
 								: ''} on the server, started {ago(preview.started_at, now)}…
 						</p>
@@ -555,6 +570,7 @@
 					{:else}
 						<p class="muted small">
 							Package changes from the running system to {preview.rev}
+							{#if preview.update_nixpkgs}with refreshed flake inputs{/if}
 							{#if preview.commit}(<span class="mono">{preview.commit.slice(0, 12)}</span>){/if},
 							built {ago(preview.finished_at, now)}:
 						</p>

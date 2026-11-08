@@ -7,6 +7,8 @@
 //! something to update. Flatpak updates run first; the flake input update
 //! follows at a later poll. Deployments the scheduler starts are
 //! requested by [`REQUESTED_BY`], which is how it finds its last attempt.
+//! Machines can independently opt into prebuilding available Nix updates,
+//! using the preview builder without activation or repository changes.
 
 use std::time::Duration;
 
@@ -17,7 +19,7 @@ use mnix_protocol::ActivationMode;
 use mnix_store::Machine;
 use time::OffsetDateTime;
 
-use crate::app::{AppState, State};
+use crate::app::State;
 use crate::{api, deploy, updates};
 
 /// How often the scheduler looks for due updates.
@@ -46,9 +48,12 @@ pub async fn run(state: State) {
 }
 
 /// One pass over every machine.
-pub async fn run_once(state: &AppState) -> anyhow::Result<()> {
+pub async fn run_once(state: &State) -> anyhow::Result<()> {
     for machine in state.store.machines(state.organization.id).await? {
-        if machine.auto_update.nixpkgs || machine.auto_update.flatpak {
+        if machine.auto_update.nixpkgs
+            || machine.auto_update.flatpak
+            || machine.auto_update.prebuild
+        {
             if let Err(e) = update(state, machine.clone()).await {
                 tracing::warn!("auto-update {}: {e:#}", machine.name);
             }
@@ -57,7 +62,7 @@ pub async fn run_once(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn update(state: &AppState, machine: Machine) -> anyhow::Result<()> {
+async fn update(state: &State, machine: Machine) -> anyhow::Result<()> {
     let now = OffsetDateTime::now_utc();
     if api::status(&machine, now, state.settings.heartbeat_timeout) != MachineStatus::Online {
         return Ok(());
@@ -105,7 +110,7 @@ async fn update(state: &AppState, machine: Machine) -> anyhow::Result<()> {
     if machine.auto_update.nixpkgs && due(DeploymentKind::Update) {
         let name = machine.name.clone();
         let target = machine.id.to_string();
-        if let Some(rev) = updates::nixpkgs_update(state, machine).await? {
+        if let Some(rev) = updates::nixpkgs_update(state, machine.clone()).await? {
             let id = deploy::create(
                 state,
                 CreateDeployment {
@@ -119,7 +124,11 @@ async fn update(state: &AppState, machine: Machine) -> anyhow::Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!(e.message))?;
             tracing::info!("auto-update {name}: flake inputs on {rev} in deployment {id}");
+            return Ok(());
         }
+    }
+    if machine.auto_update.prebuild {
+        updates::prebuild(state, machine).await?;
     }
     Ok(())
 }

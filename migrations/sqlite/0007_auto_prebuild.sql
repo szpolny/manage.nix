@@ -1,0 +1,1 @@
+ALTER TABLE machines ADD COLUMN auto_prebuild BOOLEAN NOT NULL DEFAULT 0;

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, organization_id, name, created_at, enrolled_at, agent_version,\n                      facts AS \"facts: Json<Facts>\", facts_updated_at, last_seen_at,\n                      EXISTS (\n                          SELECT 1 FROM agent_sessions AS s\n                          WHERE s.machine_id = machines.id AND s.disconnected_at IS NULL\n                      ) AS \"connected!\",\n                      repository_id, configuration,\n                      ARRAY(\n                          SELECT tag FROM machine_tags AS t\n                          WHERE t.machine_id = machines.id ORDER BY tag COLLATE \"C\"\n                      ) AS \"tags!\",\n                      auto_update_nixpkgs, auto_update_flatpak\n               FROM machines WHERE credential_hash = $1",
+  "query": "SELECT id, organization_id, name, created_at, enrolled_at, agent_version,\n                      facts AS \"facts: Json<Facts>\", facts_updated_at, last_seen_at,\n                      EXISTS (\n                          SELECT 1 FROM agent_sessions AS s\n                          WHERE s.machine_id = machines.id AND s.disconnected_at IS NULL\n                      ) AS \"connected!\",\n                      repository_id, configuration,\n                      ARRAY(\n                          SELECT tag FROM machine_tags AS t\n                          WHERE t.machine_id = machines.id ORDER BY tag COLLATE \"C\"\n                      ) AS \"tags!\",\n                      auto_prebuild, auto_update_nixpkgs, auto_update_flatpak\n               FROM machines WHERE organization_id = $1 ORDER BY name COLLATE \"C\"",
   "describe": {
     "columns": [
       {
@@ -70,18 +70,23 @@
       },
       {
         "ordinal": 13,
-        "name": "auto_update_nixpkgs",
+        "name": "auto_prebuild",
         "type_info": "Bool"
       },
       {
         "ordinal": 14,
+        "name": "auto_update_nixpkgs",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 15,
         "name": "auto_update_flatpak",
         "type_info": "Bool"
       }
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -99,8 +104,9 @@
       true,
       null,
       false,
+      false,
       false
     ]
   },
-  "hash": "b995d28e1cd8b7462cf3199f073b438bc21c53931eab8d79c77d7ae3dbd69cc8"
+  "hash": "5dc1dc2222f34b289af6800a62f27f835220bb76217c1c012d36693262765fcb"
 }

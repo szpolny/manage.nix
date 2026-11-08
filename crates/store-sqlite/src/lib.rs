@@ -99,6 +99,7 @@ struct MachineRow {
     configuration: Option<String>,
     /// A JSON array.
     tags: String,
+    auto_prebuild: bool,
     auto_update_nixpkgs: bool,
     auto_update_flatpak: bool,
 }
@@ -122,6 +123,7 @@ impl TryFrom<MachineRow> for Machine {
             configuration: row.configuration,
             tags: serde_json::from_str(&row.tags)?,
             auto_update: AutoUpdate {
+                prebuild: row.auto_prebuild,
                 nixpkgs: row.auto_update_nixpkgs,
                 flatpak: row.auto_update_flatpak,
             },
@@ -264,7 +266,7 @@ macro_rules! select_machines {
                           SELECT tag FROM machine_tags AS t
                           WHERE t.machine_id = machines.id ORDER BY tag
                       )) AS "tags!: String",
-                      auto_update_nixpkgs, auto_update_flatpak
+                      auto_prebuild, auto_update_nixpkgs, auto_update_flatpak
                FROM machines "# + $($where)*
         )
     };
@@ -750,9 +752,10 @@ impl Store for SqliteStore {
     ) -> Result<()> {
         let machine_id = id(machine_id);
         sqlx::query!(
-            "UPDATE machines SET auto_update_nixpkgs = ?, auto_update_flatpak = ? WHERE id = ?",
+            "UPDATE machines SET auto_update_nixpkgs = ?, auto_update_flatpak = ?, auto_prebuild = ? WHERE id = ?",
             auto_update.nixpkgs,
             auto_update.flatpak,
+            auto_update.prebuild,
             machine_id
         )
         .execute(&self.pool)

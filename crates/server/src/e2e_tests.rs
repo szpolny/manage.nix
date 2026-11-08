@@ -1784,16 +1784,31 @@ async fn updates_list_the_commits_a_machine_lacks() {
         .admin("GET", "/api/machines/web-1/updates/preview", None)
         .await;
     assert_eq!(status, 404, "{body}");
+    // Off by default: a scheduler pass does not start a preview.
+    crate::auto_update::run_once(&server.state).await.unwrap();
+    assert_eq!(
+        server
+            .admin("GET", "/api/machines/web-1/updates/preview", None)
+            .await
+            .0,
+        404
+    );
     let (status, body) = server
         .admin(
-            "POST",
-            "/api/machines/web-1/updates/preview",
-            Some(json!({})),
+            "PUT",
+            "/api/machines/web-1/auto-update",
+            Some(json!({ "prebuild": true })),
         )
         .await;
-    assert_eq!(status, 202, "{body}");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["auto_update"]["prebuild"], true);
+    crate::auto_update::run_once(&server.state).await.unwrap();
+    let (status, body) = server
+        .admin("GET", "/api/machines/web-1/updates/preview", None)
+        .await;
+    assert_eq!(status, 200, "{body}");
     let preview: Preview = serde_json::from_value(body).unwrap();
-    assert_eq!(preview.status, PreviewStatus::Building);
+    assert!(preview.update_nixpkgs);
     assert_eq!(preview.from, facts("web-1").current_system);
     let preview = loop {
         let (status, body) = server
@@ -1807,10 +1822,54 @@ async fn updates_list_the_commits_a_machine_lacks() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     assert_eq!(preview.status, PreviewStatus::Failed);
-    assert_eq!(preview.rev, "HEAD");
+    assert_eq!(preview.commit.as_deref(), Some(preview.rev.as_str()));
     assert!(preview.commit.is_some());
     assert!(preview.message.is_some());
     assert!(preview.finished_at.is_some());
+
+    // Failures are throttled too, and prebuilding never deploys or writes a commit.
+    crate::auto_update::run_once(&server.state).await.unwrap();
+    let (_, body) = server
+        .admin("GET", "/api/machines/web-1/updates/preview", None)
+        .await;
+    assert_eq!(body["started_at"], preview.started_at);
+    let (_, history) = server
+        .admin("GET", "/api/machines/web-1/deployments", None)
+        .await;
+    assert!(history.as_array().unwrap().is_empty());
+    assert_eq!(git(&work, &["log", "-1", "--format=%s"]), "change 4");
+
+    // Disabling prevents further builds even when a new commit becomes available.
+    let (status, body) = server
+        .admin(
+            "PUT",
+            "/api/machines/web-1/auto-update",
+            Some(json!({ "prebuild": false })),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    std::fs::write(work.join("README"), "five\n").unwrap();
+    git(&work, &["commit", "--quiet", "-am", "change 5"]);
+    server.state.updates.forget_fetches().await;
+    crate::auto_update::run_once(&server.state).await.unwrap();
+    let (_, body) = server
+        .admin("GET", "/api/machines/web-1/updates/preview", None)
+        .await;
+    assert_eq!(body["started_at"], preview.started_at);
+
+    // A changed commit bypasses the previous configuration's cooldown.
+    server
+        .admin(
+            "PUT",
+            "/api/machines/web-1/auto-update",
+            Some(json!({ "prebuild": true })),
+        )
+        .await;
+    crate::auto_update::run_once(&server.state).await.unwrap();
+    let (_, body) = server
+        .admin("GET", "/api/machines/web-1/updates/preview", None)
+        .await;
+    assert_ne!(body["rev"], preview.rev);
 }
 
 #[tokio::test]
@@ -1857,6 +1916,14 @@ async fn flatpak_updates_run_on_request_and_automatically() {
             "PUT",
             "/api/machines/web-1/auto-update",
             Some(json!({ "nixpkgs": true })),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    let (status, body) = server
+        .admin(
+            "PUT",
+            "/api/machines/web-1/auto-update",
+            Some(json!({ "prebuild": true })),
         )
         .await;
     assert_eq!(status, 400, "{body}");
@@ -1939,6 +2006,165 @@ fn nix_available() -> bool {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
+}
+
+#[tokio::test]
+async fn prebuild_refreshes_inputs_without_changing_the_repository() {
+    if !nix_available() {
+        eprintln!("skipping: nix is not available");
+        return;
+    }
+    let server = start(Duration::from_secs(30)).await;
+    let input = server._dir.path().join("input");
+    let work = server._dir.path().join("infra");
+    for dir in [&input, &work] {
+        std::fs::create_dir(dir).unwrap();
+        git(dir, &["init", "--quiet"]);
+    }
+    std::fs::write(
+        input.join("flake.nix"),
+        "{ outputs = _: { value = builtins.readFile ./value; }; }",
+    )
+    .unwrap();
+    std::fs::write(input.join("value"), "old").unwrap();
+    git(&input, &["add", "."]);
+    git(&input, &["commit", "--quiet", "-m", "old"]);
+    // Store files make a real, tiny Nix output without needing a compiler or a cache.
+    std::fs::write(work.join("flake.nix"), format!(
+        "{{ inputs.example.url = \"git+file://{}\"; outputs = {{ example, ... }}: {{ nixosConfigurations.web-1.config.system.build.toplevel = builtins.toFile \"mnix-prebuild\" example.value; }}; }}",
+        input.display())).unwrap();
+    git(&work, &["add", "."]);
+    let nix = |args: &[&str]| {
+        let out = std::process::Command::new("nix")
+            .args(["--extra-experimental-features", "nix-command flakes"])
+            .args(args)
+            .current_dir(&work)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    nix(&["flake", "lock"]);
+    git(&work, &["add", "."]);
+    git(&work, &["commit", "--quiet", "-m", "configuration"]);
+    let base = git(&work, &["rev-parse", "HEAD"]);
+    let lock = std::fs::read(work.join("flake.lock")).unwrap();
+    let old = nix(&[
+        "build",
+        "--no-link",
+        "--print-out-paths",
+        ".#nixosConfigurations.web-1.config.system.build.toplevel",
+    ]);
+    std::fs::write(input.join("value"), "new").unwrap();
+    git(&input, &["commit", "--quiet", "-am", "new"]);
+    let credential = server.enrolled("web-1").await;
+    assert_eq!(
+        server
+            .admin(
+                "POST",
+                "/api/repositories",
+                Some(json!({
+                    "name": "infra", "url": work.to_str().unwrap()
+                }))
+            )
+            .await
+            .0,
+        201
+    );
+    assert_eq!(
+        server
+            .admin(
+                "PUT",
+                "/api/machines/web-1/configuration",
+                Some(json!({ "repository": "infra" }))
+            )
+            .await
+            .0,
+        200
+    );
+    let mut ws = server.session(&credential, "web-1").await;
+    ws.send(text(&AgentMessage::Facts {
+        facts: Facts {
+            current_system: old.clone(),
+            configuration_revision: Some(base.clone()),
+            ..facts("web-1")
+        },
+    }))
+    .await
+    .unwrap();
+    for _ in 0..100 {
+        if server
+            .machine("web-1")
+            .await
+            .facts
+            .is_some_and(|f| f.current_system == old)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        server
+            .admin(
+                "PUT",
+                "/api/machines/web-1/auto-update",
+                Some(json!({ "prebuild": true }))
+            )
+            .await
+            .0,
+        200
+    );
+    crate::auto_update::run_once(&server.state).await.unwrap();
+    let preview = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let (status, body) = server
+                .admin("GET", "/api/machines/web-1/updates/preview", None)
+                .await;
+            assert_eq!(status, 200, "{body}");
+            let preview: Preview = serde_json::from_value(body).unwrap();
+            if preview.status != PreviewStatus::Building {
+                break preview;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        preview.status,
+        PreviewStatus::Succeeded,
+        "{:?}",
+        preview.message
+    );
+    assert!(preview.update_nixpkgs);
+    let to = preview.to.unwrap();
+    assert_ne!(to, old);
+    assert_eq!(std::fs::read_to_string(&to).unwrap(), "new");
+    let machine = server.machine("web-1").await;
+    let root = server
+        .state
+        .builder
+        .state_dir
+        .join("gcroots")
+        .join(format!("preview-{}", machine.id));
+    assert_eq!(
+        std::fs::canonicalize(root).unwrap().to_str(),
+        Some(to.as_str())
+    );
+    assert_eq!(git(&work, &["rev-parse", "HEAD"]), base);
+    assert_eq!(std::fs::read(work.join("flake.lock")).unwrap(), lock);
+    assert_eq!(machine.facts.unwrap().current_system, old);
+    assert!(server
+        .admin("GET", "/api/machines/web-1/deployments", None)
+        .await
+        .1
+        .as_array()
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
@@ -2034,6 +2260,17 @@ async fn update_deploys_push_all_flake_inputs_first() {
         .await;
     assert_eq!(status, 200, "{body}");
     let mut ws = server.session(&credential, "web-1").await;
+
+    // A server that delegates builds cannot warm the machines' stores.
+    let (status, body) = server
+        .admin(
+            "PUT",
+            "/api/machines/web-1/auto-update",
+            Some(json!({ "prebuild": true })),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("server-side"));
 
     // A tag cannot take the new lock.
     let (status, body) = server
