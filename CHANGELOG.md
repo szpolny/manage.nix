@@ -5,7 +5,7 @@
 
 ### Features
 
-* **updates:** add automatic Nix prebuilds ([7e11b82](https://github.com/szpolny/manage.nix/commit/7e11b82ee548882d8b718de69657202587def086))
+* **updates:** add opt-in automatic Nix prebuilds to reduce build time before switching, without activating the machine ([7e11b82](https://github.com/szpolny/manage.nix/commit/7e11b82ee548882d8b718de69657202587def086))
 
 ## [0.4.3-alpha](https://github.com/szpolny/manage.nix/compare/v0.4.2-alpha...v0.4.3-alpha) (2026-11-06)
 
